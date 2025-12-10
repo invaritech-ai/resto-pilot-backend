@@ -5,10 +5,10 @@
 
 ## Package for AWS Lambda (FastAPI + Mangum)
 - Handler entrypoint is `app.handler.handler` (see `app/handler.py`).
-- Build the deployable zip from repo root:
+- Build the deployable zip from repo root for Lambda Python 3.12:
   ```
   rm -rf build && mkdir -p build/lambda
-  uv pip install --target build/lambda .
+  uv pip install --target build/lambda --python-platform x86_64-manylinux2014 --python-version 3.12 --only-binary=:all: .
   cp -r app build/lambda/
   cd build/lambda && zip -r ../resto-pilot-lambda.zip .
   ```
