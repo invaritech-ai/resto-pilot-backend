@@ -1,0 +1,63 @@
+name: Deploy Lambda
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      lambda_function_name:
+        description: "Target Lambda function name (defaults to env.LAMBDA_FUNCTION_NAME when omitted)"
+        required: false
+        default: ""
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  PY_VERSION: "3.12"
+  LAMBDA_IMAGE: "public.ecr.aws/lambda/python:3.12"
+  ROLE_TO_ASSUME: "${{ vars.AWS_IAM_ROLE_ARN }}"
+  AWS_REGION: "${{ vars.AWS_REGION }}"
+  LAMBDA_FUNCTION_NAME: "${{ vars.AWS_LAMBDA_FUNCTION_NAME }}"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Build Lambda bundle in Lambda base image
+        run: |
+          rm -rf build && mkdir -p build/lambda
+          docker run --rm \
+            -v "$PWD":/var/task \
+            -w /var/task \
+            ${LAMBDA_IMAGE} \
+            /bin/bash -c "\
+              pip install --upgrade pip setuptools wheel && \
+              pip install --target build/lambda --only-binary=:all: . && \
+              cp -r app build/lambda/"
+          cd build/lambda && zip -r ../resto-pilot-lambda.zip .
+
+      - name: Update Lambda function code
+        run: |
+          FN="${{ github.event.inputs.lambda_function_name }}"
+          if [ -z "$FN" ]; then
+            FN="${LAMBDA_FUNCTION_NAME}"
+          fi
+          if [ -z "$FN" ]; then
+            echo "Lambda function name not provided (input or env). Set AWS_LAMBDA_FUNCTION_NAME repo variable or provide workflow_dispatch input." >&2
+            exit 1
+          fi
+          aws lambda update-function-code \
+            --function-name "$FN" \
+            --zip-file fileb://build/resto-pilot-lambda.zip \
+            --publish
