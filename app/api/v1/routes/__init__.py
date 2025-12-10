@@ -1,3 +1,4 @@
-from app.api.v1.routes import users
+from app.api.v1.routes import users, telegram
 
-__all__ = ["users"]
+
+__all__ = ["users", "telegram"]
