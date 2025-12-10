@@ -40,8 +40,9 @@ jobs:
           docker run --rm \
             -v "$PWD":/var/task \
             -w /var/task \
+            --entrypoint /bin/bash \
             ${LAMBDA_IMAGE} \
-            /bin/bash -c "\
+            -c "\
               pip install --upgrade pip setuptools wheel && \
               pip install --target build/lambda --only-binary=:all: . && \
               cp -r app build/lambda/"
