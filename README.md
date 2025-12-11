@@ -1,4 +1,5 @@
 ## Local dev
+- Copy `.env.example` to `.env` and set `APP_DATABASE_URL` to your Neon connection string (e.g. `postgresql+psycopg://user:pass@host/db?sslmode=require`).
 - Install deps and run `uvicorn app.main:app --reload`.
 - Create your first migration: `alembic revision --autogenerate -m "init"` then `alembic upgrade head`.
 - Configure CORS origins/settings via `.env` as needed.
