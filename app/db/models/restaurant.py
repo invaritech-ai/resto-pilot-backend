@@ -6,15 +6,17 @@ import uuid
 from sqlalchemy import DateTime, ForeignKey, String, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
-from typing import TYPE_CHECKING
+from app.db.base import Base
+from typing import TYPE_CHECKING, ClassVar
 
 if TYPE_CHECKING:
+    from app.db.models.restaurant_user import RestaurantUser
     from app.db.models.user import User
-
-from app.db.base import Base
 
 
 class Restaurant(Base):
+    __tablename__: ClassVar[str] = "restaurants"  # type: ignore[override]
+
     name: Mapped[str] = mapped_column(String, nullable=False)
     restaurant_code: Mapped[str] = mapped_column(String, unique=True, nullable=False)
 
@@ -35,6 +37,8 @@ class Restaurant(Base):
     owner: Mapped["User"] = relationship(
         back_populates="owned_restaurants", foreign_keys=[owner_user_id]
     )
-    active_users: Mapped[list["User"]] = relationship(
-        back_populates="current_restaurant", foreign_keys="User.current_restaurant_id"
+    memberships: Mapped[list["RestaurantUser"]] = relationship(
+        back_populates="restaurant",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
     )

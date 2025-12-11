@@ -1,19 +1,19 @@
 from __future__ import annotations
 
 import datetime as dt
-import uuid
-
-from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, String, func
+from sqlalchemy import BigInteger, Boolean, DateTime, String, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 if TYPE_CHECKING:
     from app.db.models.restaurant import Restaurant
+    from app.db.models.restaurant_user import RestaurantUser
 
 
 class User(Base):
+    __tablename__: ClassVar[str] = "users"  # type: ignore[override]
     telegram_id: Mapped[int] = mapped_column(BigInteger, unique=True, nullable=False)
     chat_id: Mapped[int] = mapped_column(BigInteger, unique=True, nullable=False)
 
@@ -24,16 +24,9 @@ class User(Base):
         Boolean, nullable=False, server_default="false"
     )
 
-    role: Mapped[str] = mapped_column(
-        String(50), nullable=False, server_default="owner"
-    )
+    role: Mapped[str | None] = mapped_column(String(50), nullable=True)
     state: Mapped[str | None] = mapped_column(
         String(50), nullable=True, server_default="IDLE"
-    )
-
-    current_restaurant_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("restaurants.id", ondelete="SET NULL"),
-        nullable=True,
     )
 
     created_at: Mapped[dt.datetime] = mapped_column(
@@ -47,8 +40,8 @@ class User(Base):
         back_populates="owner",
         foreign_keys="Restaurant.owner_user_id",
     )
-    current_restaurant: Mapped["Restaurant | None"] = relationship(
-        back_populates="active_users",
-        foreign_keys=[current_restaurant_id],
+    memberships: Mapped[list["RestaurantUser"]] = relationship(
+        back_populates="user",
+        cascade="all, delete-orphan",
         passive_deletes=True,
     )
