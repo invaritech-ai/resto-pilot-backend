@@ -1,25 +1,17 @@
 from uuid import UUID
 
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, Field
 
 
 class UserBase(BaseModel):
-    email: EmailStr
-
-
-class UserCreate(UserBase):
-    password: str = Field(min_length=8)
-
-
-class UserUpdate(BaseModel):
-    email: EmailStr | None = None
-    password: str | None = Field(default=None, min_length=8)
-    is_active: bool | None = None
+    telegram_id: int = Field()
+    chat_id: int
+    first_name: str = Field(min_length=2)
+    last_name: str = Field(min_length=2)
 
 
 class UserRead(UserBase):
     id: UUID
-    is_active: bool
 
     class Config:
         from_attributes = True

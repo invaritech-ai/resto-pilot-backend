@@ -24,11 +24,18 @@ def _is_superuser(*, telegram_id: int, settings: Settings) -> bool:
 def _send_message(*, chat_id: int, text: str) -> TelegramResponse:
     return TelegramResponse(method="sendMessage", chat_id=chat_id, text=text)
 
+
 def handle_start(update: dict):
-    pass
+    user_info: dict = update["message"]["from"]
+    chat_id: int = update["chat"]["id"]
+    user_id: int = user_info["id"]
+    f_name: str = user_info["first_name"]
+    l_name: str = user_info["last_name"]
 
 
-def process_update(*, update: dict, session: Session, settings: Settings) -> dict | None:
+def process_update(
+    *, update: dict, session: Session, settings: Settings
+) -> dict | None:
     del session, settings
 
     message = update.get("message") or update.get("edited_message") or {}
