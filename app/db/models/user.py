@@ -24,7 +24,6 @@ class User(Base):
         Boolean, nullable=False, server_default="false"
     )
 
-    role: Mapped[str | None] = mapped_column(String(50), nullable=True)
     state: Mapped[str | None] = mapped_column(
         String(50), nullable=True, server_default="IDLE"
     )

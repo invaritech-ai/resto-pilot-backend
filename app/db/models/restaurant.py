@@ -4,6 +4,7 @@ import datetime as dt
 import uuid
 
 from sqlalchemy import DateTime, ForeignKey, String, func
+from sqlalchemy import JSON
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.db.base import Base
@@ -24,7 +25,7 @@ class Restaurant(Base):
         ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
     )
     onboarding_status: Mapped[dict] = mapped_column(
-        JSONB, nullable=False, server_default="{}"
+        JSON().with_variant(JSONB, "postgresql"), nullable=False, server_default="{}"
     )
 
     created_at: Mapped[dt.datetime] = mapped_column(

@@ -4,8 +4,7 @@ import datetime as dt
 import uuid
 from typing import TYPE_CHECKING, ClassVar
 
-from sqlalchemy import DateTime, Enum, ForeignKey, UniqueConstraint
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy import DateTime, Enum, ForeignKey, String, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -21,17 +20,13 @@ class InviteCodes(Base):
         UniqueConstraint("code", name="uq_invite_codes_code"),
     )
 
-    code: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        nullable=False,
-        default=uuid.uuid4,
-    )
+    code: Mapped[str] = mapped_column(String(10), nullable=False)
     restaurant_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("restaurants.id", ondelete="CASCADE"),
         nullable=False,
     )
     role: Mapped[str] = mapped_column(
-        Enum("owner", "manager", "staff", name="invite_code_role"),
+        Enum("owner", "staff", name="invite_target_role"),
         nullable=False,
         server_default="staff",
     )
@@ -46,6 +41,9 @@ class InviteCodes(Base):
     created_by: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL"),
         nullable=True,
+    )
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 
     restaurant: Mapped["Restaurant"] = relationship(
