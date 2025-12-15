@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 @router.post("/telegram")
 async def telegram_webhook(request: Request, db: Session = Depends(get_db)):
-    update = await request.json()  # <- This gets the full Telegram update
+    update = await request.json()
     logger.info("telegram_webhook_received", extra={"update": update})
 
     response = process_update(update=update, session=db, settings=get_settings())

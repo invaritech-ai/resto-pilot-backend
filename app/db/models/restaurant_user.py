@@ -4,14 +4,14 @@ import datetime as dt
 import uuid
 
 from sqlalchemy import DateTime, Enum, ForeignKey, UniqueConstraint, func
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column
 from typing import TYPE_CHECKING, ClassVar
 
 from app.db.base import Base
 
-if TYPE_CHECKING:
-    from app.db.models.restaurant import Restaurant
-    from app.db.models.user import User
+# if TYPE_CHECKING:
+#     from app.db.models.restaurant import Restaurant
+#     from app.db.models.user import User
 
 
 class RestaurantUser(Base):
@@ -29,9 +29,8 @@ class RestaurantUser(Base):
         nullable=False,
     )
     role: Mapped[str] = mapped_column(
-        Enum("owner", "manager", "staff", name="restaurant_user_role"),
+        Enum("owner", "staff", name="restaurant_user_role"),
         nullable=False,
-        server_default="staff",
     )
     joined_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
@@ -44,16 +43,4 @@ class RestaurantUser(Base):
         Enum("invited", "active", "removed", name="restaurant_user_status"),
         nullable=False,
         server_default="invited",
-    )
-
-    restaurant: Mapped["Restaurant"] = relationship(
-        back_populates="memberships",
-        foreign_keys=[restaurant_id],
-    )
-    user: Mapped["User"] = relationship(
-        back_populates="memberships",
-        foreign_keys=[user_id],
-    )
-    invited_by_user: Mapped["User | None"] = relationship(
-        foreign_keys=[invited_by],
     )

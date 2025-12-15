@@ -6,13 +6,9 @@ import uuid
 from sqlalchemy import DateTime, ForeignKey, String, func
 from sqlalchemy import JSON
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column
 from app.db.base import Base
-from typing import TYPE_CHECKING, ClassVar
-
-if TYPE_CHECKING:
-    from app.db.models.restaurant_user import RestaurantUser
-    from app.db.models.user import User
+from typing import ClassVar
 
 
 class Restaurant(Base):
@@ -33,13 +29,4 @@ class Restaurant(Base):
     )
     last_active_at: Mapped[dt.datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
-    )
-
-    owner: Mapped["User"] = relationship(
-        back_populates="owned_restaurants", foreign_keys=[owner_user_id]
-    )
-    memberships: Mapped[list["RestaurantUser"]] = relationship(
-        back_populates="restaurant",
-        cascade="all, delete-orphan",
-        passive_deletes=True,
     )

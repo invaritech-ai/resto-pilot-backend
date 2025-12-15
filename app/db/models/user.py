@@ -2,14 +2,10 @@ from __future__ import annotations
 
 import datetime as dt
 from sqlalchemy import BigInteger, Boolean, DateTime, String, func
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
-from typing import TYPE_CHECKING, ClassVar
-
-if TYPE_CHECKING:
-    from app.db.models.restaurant import Restaurant
-    from app.db.models.restaurant_user import RestaurantUser
+from typing import ClassVar
 
 
 class User(Base):
@@ -33,14 +29,4 @@ class User(Base):
     )
     last_interaction_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
-    )
-
-    owned_restaurants: Mapped[list["Restaurant"]] = relationship(
-        back_populates="owner",
-        foreign_keys="Restaurant.owner_user_id",
-    )
-    memberships: Mapped[list["RestaurantUser"]] = relationship(
-        back_populates="user",
-        cascade="all, delete-orphan",
-        passive_deletes=True,
     )
