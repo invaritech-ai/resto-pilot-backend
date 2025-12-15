@@ -10,6 +10,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.db.models.invite_codes import InviteCodes
+from app.db.models.restaurant import Restaurant
 from app.db.models.restaurant_user import RestaurantUser
 
 
@@ -18,6 +19,14 @@ class InviteCodeNotValidError(ValueError):
 
 
 class InviteCodePermissionError(PermissionError):
+    pass
+
+
+class InviteCodeUsedError(InviteCodeNotValidError):
+    pass
+
+
+class InviteCodeExpiredError(InviteCodeNotValidError):
     pass
 
 
@@ -99,3 +108,50 @@ class InviteCodeService:
         invite.used_at = used_at or dt.datetime.now(dt.UTC)
         self.session.add(invite)
         self.session.commit()
+
+    def accept_invite(
+        self,
+        *,
+        code: str,
+        user_id: uuid.UUID,
+        now: dt.datetime | None = None,
+    ) -> tuple[RestaurantUser, Restaurant | None]:
+        now = now or dt.datetime.now(dt.UTC)
+        normalized_code = code.strip().upper()
+        invite = self.session.scalar(
+            select(InviteCodes).where(InviteCodes.code == normalized_code)
+        )
+        if invite is None:
+            raise InviteCodeNotValidError("Invite code not found")
+        if invite.used_at is not None:
+            raise InviteCodeUsedError("Invite code already used")
+        if invite.expires_at is not None and invite.expires_at <= now:
+            raise InviteCodeExpiredError("Invite code expired")
+
+        restaurant = self.session.get(Restaurant, invite.restaurant_id)
+
+        membership = self.session.scalar(
+            select(RestaurantUser).where(
+                RestaurantUser.restaurant_id == invite.restaurant_id,
+                RestaurantUser.user_id == user_id,
+            )
+        )
+        if membership is None:
+            membership = RestaurantUser(
+                restaurant_id=invite.restaurant_id,
+                user_id=user_id,
+                role=invite.role,
+                status="active",
+                invited_by=invite.created_by,
+            )
+        else:
+            membership.role = invite.role
+            membership.status = "active"
+            if membership.invited_by is None:
+                membership.invited_by = invite.created_by
+
+        invite.used_at = now
+        self.session.add_all([membership, invite])
+        self.session.commit()
+        self.session.refresh(membership)
+        return membership, restaurant

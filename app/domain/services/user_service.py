@@ -4,7 +4,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.db.repositories.user import UserRepository
-from app.schemas.user import UserBase, UserRead
+from app.schemas.user import TelegramUserCreate, UserRead
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +17,7 @@ class UserService:
     def list_users(self) -> list[UserRead]:
         return [UserRead.model_validate(user) for user in self.repo.list()]
 
-    def create_user(self, payload: UserBase) -> UserRead:
+    def create_user(self, payload: TelegramUserCreate) -> UserRead:
         try:
             user = self.repo.create(payload)
             self.session.commit()
@@ -27,8 +27,9 @@ class UserService:
             logger.exception("user_create_failed")
             raise
 
-    def get_or_create(self, payload: UserBase) -> UserRead:
-        full_name = f"{payload.first_name} {payload.last_name}".strip()
+    def get_or_create(self, payload: TelegramUserCreate) -> UserRead:
+        full_name_parts = [p for p in [payload.first_name, payload.last_name] if p]
+        full_name = " ".join(full_name_parts).strip() or None
         try:
             user = self.repo.get_by_telegram_id(payload.telegram_id)
             if user is None:
@@ -36,6 +37,7 @@ class UserService:
             else:
                 user.chat_id = payload.chat_id
                 user.full_name = full_name
+                user.username = payload.username
                 self.session.add(user)
 
             self.session.commit()
