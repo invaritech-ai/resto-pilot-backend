@@ -1,6 +1,6 @@
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 
 class RestaurantCreate(BaseModel):
@@ -10,9 +10,9 @@ class RestaurantCreate(BaseModel):
 class RestaurantRead(BaseModel):
     id: UUID
     name: str
-
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
+    # class Config:
+    #     from_attributes = True
 
 
 class RestaurantMembershipRead(BaseModel):
@@ -28,4 +28,3 @@ class RestaurantMemberRead(BaseModel):
     username: str | None
     role: str
     status: str
-
