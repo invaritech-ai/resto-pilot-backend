@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.db.models.restaurant import Restaurant
 from app.db.models.restaurant_user import RestaurantUser
+from app.db.models.user import User
 
 
 class RestaurantService:
@@ -38,6 +39,15 @@ class RestaurantService:
                 owner_user_id=owner_user_id,
             )
             self.session.add(restaurant)
+            self.session.flush()
+            membership = RestaurantUser(
+                restaurant_id=restaurant.id,
+                user_id=owner_user_id,
+                role="owner",
+                invited_by=None,
+                status="active",
+            )
+            self.session.add(membership)
             try:
                 self.session.commit()
             except IntegrityError:
@@ -56,7 +66,7 @@ class RestaurantService:
         role: str,
         invited_by: uuid.UUID | None,
     ) -> RestaurantUser:
-        if role not in {"owner", "staff", "manager"}:
+        if role not in {"owner", "staff"}:
             raise ValueError("Invalid role")
 
         membership = RestaurantUser(
@@ -83,3 +93,26 @@ class RestaurantService:
         )
         return existing_id is not None
 
+    def list_for_user(self, *, user_id: uuid.UUID) -> list[tuple[Restaurant, RestaurantUser]]:
+        rows = self.session.execute(
+            select(Restaurant, RestaurantUser)
+            .join(RestaurantUser, RestaurantUser.restaurant_id == Restaurant.id)
+            .where(
+                RestaurantUser.user_id == user_id,
+                RestaurantUser.status != "removed",
+            )
+            .order_by(Restaurant.created_at.desc())
+        ).all()
+        return [(restaurant, membership) for restaurant, membership in rows]
+
+    def list_members(self, *, restaurant_id: uuid.UUID) -> list[tuple[User, RestaurantUser]]:
+        rows = self.session.execute(
+            select(User, RestaurantUser)
+            .join(RestaurantUser, RestaurantUser.user_id == User.id)
+            .where(
+                RestaurantUser.restaurant_id == restaurant_id,
+                RestaurantUser.status != "removed",
+            )
+            .order_by(RestaurantUser.joined_at.asc())
+        ).all()
+        return [(user, membership) for user, membership in rows]
