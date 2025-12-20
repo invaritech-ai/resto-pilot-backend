@@ -1,21 +1,32 @@
-import datetime as dt
+from __future__ import annotations
 
-from sqlalchemy import Boolean, DateTime, String
+import datetime as dt
+from sqlalchemy import BigInteger, Boolean, DateTime, String, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
+from typing import ClassVar
 
 
 class User(Base):
-    email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
-    hashed_password: Mapped[str] = mapped_column(String(255), nullable=False)
-    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
-    created_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), default=dt.datetime.utcnow, nullable=False
+    __tablename__: ClassVar[str] = "users"  # type: ignore[override]
+    telegram_id: Mapped[int] = mapped_column(BigInteger, unique=True, nullable=False)
+    chat_id: Mapped[int] = mapped_column(BigInteger, unique=True, nullable=False)
+
+    full_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    username: Mapped[str | None] = mapped_column(String, nullable=True)
+    phone: Mapped[str | None] = mapped_column(String, nullable=True)
+    is_phone_verified: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false"
     )
-    updated_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True),
-        default=dt.datetime.utcnow,
-        onupdate=dt.datetime.utcnow,
-        nullable=False,
+
+    state: Mapped[str | None] = mapped_column(
+        String(50), nullable=True, server_default="IDLE"
+    )
+
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    last_interaction_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
     )

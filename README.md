@@ -1,4 +1,5 @@
 ## Local dev
+- Copy `.env.example` to `.env` and set `APP_DATABASE_URL` to your Neon connection string (e.g. `postgresql+psycopg://user:pass@host/db?sslmode=require`).
 - Install deps and run `uvicorn app.main:app --reload`.
 - Create your first migration: `alembic revision --autogenerate -m "init"` then `alembic upgrade head`.
 - Configure CORS origins/settings via `.env` as needed.
@@ -21,6 +22,7 @@
 ## Telegram webhook
 - Set the webhook (replace token and URL):
   ```
-  https://api.telegram.org/bot<YOUR_TOKEN>/setWebhook?url=https://<api-id>.execute-api.<region>.amazonaws.com/api/v1/telegram
+  https://api.telegram.org/bot<YOUR_TOKEN>/setWebhook?url=https://<api-id>.execute-api.<region>.amazonaws.com/api/v1/telegram&secret_token=<YOUR_WEBHOOK_SECRET>
   ```
+- Configure `APP_TELEGRAM_WEBHOOK_SECRET_TOKEN=<YOUR_WEBHOOK_SECRET>` in your server/Lambda environment.
 - Test by sending a message; logs appear in CloudWatch `/aws/lambda/<function-name>`.
