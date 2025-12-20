@@ -22,6 +22,7 @@
 ## Telegram webhook
 - Set the webhook (replace token and URL):
   ```
-  https://api.telegram.org/bot<YOUR_TOKEN>/setWebhook?url=https://<api-id>.execute-api.<region>.amazonaws.com/api/v1/telegram
+  https://api.telegram.org/bot<YOUR_TOKEN>/setWebhook?url=https://<api-id>.execute-api.<region>.amazonaws.com/api/v1/telegram&secret_token=<YOUR_WEBHOOK_SECRET>
   ```
+- Configure `APP_TELEGRAM_WEBHOOK_SECRET_TOKEN=<YOUR_WEBHOOK_SECRET>` in your server/Lambda environment.
 - Test by sending a message; logs appear in CloudWatch `/aws/lambda/<function-name>`.

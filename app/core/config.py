@@ -15,6 +15,7 @@ class Settings(BaseSettings):
 
     telegram_bot_username: str = "MyBot"
     telegram_bot_token: str = ""
+    telegram_webhook_secret_token: str = ""
     telegram_superuser_ids: list[int] = []
 
     auth_secret: str = "dev-secret-change-me"
