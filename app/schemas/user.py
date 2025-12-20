@@ -1,25 +1,31 @@
 from uuid import UUID
 
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
-class UserBase(BaseModel):
-    email: EmailStr
+class TelegramUserCreate(BaseModel):
+    telegram_id: int
+    chat_id: int
+    first_name: str | None = Field(default=None, min_length=1)
+    last_name: str | None = Field(default=None, min_length=1)
+    username: str | None = None
+
+    @field_validator("first_name", "last_name", "username", mode="before")
+    @classmethod
+    def _normalize_optional_str(cls, value):  # type: ignore[no-untyped-def]
+        if value is None:
+            return None
+        if isinstance(value, str):
+            value = value.strip()
+            return value or None
+        return value
 
 
-class UserCreate(UserBase):
-    password: str = Field(min_length=8)
-
-
-class UserUpdate(BaseModel):
-    email: EmailStr | None = None
-    password: str | None = Field(default=None, min_length=8)
-    is_active: bool | None = None
-
-
-class UserRead(UserBase):
+class UserRead(BaseModel):
     id: UUID
-    is_active: bool
+    telegram_id: int
+    chat_id: int
+    full_name: str | None = None
+    username: str | None = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)

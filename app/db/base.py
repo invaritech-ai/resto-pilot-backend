@@ -1,6 +1,5 @@
 from sqlalchemy.orm import DeclarativeBase, declared_attr, mapped_column
-from sqlalchemy import MetaData
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy import MetaData, Uuid
 import uuid
 
 
@@ -22,7 +21,7 @@ class Base(DeclarativeBase):
         return cls.__name__.lower()
 
     id = mapped_column(
-        UUID(as_uuid=True),
+        Uuid(as_uuid=True),
         primary_key=True,
         default=uuid.uuid4,
     )

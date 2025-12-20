@@ -1,41 +1,50 @@
 import logging
+import secrets
+
 from fastapi import APIRouter, Request
+from fastapi import Depends, Header, HTTPException, status
 from fastapi.responses import JSONResponse
+from sqlalchemy.orm import Session
+
+from app.api.deps import get_db_dep, get_settings_dep
+from app.core.config import Settings
+from app.telegram.processor import process_update
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
 @router.post("/telegram")
-async def telegram_webhook(request: Request):
-    update = await request.json()  # <- This gets the full Telegram update
+async def telegram_webhook(
+    request: Request,
+    db: Session = Depends(get_db_dep),
+    settings: Settings = Depends(get_settings_dep),
+    x_telegram_bot_api_secret_token: str | None = Header(
+        default=None, alias="X-Telegram-Bot-Api-Secret-Token"
+    ),
+):
+    if not settings.telegram_webhook_secret_token:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Telegram webhook is not configured",
+        )
+    if not x_telegram_bot_api_secret_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing Telegram webhook secret",
+        )
+    if not secrets.compare_digest(
+        x_telegram_bot_api_secret_token, settings.telegram_webhook_secret_token
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid Telegram webhook secret",
+        )
+
+    update = await request.json()
     logger.info("telegram_webhook_received", extra={"update": update})
 
-    # TODO: pass update to your telegram handler
-    # response = await process_update(update)
-
-    # Echo back to Telegram directly in the webhook response.
-    # Telegram will execute this single API call on your behalf.
-    message = update.get("message") or update.get("edited_message") or {}
-    chat_id = message.get("chat", {}).get("id")
-    text = message.get("text") or ""
-
-    if chat_id and text:
-        logger.info("telegram_echo_sent_via_webhook_response", extra={"chat_id": chat_id})
-        return JSONResponse(
-            {
-                "method": "sendMessage",
-                "chat_id": chat_id,
-                "text": f"Echo: {text}",
-            }
-        )
-    else:
-        logger.warning(
-            "telegram_echo_skipped",
-            extra={
-                "chat_id_present": bool(chat_id),
-                "text_present": bool(text),
-            },
-        )
-
-    return JSONResponse({"status": "ok"})
+    response = process_update(update=update, session=db, settings=settings)
+    if response is None:
+        return JSONResponse({"status": "ok"})
+    return JSONResponse(response)

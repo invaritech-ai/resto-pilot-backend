@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.router import api_router
 from app.core.config import Settings, get_settings
@@ -11,6 +12,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     configure_logging(settings)
 
     app = FastAPI(title=settings.app_name, version=settings.version, debug=settings.debug)
+
+    cors_origins: list[str] = [str(o) for o in (settings.cors_origins or [])]
+    if cors_origins or settings.debug:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=cors_origins or ["*"],
+            allow_credentials=False,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+
     app.include_router(api_router, prefix=settings.api_prefix)
 
     @app.get("/health", tags=["health"])
