@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Resto Pilot - Interactive Demo</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" />
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #0f172a;
+            color: #f1f5f9;
+        }
+        .glass-panel {
+            background: rgba(30, 41, 59, 0.7);
+            backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        .chat-bubble {
+            max-width: 85%;
+            padding: 10px 14px;
+            border-radius: 12px;
+            font-size: 0.9rem;
+            margin-bottom: 8px;
+            animation: fadeIn 0.3s ease-out;
+        }
+        .chat-bubble.staff {
+            background-color: #3b82f6;
+            color: white;
+            align-self: flex-end;
+            border-bottom-right-radius: 2px;
+        }
+        .chat-bubble.bot {
+            background-color: #334155;
+            color: #e2e8f0;
+            align-self: flex-start;
+            border-bottom-left-radius: 2px;
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(5px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        .dashboard-card {
+            background-color: #1e293b;
+            border: 1px solid #334155;
+            border-radius: 0.75rem;
+            padding: 1rem;
+            transition: all 0.3s ease;
+        }
+        .dashboard-card.highlight {
+            border-color: #3b82f6;
+            box-shadow: 0 0 15px rgba(59, 130, 246, 0.3);
+        }
+    </style>
+</head>
+<body class="h-screen flex flex-col overflow-hidden">
+
+    <!-- Main Content Area -->
+    <main class="flex-1 flex flex-col md:flex-row overflow-hidden relative">
+        
+        <!-- Left Panel: Context / Story -->
+        <div class="w-full md:w-1/3 p-6 md:p-10 flex flex-col justify-center overflow-y-auto z-10 bg-slate-900">
+            <div class="flex items-center gap-2 mb-6">
+                <div class="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center font-bold text-white">RP</div>
+                <span class="font-bold text-lg text-white">Resto Pilot</span>
+                <span class="text-xs text-slate-400">interactive demo</span>
+            </div>
+            <h1 class="text-3xl md:text-4xl font-bold mb-4">
+                The <span class="text-blue-400">Invisible Brain</span> for Modern Restaurants
+            </h1>
+            <p class="text-slate-400 mb-8 leading-relaxed">
+                Experience how Resto Pilot transforms chaotic kitchen data into structured business insights. 
+                <br><br>
+                <strong>Try it yourself:</strong> Use the simulated Telegram interface to send data, and watch the Dashboard react in real-time.
+            </p>
+
+            <div class="space-y-4">
+                <div class="flex items-start gap-4 p-4 rounded-xl dashboard-card cursor-pointer hover:bg-slate-800 transition-colors" onclick="triggerDemo('invoice')">
+                    <div class="w-10 h-10 rounded-full bg-blue-500/20 text-blue-400 flex items-center justify-center">
+                        <span class="material-symbols-outlined">receipt_long</span>
+                    </div>
+                    <div>
+                        <h3 class="font-semibold text-white">Snap Invoice</h3>
+                        <p class="text-sm text-slate-400">Simulate capturing a vendor invoice. Watch margin protection kicks in.</p>
+                    </div>
+                </div>
+
+                <div class="flex items-start gap-4 p-4 rounded-xl dashboard-card cursor-pointer hover:bg-slate-800 transition-colors" onclick="triggerDemo('voice')">
+                    <div class="w-10 h-10 rounded-full bg-purple-500/20 text-purple-400 flex items-center justify-center">
+                        <span class="material-symbols-outlined">mic</span>
+                    </div>
+                    <div>
+                        <h3 class="font-semibold text-white">Voice Note</h3>
+                        <p class="text-sm text-slate-400">"86 broccoli". See how unstructured audio becomes structured data.</p>
+                    </div>
+                </div>
+
+                <div class="flex items-start gap-4 p-4 rounded-xl dashboard-card cursor-pointer hover:bg-slate-800 transition-colors" onclick="triggerDemo('fridge')">
+                    <div class="w-10 h-10 rounded-full bg-green-500/20 text-green-400 flex items-center justify-center">
+                        <span class="material-symbols-outlined">burst_mode</span>
+                    </div>
+                    <div>
+                        <h3 class="font-semibold text-white">Fridge Check (Burst)</h3>
+                        <p class="text-sm text-slate-400">Upload multiple photos. Watch the Session Aggregator group them.</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Center Interactive Area -->
+        <div class="w-full md:w-2/3 bg-[#0b1121] relative flex flex-col md:flex-row">
+            
+            <!-- Mobile: Phone Simulator -->
+            <div class="flex-1 flex items-center justify-center p-8 bg-[url('https://www.transparenttextures.com/patterns/carbon-fibre.png')]">
+                <div class="w-[320px] h-[600px] bg-black rounded-[3rem] border-[8px] border-slate-800 shadow-2xl overflow-hidden relative flex flex-col">
+                    <!-- Status Bar -->
+                    <div class="h-6 bg-slate-900 w-full flex justify-between px-6 items-center text-[10px] text-white z-10">
+                        <span>9:41</span>
+                        <div class="flex gap-1">
+                            <span class="material-symbols-outlined text-[10px]">signal_cellular_alt</span>
+                            <span class="material-symbols-outlined text-[10px]">wifi</span>
+                            <span class="material-symbols-outlined text-[10px]">battery_full</span>
+                        </div>
+                    </div>
+                    
+                    <!-- App Header -->
+                    <div class="bg-slate-800 p-3 flex items-center gap-3 border-b border-slate-700 z-10">
+                        <div class="w-8 h-8 rounded-full bg-blue-600 flex items-center justify-center text-xs font-bold font-mono text-white">RP</div>
+                        <div>
+                            <div class="font-semibold text-white text-sm">Resto Pilot</div>
+                            <div class="text-[10px] text-blue-400">bot</div>
+                        </div>
+                    </div>
+
+                    <!-- Chat Area -->
+                    <div id="chat-container" class="flex-1 bg-slate-900 p-4 overflow-y-auto flex flex-col gap-2 relative">
+                        <!-- Messages will appear here -->
+                        <div class="chat-bubble bot">
+                            Ready for service! Send me invoices, inventory photos, or voice notes. 🧑‍🍳
+                        </div>
+                    </div>
+
+                    <!-- Input Area -->
+                    <div class="p-3 bg-slate-800 border-t border-slate-700 flex items-center gap-2">
+                        <span class="material-symbols-outlined text-slate-400 cursor-pointer hover:text-white">add</span>
+                        <div class="flex-1 bg-slate-700 h-8 rounded-full px-3 text-xs flex items-center text-slate-400">
+                            Message...
+                        </div>
+                        <span class="material-symbols-outlined text-blue-500 cursor-pointer hover:text-blue-400">mic</span>
+                    </div>
+                    
+                    <!-- Sim Overlay -->
+                    <div id="sim-overlay" class="absolute inset-0 bg-black/50 backdrop-blur-sm z-20 flex items-center justify-center opacity-0 pointer-events-none transition-opacity">
+                        <div class="bg-slate-800 p-4 rounded-xl flex flex-col items-center">
+                            <span class="material-symbols-outlined text-4xl text-white mb-2 animate-pulse" id="sim-icon">photo_camera</span>
+                            <span class="text-white text-sm font-medium" id="sim-text">Uploading...</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Desktop: Dashboard Simulator -->
+            <div class="flex-1 bg-slate-900 border-l border-slate-800 p-6 flex flex-col overflow-hidden">
+                <div class="flex items-center justify-between mb-6">
+                    <h2 class="text-xl font-bold text-white">Live Dashboard</h2>
+                    <div class="flex gap-2">
+                        <span class="w-2 h-2 rounded-full bg-green-500 animate-pulse"></span>
+                        <span class="text-xs text-green-500 uppercase font-bold tracking-wider">Online</span>
+                    </div>
+                </div>
+
+                <!-- Stats Grid -->
+                <div class="grid grid-cols-2 gap-4 mb-6">
+                    <div class="dashboard-card" id="card-spend">
+                        <div class="text-slate-400 text-xs uppercase tracking-wider mb-1">Today's Spend</div>
+                        <div class="text-2xl font-bold text-white" id="val-spend">$0.00</div>
+                        <div class="text-xs text-slate-500 mt-1">No invoices yet</div>
+                    </div>
+                    <div class="dashboard-card" id="card-alerts">
+                        <div class="text-slate-400 text-xs uppercase tracking-wider mb-1">Price Alerts</div>
+                        <div class="text-2xl font-bold text-white" id="val-alerts">0</div>
+                        <div class="text-xs text-slate-500 mt-1">All standard prices</div>
+                    </div>
+                </div>
+
+                <!-- Live Feed -->
+                <div class="flex-1 overflow-hidden flex flex-col">
+                    <h3 class="text-sm font-bold text-slate-300 mb-3 uppercase tracking-wider">Incoming Data Stream</h3>
+                    <div class="flex-1 overflow-y-auto space-y-3 pr-2" id="feed-container">
+                        <!-- Feed Items will appear here -->
+                        <div class="p-3 rounded bg-slate-800/50 border border-slate-700/50 text-center text-sm text-slate-500 italic">
+                            Waiting for input...
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+        </div>
+    </main>
+
+    <script>
+        const chatContainer = document.getElementById('chat-container');
+        const feedContainer = document.getElementById('feed-container');
+        const simOverlay = document.getElementById('sim-overlay');
+        const simIcon = document.getElementById('sim-icon');
+        const simText = document.getElementById('sim-text');
+
+        // State
+        let spend = 0;
+        let alerts = 0;
+
+        function updateScroll() {
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+            feedContainer.scrollTop = feedContainer.scrollHeight;
+        }
+
+        function showOverlay(icon, text) {
+            simIcon.textContent = icon;
+            simText.textContent = text;
+            simOverlay.classList.remove('opacity-0');
+            return new Promise(resolve => setTimeout(() => {
+                simOverlay.classList.add('opacity-0');
+                resolve();
+            }, 1500));
+        }
+
+        function addChatMessage(type, text) {
+            const div = document.createElement('div');
+            div.className = `chat-bubble ${type}`;
+            div.textContent = text;
+            chatContainer.appendChild(div);
+            updateScroll();
+        }
+
+        function addFeedItem(title, meta, type='info') {
+            // Clear empty state if exists
+            if (feedContainer.children[0]?.classList.contains('text-center')) {
+                feedContainer.innerHTML = '';
+            }
+
+            const div = document.createElement('div');
+            let borderColor = 'border-slate-700';
+            let icon = 'info';
+            let iconColor = 'text-slate-400';
+
+            if (type === 'success') { borderColor = 'border-green-500/30'; icon = 'check_circle'; iconColor = 'text-green-500'; }
+            if (type === 'warning') { borderColor = 'border-orange-500/30'; icon = 'warning'; iconColor = 'text-orange-500'; }
+            if (type === 'error') { borderColor = 'border-red-500/30'; icon = 'error'; iconColor = 'text-red-500'; }
+
+            div.className = `p-3 rounded bg-slate-800 border ${borderColor} flex items-start gap-3 animate-pulse`;
+            div.innerHTML = `
+                <span class="material-symbols-outlined ${iconColor} text-lg pt-0.5">${icon}</span>
+                <div>
+                    <div class="text-sm font-semibold text-white">${title}</div>
+                    <div class="text-xs text-slate-400">${meta}</div>
+                </div>
+            `;
+            
+            feedContainer.appendChild(div);
+            // Remove pulse after animation
+            setTimeout(() => div.classList.remove('animate-pulse'), 1000);
+            updateScroll();
+        }
+
+        function updateDashboard(spendInc, alertInc) {
+            if (spendInc) {
+                spend += spendInc;
+                const el = document.getElementById('val-spend');
+                const card = document.getElementById('card-spend');
+                el.innerText = '$' + spend.toFixed(2);
+                card.classList.add('highlight');
+                setTimeout(() => card.classList.remove('highlight'), 1000);
+                // Update subtext
+                card.querySelector('.text-xs').innerText = 'Updated just now';
+            }
+
+            if (alertInc) {
+                alerts += alertInc;
+                const el = document.getElementById('val-alerts');
+                const card = document.getElementById('card-alerts');
+                el.innerText = alerts;
+                el.classList.add('text-red-500');
+                card.classList.add('highlight');
+                card.style.borderColor = '#ef4444';
+                setTimeout(() => {
+                    card.classList.remove('highlight');
+                    card.style.borderColor = '';
+                }, 1000);
+                card.querySelector('.text-xs').innerText = `${alerts} items > 10% variance`;
+            }
+        }
+
+        async function triggerDemo(action) {
+            if (action === 'invoice') {
+                // 1. User Action
+                await showOverlay('photo_camera', 'Scanning Invoice...');
+                addChatMessage('staff', 'Sent a photo 📸');
+                
+                // 2. Processing delay
+                setTimeout(() => {
+                    addChatMessage('bot', 'Processing invoice from FreshCo...');
+                }, 500);
+
+                setTimeout(() => {
+                    // 3. Result
+                    addChatMessage('bot', '✅ Received. Total: $452.30. Warning: Tomatoes price increased by 15%.');
+                    
+                    // 4. Dashboard Update
+                    addFeedItem('Invoice Processed', 'Vendor: FreshCo • Items: 12 • Total: $452.30', 'success');
+                    setTimeout(() => {
+                        addFeedItem('Price Alert Detected', 'Item: Tomatoes (kg) • Old: $2.50 • New: $2.88 (+15%)', 'warning');
+                        updateDashboard(452.30, 1);
+                    }, 500);
+                }, 2000);
+
+            } else if (action === 'voice') {
+                await showOverlay('mic', 'Recording...');
+                addChatMessage('staff', '🎤 Voice note (4s)');
+                
+                setTimeout(() => {
+                    addChatMessage('bot', '📝 Transcribed: "86 the broccoli, we are out."');
+                }, 1000);
+
+                setTimeout(() => {
+                    addChatMessage('bot', 'Got it. Updated inventory status for Broccoli to "Out of Stock".');
+                    addFeedItem('Inventory Status Update', 'Item: Broccoli • Status: Out of Stock • Source: Audio Transcription', 'info');
+                }, 2500);
+
+            } else if (action === 'fridge') {
+                await showOverlay('burst_mode', 'Uploading 10 photos...');
+                addChatMessage('staff', 'Sent 10 photos 📸');
+                
+                setTimeout(() => {
+                    addChatMessage('bot', '👀 Detecting burst mode...');
+                }, 800);
+
+                setTimeout(() => {
+                    addChatMessage('bot', '✨ Session created. 10 photos grouped into "Morning Fridge Check". 4 items low on stock.');
+                    addFeedItem('Session Aggregated', 'Morning Fridge Check • 10 Images processed as one context', 'success');
+                    addFeedItem('Low Stock Alert', 'Milk, Eggs, Butter, Cheese', 'warning');
+                }, 2500);
+            }
+        }
+    </script>
+</body>
+</html>
