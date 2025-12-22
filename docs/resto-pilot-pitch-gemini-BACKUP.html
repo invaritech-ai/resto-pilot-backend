@@ -1,0 +1,894 @@
+<!DOCTYPE html>
+<html lang="en" class="scroll-smooth">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Resto Pilot - Investor Deck</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,1,0" rel="stylesheet">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.2/gsap.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.2/ScrollTrigger.min.js"></script>
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            font-family: 'DM Sans', sans-serif;
+            background-color: #030712;
+            color: #f8fafc;
+            overflow-x: hidden;
+        }
+        h1, h2, h3, .brand-font {
+            font-family: 'Space Grotesk', sans-serif;
+        }
+        .glass {
+            background: rgba(15, 23, 42, 0.6);
+            backdrop-filter: blur(20px);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+        }
+        .section-label {
+            font-size: 0.75rem;
+            font-weight: 600;
+            letter-spacing: 0.1em;
+            text-transform: uppercase;
+        }
+        .stat-card {
+            background: linear-gradient(135deg, rgba(30, 41, 59, 0.5) 0%, rgba(15, 23, 42, 0.8) 100%);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+        }
+        .chat-bubble {
+            max-width: 85%;
+            padding: 10px 14px;
+            border-radius: 16px;
+            font-size: 0.85rem;
+            line-height: 1.5;
+            margin-bottom: 8px;
+            opacity: 0;
+            transform: translateY(10px);
+            animation: fadeIn 0.3s forwards;
+        }
+        @keyframes fadeIn {
+            to { opacity: 1; transform: translateY(0); }
+        }
+        .chat-bubble.user {
+            background: linear-gradient(135deg, #3b82f6, #2563eb);
+            color: white;
+            align-self: flex-end;
+            border-bottom-right-radius: 4px;
+        }
+        .chat-bubble.bot {
+            background: rgba(51, 65, 85, 0.8);
+            color: #e2e8f0;
+            align-self: flex-start;
+            border-bottom-left-radius: 4px;
+        }
+        .typing-indicator span {
+            display: inline-block;
+            width: 5px;
+            height: 5px;
+            background-color: #94a3b8;
+            border-radius: 50%;
+            animation: typing 1.4s infinite ease-in-out both;
+            margin: 0 2px;
+        }
+        .typing-indicator span:nth-child(1) { animation-delay: -0.32s; }
+        .typing-indicator span:nth-child(2) { animation-delay: -0.16s; }
+        @keyframes typing {
+            0%, 80%, 100% { transform: scale(0); }
+            40% { transform: scale(1); }
+        }
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+        @media print {
+            body { background-color: white; color: black; }
+            .no-print { display: none !important; }
+            .glass, .stat-card { background: #f1f5f9; border: 1px solid #e2e8f0; }
+            h1, h2, h3 { color: #0f172a !important; }
+            .text-slate-400, .text-slate-500 { color: #475569 !important; }
+        }
+    </style>
+</head>
+<body class="antialiased">
+
+<!-- Navigation -->
+<nav class="fixed top-0 w-full z-50 glass border-b border-white/5 no-print">
+    <div class="max-w-5xl mx-auto px-6">
+        <div class="flex items-center justify-between h-14">
+            <div class="flex items-center gap-2">
+                <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-blue-500 to-blue-600 flex items-center justify-center">
+                    <span class="material-symbols-outlined text-white text-lg">smart_toy</span>
+                </div>
+                <span class="text-base font-bold brand-font text-white">Resto Pilot</span>
+            </div>
+            <div class="text-xs text-slate-500">Investor Deck · Q1 2025</div>
+        </div>
+    </div>
+</nav>
+
+<!-- Slide 1: Title -->
+<section class="min-h-screen flex items-center justify-center relative overflow-hidden">
+    <div class="absolute inset-0">
+        <div class="absolute top-1/4 left-1/4 w-96 h-96 bg-blue-500/10 rounded-full blur-3xl"></div>
+        <div class="absolute bottom-1/4 right-1/4 w-72 h-72 bg-purple-500/10 rounded-full blur-3xl"></div>
+    </div>
+    
+    <div class="relative z-10 max-w-4xl mx-auto px-6 text-center">
+        <div class="inline-flex items-center gap-2 px-3 py-1.5 rounded-full glass text-xs text-slate-400 mb-8">
+            <span class="w-1.5 h-1.5 rounded-full bg-green-500"></span>
+            Seed Round · $1.5M
+        </div>
+        
+        <h1 class="text-5xl md:text-7xl font-bold mb-6 leading-[1.1] tracking-tight">
+            <span class="text-white">Resto Pilot</span>
+        </h1>
+        
+        <p class="text-2xl md:text-3xl text-slate-300 mb-4 font-medium">
+            The invisible back-office for restaurants
+        </p>
+        
+        <p class="text-lg text-slate-500 max-w-2xl mx-auto mb-12">
+            AI-powered data capture via Telegram. Zero friction. Full visibility.
+        </p>
+        
+        <div class="flex justify-center gap-12 text-center">
+            <div>
+                <div class="text-3xl font-bold text-white">$900B</div>
+                <div class="text-xs text-slate-500 mt-1">US Restaurant Market</div>
+            </div>
+            <div class="w-px bg-slate-800"></div>
+            <div>
+                <div class="text-3xl font-bold text-white">1M+</div>
+                <div class="text-xs text-slate-500 mt-1">Independent Venues</div>
+            </div>
+            <div class="w-px bg-slate-800"></div>
+            <div>
+                <div class="text-3xl font-bold text-white">3-5%</div>
+                <div class="text-xs text-slate-500 mt-1">Margin Lost to "Data Fog"</div>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- Slide 2: The Problem -->
+<section id="problem" class="min-h-screen flex items-center py-24">
+    <div class="max-w-5xl mx-auto px-6 w-full">
+        <div class="section-label text-red-400 mb-4">The Problem</div>
+        <h2 class="text-4xl md:text-5xl font-bold text-white mb-6">
+            Restaurants are drowning in paper
+        </h2>
+        <p class="text-xl text-slate-400 mb-12 max-w-3xl">
+            Critical operational data—invoices, deliveries, inventory counts—stays trapped in paper piles. 
+            Owners discover problems weeks later when the P&L arrives.
+        </p>
+        
+        <div class="grid md:grid-cols-3 gap-6 mb-12">
+            <div class="stat-card rounded-2xl p-6">
+                <div class="text-4xl font-bold text-red-400 mb-2">15+</div>
+                <div class="text-sm text-slate-400">Hours/week spent on manual data entry</div>
+            </div>
+            <div class="stat-card rounded-2xl p-6">
+                <div class="text-4xl font-bold text-red-400 mb-2">3-5%</div>
+                <div class="text-sm text-slate-400">Revenue lost to undetected price hikes & waste</div>
+            </div>
+            <div class="stat-card rounded-2xl p-6">
+                <div class="text-4xl font-bold text-red-400 mb-2">72%</div>
+                <div class="text-sm text-slate-400">Of independents have no inventory system</div>
+            </div>
+        </div>
+        
+        <div class="glass rounded-2xl p-6">
+            <div class="text-sm font-medium text-slate-300 mb-3">Why existing solutions fail:</div>
+            <div class="grid md:grid-cols-3 gap-6 text-sm text-slate-400">
+                <div class="flex gap-3">
+                    <span class="material-symbols-outlined text-red-400 text-lg">close</span>
+                    <span><strong class="text-slate-300">Traditional software</strong> — Too complex, requires training, staff won't use it</span>
+                </div>
+                <div class="flex gap-3">
+                    <span class="material-symbols-outlined text-red-400 text-lg">close</span>
+                    <span><strong class="text-slate-300">Accounting tools</strong> — Retrospective, not real-time, no operational context</span>
+                </div>
+                <div class="flex gap-3">
+                    <span class="material-symbols-outlined text-red-400 text-lg">close</span>
+                    <span><strong class="text-slate-300">POS add-ons</strong> — Siloed data, expensive, limited to transactions</span>
+                </div>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- Slide 3: The Solution -->
+<section id="solution" class="min-h-screen flex items-center py-24">
+    <div class="max-w-5xl mx-auto px-6 w-full">
+        <div class="section-label text-blue-400 mb-4">Our Solution</div>
+        <h2 class="text-4xl md:text-5xl font-bold text-white mb-6">
+            Data capture via Telegram
+        </h2>
+        <p class="text-xl text-slate-400 mb-12 max-w-3xl">
+            Staff send photos, voice notes, or messages to our bot. AI extracts structured data instantly. 
+            No new apps. No training. No behavior change.
+        </p>
+        
+        <div class="grid lg:grid-cols-2 gap-12 items-start">
+            <!-- Demo -->
+            <div class="glass rounded-2xl overflow-hidden max-w-sm">
+                <div class="bg-slate-800/50 p-3 flex items-center gap-3 border-b border-white/5">
+                    <div class="w-9 h-9 rounded-full bg-gradient-to-br from-blue-500 to-blue-600 flex items-center justify-center text-white font-bold text-xs">RP</div>
+                    <div class="flex-1">
+                        <div class="font-semibold text-white text-sm">Resto Pilot</div>
+                        <div class="text-xs text-green-400">Online</div>
+                    </div>
+                </div>
+                <div id="chat-container" class="h-[280px] p-3 overflow-y-auto flex flex-col gap-1 bg-slate-900/50">
+                    <div class="text-center text-xs text-slate-600 my-2">Demo</div>
+                    <div class="chat-bubble bot">Send me invoices, photos, or voice notes 📱</div>
+                </div>
+                <div class="p-3 bg-slate-800/30 border-t border-white/5 no-print">
+                    <div class="grid grid-cols-3 gap-2">
+                        <button onclick="simulateAction('invoice')" class="flex flex-col items-center gap-1 p-2 rounded-lg bg-slate-700/50 hover:bg-slate-600/50 transition-colors text-xs text-slate-300">
+                            <span class="material-symbols-outlined text-lg text-blue-400">receipt_long</span>
+                            Invoice
+                        </button>
+                        <button onclick="simulateAction('voice')" class="flex flex-col items-center gap-1 p-2 rounded-lg bg-slate-700/50 hover:bg-slate-600/50 transition-colors text-xs text-slate-300">
+                            <span class="material-symbols-outlined text-lg text-purple-400">mic</span>
+                            Voice
+                        </button>
+                        <button onclick="simulateAction('fridge')" class="flex flex-col items-center gap-1 p-2 rounded-lg bg-slate-700/50 hover:bg-slate-600/50 transition-colors text-xs text-slate-300">
+                            <span class="material-symbols-outlined text-lg text-green-400">kitchen</span>
+                            Inventory
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Key Points -->
+            <div class="space-y-6">
+                <div class="flex gap-4">
+                    <div class="w-10 h-10 rounded-xl bg-blue-500/10 flex items-center justify-center text-blue-400 shrink-0">
+                        <span class="material-symbols-outlined">camera</span>
+                    </div>
+                    <div>
+                        <div class="font-semibold text-white mb-1">Photo → Structured Data</div>
+                        <div class="text-sm text-slate-400">Snap an invoice. AI extracts vendor, line items, prices, totals. Flags anomalies.</div>
+                    </div>
+                </div>
+                <div class="flex gap-4">
+                    <div class="w-10 h-10 rounded-xl bg-purple-500/10 flex items-center justify-center text-purple-400 shrink-0">
+                        <span class="material-symbols-outlined">record_voice_over</span>
+                    </div>
+                    <div>
+                        <div class="font-semibold text-white mb-1">Voice → Action</div>
+                        <div class="text-sm text-slate-400">"86 the ribeye" becomes inventory update + POS alert. Hands-free.</div>
+                    </div>
+                </div>
+                <div class="flex gap-4">
+                    <div class="w-10 h-10 rounded-xl bg-green-500/10 flex items-center justify-center text-green-400 shrink-0">
+                        <span class="material-symbols-outlined">bolt</span>
+                    </div>
+                    <div>
+                        <div class="font-semibold text-white mb-1">Instant Alerts</div>
+                        <div class="text-sm text-slate-400">"Tomato prices up 15% vs last week" — know immediately, act immediately.</div>
+                    </div>
+                </div>
+                <div class="flex gap-4">
+                    <div class="w-10 h-10 rounded-xl bg-cyan-500/10 flex items-center justify-center text-cyan-400 shrink-0">
+                        <span class="material-symbols-outlined">hub</span>
+                    </div>
+                    <div>
+                        <div class="font-semibold text-white mb-1">Session Aggregation</div>
+                        <div class="text-sm text-slate-400">10 photos in 60 seconds = 1 delivery session. Context-aware processing.</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- Slide 4: How It Works -->
+<section class="min-h-screen flex items-center py-24">
+    <div class="max-w-5xl mx-auto px-6 w-full">
+        <div class="section-label text-purple-400 mb-4">Product</div>
+        <h2 class="text-4xl md:text-5xl font-bold text-white mb-12">
+            Simple input → Powerful output
+        </h2>
+        
+        <div class="grid md:grid-cols-3 gap-8 mb-16">
+            <div class="text-center">
+                <div class="w-16 h-16 rounded-2xl bg-slate-800 flex items-center justify-center mx-auto mb-4">
+                    <span class="material-symbols-outlined text-3xl text-blue-400">smartphone</span>
+                </div>
+                <div class="font-semibold text-white mb-2">1. Capture</div>
+                <div class="text-sm text-slate-400">Staff send photos, voice notes, or text via Telegram. No app install.</div>
+            </div>
+            <div class="text-center">
+                <div class="w-16 h-16 rounded-2xl bg-slate-800 flex items-center justify-center mx-auto mb-4">
+                    <span class="material-symbols-outlined text-3xl text-purple-400">psychology</span>
+                </div>
+                <div class="font-semibold text-white mb-2">2. Process</div>
+                <div class="text-sm text-slate-400">AI classifies content, extracts data, groups into sessions, flags issues.</div>
+            </div>
+            <div class="text-center">
+                <div class="w-16 h-16 rounded-2xl bg-slate-800 flex items-center justify-center mx-auto mb-4">
+                    <span class="material-symbols-outlined text-3xl text-green-400">dashboard</span>
+                </div>
+                <div class="font-semibold text-white mb-2">3. Act</div>
+                <div class="text-sm text-slate-400">Real-time dashboard for owners. Alerts, reports, and integrations.</div>
+            </div>
+        </div>
+        
+        <div class="glass rounded-2xl p-6">
+            <div class="text-sm font-medium text-slate-300 mb-4">What we extract from each input:</div>
+            <div class="grid md:grid-cols-4 gap-4 text-sm">
+                <div>
+                    <div class="text-blue-400 font-medium mb-2">Invoices</div>
+                    <ul class="text-slate-400 space-y-1">
+                        <li>• Vendor name</li>
+                        <li>• Line items & prices</li>
+                        <li>• Totals & taxes</li>
+                        <li>• Price change alerts</li>
+                    </ul>
+                </div>
+                <div>
+                    <div class="text-purple-400 font-medium mb-2">Voice Notes</div>
+                    <ul class="text-slate-400 space-y-1">
+                        <li>• Transcription</li>
+                        <li>• Intent detection</li>
+                        <li>• Inventory updates</li>
+                        <li>• Task creation</li>
+                    </ul>
+                </div>
+                <div>
+                    <div class="text-green-400 font-medium mb-2">Inventory Photos</div>
+                    <ul class="text-slate-400 space-y-1">
+                        <li>• Item identification</li>
+                        <li>• Quantity estimates</li>
+                        <li>• Expiry detection</li>
+                        <li>• Reorder triggers</li>
+                    </ul>
+                </div>
+                <div>
+                    <div class="text-cyan-400 font-medium mb-2">Delivery Notes</div>
+                    <ul class="text-slate-400 space-y-1">
+                        <li>• Order matching</li>
+                        <li>• Discrepancy flags</li>
+                        <li>• Credit note gen</li>
+                        <li>• Supplier scoring</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- Slide 5: Business Model -->
+<section class="min-h-screen flex items-center py-24">
+    <div class="max-w-5xl mx-auto px-6 w-full">
+        <div class="section-label text-green-400 mb-4">Business Model</div>
+        <h2 class="text-4xl md:text-5xl font-bold text-white mb-12">
+            SaaS + Usage-based pricing
+        </h2>
+        
+        <div class="grid md:grid-cols-3 gap-6 mb-12">
+            <div class="stat-card rounded-2xl p-6 border-l-4 border-blue-500">
+                <div class="text-sm text-slate-400 mb-2">Starter</div>
+                <div class="text-3xl font-bold text-white mb-1">$99<span class="text-lg text-slate-500">/mo</span></div>
+                <div class="text-sm text-slate-400">Single location, core features</div>
+            </div>
+            <div class="stat-card rounded-2xl p-6 border-l-4 border-purple-500">
+                <div class="text-sm text-slate-400 mb-2">Pro</div>
+                <div class="text-3xl font-bold text-white mb-1">$249<span class="text-lg text-slate-500">/mo</span></div>
+                <div class="text-sm text-slate-400">Multi-location, full analytics</div>
+            </div>
+            <div class="stat-card rounded-2xl p-6 border-l-4 border-green-500">
+                <div class="text-sm text-slate-400 mb-2">Enterprise</div>
+                <div class="text-3xl font-bold text-white mb-1">Custom</div>
+                <div class="text-sm text-slate-400">Groups, API, white-label</div>
+            </div>
+        </div>
+        
+        <div class="grid md:grid-cols-2 gap-8">
+            <div class="glass rounded-2xl p-6">
+                <div class="font-semibold text-white mb-4">Unit Economics (Target)</div>
+                <div class="space-y-3 text-sm">
+                    <div class="flex justify-between">
+                        <span class="text-slate-400">Average Contract Value</span>
+                        <span class="text-white font-medium">$2,400/yr</span>
+                    </div>
+                    <div class="flex justify-between">
+                        <span class="text-slate-400">Gross Margin</span>
+                        <span class="text-white font-medium">75%</span>
+                    </div>
+                    <div class="flex justify-between">
+                        <span class="text-slate-400">CAC (blended)</span>
+                        <span class="text-white font-medium">$400</span>
+                    </div>
+                    <div class="flex justify-between">
+                        <span class="text-slate-400">LTV:CAC</span>
+                        <span class="text-green-400 font-medium">6:1</span>
+                    </div>
+                    <div class="flex justify-between">
+                        <span class="text-slate-400">Payback Period</span>
+                        <span class="text-white font-medium">2 months</span>
+                    </div>
+                </div>
+            </div>
+            <div class="glass rounded-2xl p-6">
+                <div class="font-semibold text-white mb-4">Expansion Revenue</div>
+                <div class="space-y-3 text-sm text-slate-400">
+                    <div class="flex gap-3">
+                        <span class="material-symbols-outlined text-green-400 text-lg">add_circle</span>
+                        <span>Additional locations at discounted rate</span>
+                    </div>
+                    <div class="flex gap-3">
+                        <span class="material-symbols-outlined text-green-400 text-lg">add_circle</span>
+                        <span>Usage-based pricing for high-volume processing</span>
+                    </div>
+                    <div class="flex gap-3">
+                        <span class="material-symbols-outlined text-green-400 text-lg">add_circle</span>
+                        <span>Premium integrations (accounting, POS)</span>
+                    </div>
+                    <div class="flex gap-3">
+                        <span class="material-symbols-outlined text-green-400 text-lg">add_circle</span>
+                        <span>Marketplace transaction fees (future)</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- Slide 6: Market -->
+<section class="min-h-screen flex items-center py-24">
+    <div class="max-w-5xl mx-auto px-6 w-full">
+        <div class="section-label text-cyan-400 mb-4">Market Opportunity</div>
+        <h2 class="text-4xl md:text-5xl font-bold text-white mb-12">
+            Large market, underserved segment
+        </h2>
+        
+        <div class="grid md:grid-cols-3 gap-6 mb-12">
+            <div class="stat-card rounded-2xl p-8 text-center">
+                <div class="text-5xl font-bold text-white mb-2">$12B</div>
+                <div class="text-sm text-slate-400 mb-4">TAM</div>
+                <div class="text-xs text-slate-500">Restaurant management software globally</div>
+            </div>
+            <div class="stat-card rounded-2xl p-8 text-center">
+                <div class="text-5xl font-bold text-white mb-2">$3.2B</div>
+                <div class="text-sm text-slate-400 mb-4">SAM</div>
+                <div class="text-xs text-slate-500">Back-office & inventory tools, US + Europe</div>
+            </div>
+            <div class="stat-card rounded-2xl p-8 text-center">
+                <div class="text-5xl font-bold text-white mb-2">$180M</div>
+                <div class="text-sm text-slate-400 mb-4">SOM (Year 5)</div>
+                <div class="text-xs text-slate-500">5% of independent venues in target markets</div>
+            </div>
+        </div>
+        
+        <div class="glass rounded-2xl p-6">
+            <div class="font-semibold text-white mb-4">Why now?</div>
+            <div class="grid md:grid-cols-3 gap-6 text-sm">
+                <div class="flex gap-3">
+                    <span class="material-symbols-outlined text-cyan-400 text-lg">trending_up</span>
+                    <span class="text-slate-400"><strong class="text-slate-300">AI costs dropped 10x</strong> — GPT-4 level vision and NLP now affordable at scale</span>
+                </div>
+                <div class="flex gap-3">
+                    <span class="material-symbols-outlined text-cyan-400 text-lg">smartphone</span>
+                    <span class="text-slate-400"><strong class="text-slate-300">Messaging is universal</strong> — 2B+ Telegram/WhatsApp users, zero onboarding friction</span>
+                </div>
+                <div class="flex gap-3">
+                    <span class="material-symbols-outlined text-cyan-400 text-lg">restaurant</span>
+                    <span class="text-slate-400"><strong class="text-slate-300">Margin pressure</strong> — Post-COVID, restaurants need every % of profit</span>
+                </div>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- Slide 7: Traction -->
+<section class="min-h-screen flex items-center py-24">
+    <div class="max-w-5xl mx-auto px-6 w-full">
+        <div class="section-label text-yellow-400 mb-4">Traction</div>
+        <h2 class="text-4xl md:text-5xl font-bold text-white mb-12">
+            Early validation
+        </h2>
+        
+        <div class="grid md:grid-cols-4 gap-6 mb-12">
+            <div class="stat-card rounded-2xl p-6 text-center">
+                <div class="text-4xl font-bold text-white mb-2">MVP</div>
+                <div class="text-sm text-slate-400">Live & functional</div>
+            </div>
+            <div class="stat-card rounded-2xl p-6 text-center">
+                <div class="text-4xl font-bold text-white mb-2">5</div>
+                <div class="text-sm text-slate-400">Pilot restaurants</div>
+            </div>
+            <div class="stat-card rounded-2xl p-6 text-center">
+                <div class="text-4xl font-bold text-white mb-2">2,400+</div>
+                <div class="text-sm text-slate-400">Documents processed</div>
+            </div>
+            <div class="stat-card rounded-2xl p-6 text-center">
+                <div class="text-4xl font-bold text-white mb-2">94%</div>
+                <div class="text-sm text-slate-400">Extraction accuracy</div>
+            </div>
+        </div>
+        
+        <div class="glass rounded-2xl p-6 mb-8">
+            <div class="font-semibold text-white mb-4">Pilot Feedback</div>
+            <div class="grid md:grid-cols-2 gap-6">
+                <div class="text-sm">
+                    <div class="text-slate-300 italic mb-2">"I used to spend Sundays doing invoices. Now I just snap photos during the week and it's done."</div>
+                    <div class="text-slate-500">— Chef/Owner, Brooklyn gastropub</div>
+                </div>
+                <div class="text-sm">
+                    <div class="text-slate-300 italic mb-2">"Caught a 12% price increase on salmon I would have missed. Paid for a year of service in one invoice."</div>
+                    <div class="text-slate-500">— GM, Manhattan restaurant group</div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="glass rounded-2xl p-6">
+            <div class="font-semibold text-white mb-4">Roadmap</div>
+            <div class="grid md:grid-cols-4 gap-4 text-sm">
+                <div>
+                    <div class="text-green-400 font-medium mb-2">✓ Done</div>
+                    <ul class="text-slate-400 space-y-1">
+                        <li>• Telegram bot</li>
+                        <li>• Invoice OCR</li>
+                        <li>• Voice transcription</li>
+                        <li>• Session grouping</li>
+                    </ul>
+                </div>
+                <div>
+                    <div class="text-blue-400 font-medium mb-2">Q1 2025</div>
+                    <ul class="text-slate-400 space-y-1">
+                        <li>• Web dashboard</li>
+                        <li>• Price tracking</li>
+                        <li>• Basic reporting</li>
+                        <li>• WhatsApp support</li>
+                    </ul>
+                </div>
+                <div>
+                    <div class="text-purple-400 font-medium mb-2">Q2 2025</div>
+                    <ul class="text-slate-400 space-y-1">
+                        <li>• Inventory module</li>
+                        <li>• Xero/QB integration</li>
+                        <li>• Mobile app</li>
+                        <li>• Multi-location</li>
+                    </ul>
+                </div>
+                <div>
+                    <div class="text-slate-500 font-medium mb-2">H2 2025</div>
+                    <ul class="text-slate-400 space-y-1">
+                        <li>• Predictive ordering</li>
+                        <li>• Supplier marketplace</li>
+                        <li>• POS integrations</li>
+                        <li>• UK/EU expansion</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- Slide 8: Competition -->
+<section class="min-h-screen flex items-center py-24">
+    <div class="max-w-5xl mx-auto px-6 w-full">
+        <div class="section-label text-orange-400 mb-4">Competitive Landscape</div>
+        <h2 class="text-4xl md:text-5xl font-bold text-white mb-12">
+            Different approach, different market
+        </h2>
+        
+        <div class="overflow-x-auto mb-8">
+            <table class="w-full text-sm">
+                <thead>
+                    <tr class="border-b border-slate-700">
+                        <th class="text-left py-4 pr-6 text-slate-400 font-medium"></th>
+                        <th class="text-center py-4 px-4 text-blue-400 font-semibold">Resto Pilot</th>
+                        <th class="text-center py-4 px-4 text-slate-400 font-medium">MarketMan</th>
+                        <th class="text-center py-4 px-4 text-slate-400 font-medium">BlueCart</th>
+                        <th class="text-center py-4 px-4 text-slate-400 font-medium">Plate IQ</th>
+                    </tr>
+                </thead>
+                <tbody class="text-slate-400">
+                    <tr class="border-b border-slate-800">
+                        <td class="py-3 pr-6">Onboarding time</td>
+                        <td class="text-center py-3 px-4 text-green-400">Minutes</td>
+                        <td class="text-center py-3 px-4">Days</td>
+                        <td class="text-center py-3 px-4">Days</td>
+                        <td class="text-center py-3 px-4">Days</td>
+                    </tr>
+                    <tr class="border-b border-slate-800">
+                        <td class="py-3 pr-6">App required</td>
+                        <td class="text-center py-3 px-4 text-green-400">No</td>
+                        <td class="text-center py-3 px-4">Yes</td>
+                        <td class="text-center py-3 px-4">Yes</td>
+                        <td class="text-center py-3 px-4">Yes</td>
+                    </tr>
+                    <tr class="border-b border-slate-800">
+                        <td class="py-3 pr-6">Voice input</td>
+                        <td class="text-center py-3 px-4 text-green-400">Yes</td>
+                        <td class="text-center py-3 px-4">No</td>
+                        <td class="text-center py-3 px-4">No</td>
+                        <td class="text-center py-3 px-4">No</td>
+                    </tr>
+                    <tr class="border-b border-slate-800">
+                        <td class="py-3 pr-6">Session aggregation</td>
+                        <td class="text-center py-3 px-4 text-green-400">Yes</td>
+                        <td class="text-center py-3 px-4">No</td>
+                        <td class="text-center py-3 px-4">No</td>
+                        <td class="text-center py-3 px-4">No</td>
+                    </tr>
+                    <tr class="border-b border-slate-800">
+                        <td class="py-3 pr-6">Starting price</td>
+                        <td class="text-center py-3 px-4 text-green-400">$99/mo</td>
+                        <td class="text-center py-3 px-4">$200/mo</td>
+                        <td class="text-center py-3 px-4">$149/mo</td>
+                        <td class="text-center py-3 px-4">$200/mo</td>
+                    </tr>
+                    <tr>
+                        <td class="py-3 pr-6">Target segment</td>
+                        <td class="text-center py-3 px-4 text-blue-400">Independents</td>
+                        <td class="text-center py-3 px-4">Mid-market</td>
+                        <td class="text-center py-3 px-4">Chains</td>
+                        <td class="text-center py-3 px-4">Enterprise</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+        
+        <div class="glass rounded-2xl p-6">
+            <div class="font-semibold text-white mb-3">Our moat</div>
+            <div class="grid md:grid-cols-3 gap-4 text-sm text-slate-400">
+                <div class="flex gap-3">
+                    <span class="material-symbols-outlined text-blue-400 text-lg">psychology</span>
+                    <span><strong class="text-slate-300">AI-first architecture</strong> — Built for unstructured input, not form fields</span>
+                </div>
+                <div class="flex gap-3">
+                    <span class="material-symbols-outlined text-blue-400 text-lg">speed</span>
+                    <span><strong class="text-slate-300">Zero-friction UX</strong> — Adoption happens because there's nothing to adopt</span>
+                </div>
+                <div class="flex gap-3">
+                    <span class="material-symbols-outlined text-blue-400 text-lg">database</span>
+                    <span><strong class="text-slate-300">Data network effects</strong> — Better models with every invoice processed</span>
+                </div>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- Slide 9: Team -->
+<section class="min-h-screen flex items-center py-24">
+    <div class="max-w-5xl mx-auto px-6 w-full">
+        <div class="section-label text-pink-400 mb-4">Team</div>
+        <h2 class="text-4xl md:text-5xl font-bold text-white mb-12">
+            Built by operators & engineers
+        </h2>
+        
+        <div class="grid md:grid-cols-2 gap-8 mb-12">
+            <div class="glass rounded-2xl p-6">
+                <div class="flex items-center gap-4 mb-4">
+                    <div class="w-16 h-16 rounded-full bg-slate-700 flex items-center justify-center text-2xl">👨‍💼</div>
+                    <div>
+                        <div class="font-semibold text-white text-lg">Founder / CEO</div>
+                        <div class="text-sm text-slate-400">Your Name</div>
+                    </div>
+                </div>
+                <div class="text-sm text-slate-400 space-y-1">
+                    <div>• [X] years in hospitality / restaurant operations</div>
+                    <div>• Previously: [Role] at [Company]</div>
+                    <div>• [Education or relevant background]</div>
+                </div>
+            </div>
+            <div class="glass rounded-2xl p-6">
+                <div class="flex items-center gap-4 mb-4">
+                    <div class="w-16 h-16 rounded-full bg-slate-700 flex items-center justify-center text-2xl">👩‍💻</div>
+                    <div>
+                        <div class="font-semibold text-white text-lg">Co-Founder / CTO</div>
+                        <div class="text-sm text-slate-400">Co-founder Name</div>
+                    </div>
+                </div>
+                <div class="text-sm text-slate-400 space-y-1">
+                    <div>• [X] years in AI/ML engineering</div>
+                    <div>• Previously: [Role] at [Company]</div>
+                    <div>• [Education or relevant background]</div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="glass rounded-2xl p-6">
+            <div class="font-semibold text-white mb-4">Hiring Plan (Post-Funding)</div>
+            <div class="grid md:grid-cols-4 gap-4 text-sm">
+                <div>
+                    <div class="text-blue-400 font-medium mb-2">Engineering</div>
+                    <div class="text-slate-400">2 full-stack engineers</div>
+                </div>
+                <div>
+                    <div class="text-purple-400 font-medium mb-2">AI/ML</div>
+                    <div class="text-slate-400">1 ML engineer</div>
+                </div>
+                <div>
+                    <div class="text-green-400 font-medium mb-2">Go-to-Market</div>
+                    <div class="text-slate-400">1 sales/CS lead</div>
+                </div>
+                <div>
+                    <div class="text-cyan-400 font-medium mb-2">Design</div>
+                    <div class="text-slate-400">1 product designer</div>
+                </div>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- Slide 10: The Ask -->
+<section class="min-h-screen flex items-center py-24">
+    <div class="max-w-5xl mx-auto px-6 w-full">
+        <div class="section-label text-green-400 mb-4">The Ask</div>
+        <h2 class="text-4xl md:text-5xl font-bold text-white mb-6">
+            Raising $1.5M Seed
+        </h2>
+        <p class="text-xl text-slate-400 mb-12 max-w-3xl">
+            18-month runway to product-market fit and $1M ARR
+        </p>
+        
+        <div class="grid md:grid-cols-2 gap-8 mb-12">
+            <div class="glass rounded-2xl p-6">
+                <div class="font-semibold text-white mb-4">Use of Funds</div>
+                <div class="space-y-4">
+                    <div>
+                        <div class="flex justify-between text-sm mb-1">
+                            <span class="text-slate-400">Engineering (60%)</span>
+                            <span class="text-white">$900K</span>
+                        </div>
+                        <div class="h-2 bg-slate-800 rounded-full overflow-hidden">
+                            <div class="h-full bg-blue-500 rounded-full" style="width: 60%"></div>
+                        </div>
+                    </div>
+                    <div>
+                        <div class="flex justify-between text-sm mb-1">
+                            <span class="text-slate-400">Go-to-Market (25%)</span>
+                            <span class="text-white">$375K</span>
+                        </div>
+                        <div class="h-2 bg-slate-800 rounded-full overflow-hidden">
+                            <div class="h-full bg-green-500 rounded-full" style="width: 25%"></div>
+                        </div>
+                    </div>
+                    <div>
+                        <div class="flex justify-between text-sm mb-1">
+                            <span class="text-slate-400">Operations (15%)</span>
+                            <span class="text-white">$225K</span>
+                        </div>
+                        <div class="h-2 bg-slate-800 rounded-full overflow-hidden">
+                            <div class="h-full bg-purple-500 rounded-full" style="width: 15%"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="glass rounded-2xl p-6">
+                <div class="font-semibold text-white mb-4">18-Month Milestones</div>
+                <div class="space-y-3 text-sm">
+                    <div class="flex gap-3">
+                        <span class="material-symbols-outlined text-green-400 text-lg">check_circle</span>
+                        <span class="text-slate-400"><strong class="text-white">100+ paying customers</strong> across US metros</span>
+                    </div>
+                    <div class="flex gap-3">
+                        <span class="material-symbols-outlined text-green-400 text-lg">check_circle</span>
+                        <span class="text-slate-400"><strong class="text-white">$1M ARR</strong> with 80%+ gross margin</span>
+                    </div>
+                    <div class="flex gap-3">
+                        <span class="material-symbols-outlined text-green-400 text-lg">check_circle</span>
+                        <span class="text-slate-400"><strong class="text-white">Full product suite</strong> — dashboard, integrations, mobile</span>
+                    </div>
+                    <div class="flex gap-3">
+                        <span class="material-symbols-outlined text-green-400 text-lg">check_circle</span>
+                        <span class="text-slate-400"><strong class="text-white">Series A ready</strong> — metrics to raise $5-8M</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="glass rounded-2xl p-8 text-center">
+            <div class="text-2xl font-bold text-white mb-2">Let's talk</div>
+            <div class="text-slate-400 mb-6">We're looking for investors who understand hospitality and vertical SaaS.</div>
+            <div class="flex justify-center gap-4">
+                <a href="mailto:founder@restopilot.com" class="px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white rounded-full font-medium transition-colors flex items-center gap-2">
+                    <span class="material-symbols-outlined text-lg">mail</span>
+                    founder@restopilot.com
+                </a>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- Footer -->
+<footer class="py-8 border-t border-slate-800/50">
+    <div class="max-w-5xl mx-auto px-6 flex justify-between items-center text-slate-600 text-xs">
+        <div>© 2025 Resto Pilot</div>
+        <div>Confidential — Do Not Distribute</div>
+    </div>
+</footer>
+
+<!-- Print Button -->
+<div class="fixed bottom-6 right-6 z-50 no-print">
+    <button onclick="window.print()" class="w-10 h-10 rounded-full glass flex items-center justify-center text-slate-400 hover:text-white hover:bg-slate-700 transition-all" title="Print to PDF">
+        <span class="material-symbols-outlined text-xl">print</span>
+    </button>
+</div>
+
+<script>
+    // Chat simulation
+    const chatContainer = document.getElementById('chat-container');
+    
+    function scrollToBottom() {
+        if(chatContainer) chatContainer.scrollTop = chatContainer.scrollHeight;
+    }
+
+    function addMessage(text, type, isImage = false, imgSrc = '') {
+        const div = document.createElement('div');
+        div.className = `chat-bubble ${type}`;
+        if (isImage) {
+            div.innerHTML = `<div class="rounded-lg overflow-hidden mb-2"><img src="${imgSrc}" class="w-full h-24 object-cover"></div><span class="text-xs opacity-80">${text}</span>`;
+        } else {
+            div.innerHTML = text;
+        }
+        chatContainer.appendChild(div);
+        scrollToBottom();
+    }
+
+    function addTyping() {
+        const id = 'typing-' + Date.now();
+        const div = document.createElement('div');
+        div.className = 'chat-bubble bot';
+        div.id = id;
+        div.innerHTML = `<div class="typing-indicator"><span></span><span></span><span></span></div>`;
+        chatContainer.appendChild(div);
+        scrollToBottom();
+        return id;
+    }
+
+    function removeTyping(id) {
+        const el = document.getElementById(id);
+        if (el) el.remove();
+    }
+
+    function simulateAction(action) {
+        if (action === 'invoice') {
+            addMessage('Invoice photo', 'user', true, 'https://images.unsplash.com/photo-1554224155-8d04cb21cd6c?auto=format&fit=crop&q=80&w=200');
+            const typingId = addTyping();
+            setTimeout(() => {
+                removeTyping(typingId);
+                addMessage(`✅ <strong>Fresh Farms</strong><br>Total: $450.20<br><span class="text-yellow-400">⚠️ Tomatoes +15%</span>`, 'bot');
+            }, 1200);
+        } 
+        else if (action === 'voice') {
+            addMessage('🎙️ Voice (0:08)', 'user');
+            const typingId = addTyping();
+            setTimeout(() => {
+                removeTyping(typingId);
+                addMessage(`📝 <em>"86 ribeye, 2 left"</em><br>✓ Inventory updated`, 'bot');
+            }, 1200);
+        }
+        else if (action === 'fridge') {
+            addMessage('Fridge photo', 'user', true, 'https://images.unsplash.com/photo-1584473457406-6240486418e9?auto=format&fit=crop&q=80&w=200');
+            const typingId = addTyping();
+            setTimeout(() => {
+                removeTyping(typingId);
+                addMessage(`📦 <strong>Inventory session</strong><br>5 items detected<br>Stock levels updated`, 'bot');
+            }, 1500);
+        }
+    }
+
+    // Simple scroll animations
+    gsap.registerPlugin(ScrollTrigger);
+    
+    gsap.utils.toArray("section").forEach(section => {
+        gsap.from(section.querySelectorAll("h2, .stat-card, .glass"), {
+            scrollTrigger: { trigger: section, start: "top 80%" },
+            y: 30,
+            opacity: 0,
+            duration: 0.6,
+            stagger: 0.1,
+            ease: "power2.out"
+        });
+    });
+</script>
+
+</body>
+</html>
