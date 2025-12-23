@@ -66,16 +66,23 @@ Block/session start:
 - A new session begins when a message arrives and there is no open session, or the prior session is no longer eligible to accept messages (idle gap, cap exceeded, or not open).
 - No user-visible marker is required; we create a session record in the backend and attach messages to it.
 
-## Ingest (FastAPI webhook) responsibilities
+## Webhook (FastAPI) responsibilities
 On every update:
-1) Verify Telegram webhook secret header (existing behavior).
-2) Parse user identity (`telegram_id`, `chat_id`) and message content (text/caption) and any file metadata.
-3) Enforce onboarding: unregistered users must `/start` (existing direction).
-4) Persist:
+1) Verify Telegram webhook secret header.
+2) Parse JSON.
+3) Enqueue the update to Celery (`handle_telegram_update(update)`).
+4) Return immediately with `{"status":"ok"}`.
+
+The webhook should not do DB writes or call external APIs; it only validates + enqueues.
+
+## Worker ingest responsibilities
+The Celery worker (consumer) is responsible for persistence and routing:
+1) Parse user identity (`telegram_id`, `chat_id`) and message content (text/caption) and any file metadata.
+2) Enforce onboarding: unregistered users must `/start` (current direction).
+3) Persist:
    - an immutable “message/event” row for observability and replay of intent (no bytes required)
    - a “session” record (create or update `last_activity_at`, `flush_at`, and `hint_command`)
-5) Enqueue a Celery task to flush at `flush_at` (see below).
-6) Return immediately.
+4) Schedule a Celery task to flush at `flush_at` (see below).
 
 Notes:
 - Webhook response JSON is not used for delayed user feedback. Worker will send “processing now” asynchronously.
@@ -87,13 +94,17 @@ Two core task types:
 1) `flush_session(session_id, expected_last_activity_at)`
 - If the session’s current `last_activity_at` is newer than `expected_last_activity_at`, no-op (a newer flush is scheduled).
 - If eligible, atomically transition session to `processing`, then enqueue processing for that session.
-- Send a “Got it, processing now” message to the user (outbound Telegram `sendMessage`).
+- Optionally send a “Got it, processing now” message to the user (outbound Telegram `sendMessage`).
 
 2) `process_session(session_id)`
 - Load all messages/files attached to the session (the “batch evidence”).
 - Run router to decide which pipeline(s) to invoke.
 - Execute processing sequentially per file or as mini-batches based on router output.
 - Persist processing results and status transitions.
+
+## Reserved (“instant”) commands
+Some commands should bypass batching and trigger immediate behavior (currently: `/start`, `/respond`, `/done`).
+These commands are still persisted in `telegram_messages` for auditability, but they do not wait for the normal idle flush window.
 
 ## Router: inputs and outputs
 Input: “BatchEvidence”
@@ -133,4 +144,3 @@ Recommended correlation id:
 - Session state source of truth for v1: DB-only vs Redis state (DB still as the audit log).
 - Exact DB schema names/models and where they live in `app/db/models`.
 - Task concurrency + rate limiting per user/session.
-
