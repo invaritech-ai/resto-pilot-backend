@@ -177,7 +177,13 @@ def _compute_flush_at(*, started_at: dt.datetime, last_activity_at: dt.datetime,
     return min(idle_deadline, cap_deadline)
 
 
-def ingest_update(*, update: Mapping[str, Any], session: Session, settings: Settings) -> uuid.UUID | None:
+def ingest_update(
+    *,
+    update: Mapping[str, Any],
+    session: Session,
+    settings: Settings,
+    schedule_flush: bool = True,
+) -> uuid.UUID | None:
     parsed = parse_update(update)
     if parsed is None:
         return None
@@ -271,6 +277,9 @@ def ingest_update(*, update: Mapping[str, Any], session: Session, settings: Sett
             extra={"update_id": parsed.update_id, "chat_id": parsed.chat_id},
         )
         return None
+
+    if not schedule_flush:
+        return open_session.id
 
     countdown = max(0.0, (open_session.flush_at - now).total_seconds())
 
