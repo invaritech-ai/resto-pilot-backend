@@ -89,13 +89,15 @@ class InviteCodeService:
     @staticmethod
     def deep_link(*, bot_username: str, code: str) -> str:
         bot_username = bot_username.lstrip("@")
-        return f"t.me/{bot_username}?start={code}"
+        return f"https://t.me/{bot_username}?start={code}"
 
     def get_valid_invite_by_code(
         self, *, code: str, now: dt.datetime | None = None
     ) -> InviteCodes | None:
         now = now or dt.datetime.now(dt.UTC)
-        invite = self.session.scalar(select(InviteCodes).where(InviteCodes.code == code))
+        invite = self.session.scalar(
+            select(InviteCodes).where(InviteCodes.code == code)
+        )
         if invite is None:
             return None
         if invite.used_at is not None:
@@ -104,7 +106,9 @@ class InviteCodeService:
             return None
         return invite
 
-    def mark_used(self, *, invite: InviteCodes, used_at: dt.datetime | None = None) -> None:
+    def mark_used(
+        self, *, invite: InviteCodes, used_at: dt.datetime | None = None
+    ) -> None:
         invite.used_at = used_at or dt.datetime.now(dt.UTC)
         self.session.add(invite)
         self.session.commit()
