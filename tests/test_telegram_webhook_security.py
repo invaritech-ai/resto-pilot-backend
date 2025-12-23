@@ -20,7 +20,9 @@ def _make_test_client(*, settings: Settings) -> TestClient:
 
 
 def test_telegram_webhook_returns_503_if_secret_not_configured():
-    client = _make_test_client(settings=Settings(telegram_webhook_secret_token=""))
+    client = _make_test_client(
+        settings=Settings(telegram_webhook_secret_token="", telegram_batching_enabled=False)
+    )
     resp = client.post(
         "/api/v1/telegram",
         headers={"X-Telegram-Bot-Api-Secret-Token": "anything"},
@@ -31,14 +33,18 @@ def test_telegram_webhook_returns_503_if_secret_not_configured():
 
 
 def test_telegram_webhook_returns_401_if_secret_header_missing():
-    client = _make_test_client(settings=Settings(telegram_webhook_secret_token="secret"))
+    client = _make_test_client(
+        settings=Settings(telegram_webhook_secret_token="secret", telegram_batching_enabled=False)
+    )
     resp = client.post("/api/v1/telegram", json={"update_id": 1})
     assert resp.status_code == 401
     assert resp.json()["detail"] == "Missing Telegram webhook secret"
 
 
 def test_telegram_webhook_returns_403_if_secret_header_invalid():
-    client = _make_test_client(settings=Settings(telegram_webhook_secret_token="secret"))
+    client = _make_test_client(
+        settings=Settings(telegram_webhook_secret_token="secret", telegram_batching_enabled=False)
+    )
     resp = client.post(
         "/api/v1/telegram",
         headers={"X-Telegram-Bot-Api-Secret-Token": "wrong"},
@@ -49,7 +55,9 @@ def test_telegram_webhook_returns_403_if_secret_header_invalid():
 
 
 def test_telegram_webhook_processes_update_when_secret_matches(monkeypatch: pytest.MonkeyPatch):
-    client = _make_test_client(settings=Settings(telegram_webhook_secret_token="secret"))
+    client = _make_test_client(
+        settings=Settings(telegram_webhook_secret_token="secret", telegram_batching_enabled=False)
+    )
 
     called: dict[str, object] = {}
 
@@ -70,4 +78,3 @@ def test_telegram_webhook_processes_update_when_secret_matches(monkeypatch: pyte
     assert resp.status_code == 200
     assert resp.json() == {"status": "ok"}
     assert called["update"] == {"update_id": 1}
-

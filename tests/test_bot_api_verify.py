@@ -1,5 +1,15 @@
 """Quick verification test for bot_api.py"""
 
+import os
+
+import pytest
+
+if os.getenv("RUN_TELEGRAM_LIVE") != "1":
+    pytest.skip(
+        "Live Telegram Bot API verification disabled; set RUN_TELEGRAM_LIVE=1 to enable.",
+        allow_module_level=True,
+    )
+
 from app.telegram.bot_api import send_message
 from app.core.config import Settings, get_settings
 
