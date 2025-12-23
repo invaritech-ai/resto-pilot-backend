@@ -11,7 +11,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
     configure_logging(settings)
 
-    app = FastAPI(title=settings.app_name, version=settings.version, debug=settings.debug)
+    app = FastAPI(
+        title=settings.app_name, version=settings.version, debug=settings.debug
+    )
 
     cors_origins: list[str] = [str(o) for o in (settings.cors_origins or [])]
     if cors_origins or settings.debug:
@@ -28,6 +30,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/health", tags=["health"])
     def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.get("/", tags=["health"])
+    def index() -> dict[str, str]:
+        return {"status": "ok", "message": "Server running"}
 
     return app
 
