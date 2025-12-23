@@ -12,6 +12,8 @@ import logging
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
+from app.domain.services.user_service import UserService
+from app.schemas.user import TelegramUserCreate
 from app.telegram.bot_api import send_message
 from app.telegram.ingest import ingest_update
 from app.telegram.processor import process_update
@@ -72,6 +74,27 @@ def _is_instant_command(update: dict) -> bool:
     return command is not None and command in INSTANT_COMMANDS
 
 
+def _ensure_user_exists_for_update(update: dict, db: Session) -> None:
+    message = update.get("message") or update.get("edited_message")
+    if not isinstance(message, dict):
+        return
+
+    chat_id = (message.get("chat") or {}).get("id")
+    user_info = message.get("from") or {}
+    telegram_id = user_info.get("id")
+    if not isinstance(chat_id, int) or not isinstance(telegram_id, int):
+        return
+
+    payload = TelegramUserCreate(
+        telegram_id=telegram_id,
+        chat_id=chat_id,
+        first_name=user_info.get("first_name"),
+        last_name=user_info.get("last_name"),
+        username=user_info.get("username"),
+    )
+    UserService(db).get_or_create(payload)
+
+
 def handle_update(update: dict, db: Session, settings: Settings) -> None:
     """
     Process a Telegram update with the appropriate handler based on settings.
@@ -91,6 +114,11 @@ def handle_update(update: dict, db: Session, settings: Settings) -> None:
         settings: Application settings including batching configuration
     """
     logger.info("handle_update_received", extra={"update_id": update.get("update_id")})
+
+    command, _args = _extract_command(update)
+    if command in INSTANT_COMMANDS and command != "/start":
+        _ensure_user_exists_for_update(update, db)
+        ingest_update(update=update, session=db, settings=settings, schedule_flush=False)
 
     # Instant commands always bypass batching
     if settings.telegram_batching_enabled and not _is_instant_command(update):
@@ -119,3 +147,6 @@ def handle_update(update: dict, db: Session, settings: Settings) -> None:
         return
 
     send_message(chat_id=chat_id, text=text, settings=settings)
+
+    if command == "/start":
+        ingest_update(update=update, session=db, settings=settings, schedule_flush=False)
