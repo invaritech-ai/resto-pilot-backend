@@ -17,6 +17,12 @@ class Settings(BaseSettings):
     telegram_bot_token: str = ""
     telegram_webhook_secret_token: str = ""
     telegram_superuser_ids: list[int] = []
+    telegram_batching_enabled: bool = False
+    telegram_batch_idle_seconds: int = 30
+    telegram_batch_max_seconds: int = 180
+
+    celery_broker_url: str = ""
+    celery_result_backend: str = ""
 
     auth_secret: str = "dev-secret-change-me"
     auth_token_ttl_seconds: int = 60 * 60 * 24 * 7  # 7 days

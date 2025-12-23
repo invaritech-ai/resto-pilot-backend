@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_db_dep, get_settings_dep
 from app.core.config import Settings
+from app.telegram.ingest import ingest_update
 from app.telegram.processor import process_update
 
 router = APIRouter()
@@ -43,6 +44,10 @@ async def telegram_webhook(
 
     update = await request.json()
     logger.info("telegram_webhook_received", extra={"update": update})
+
+    if settings.telegram_batching_enabled:
+        ingest_update(update=update, session=db, settings=settings)
+        return JSONResponse({"status": "ok"})
 
     response = process_update(update=update, session=db, settings=settings)
     if response is None:
