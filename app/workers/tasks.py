@@ -2,17 +2,22 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import logging
 import uuid
 from typing import cast
 
 from sqlalchemy import select
 
+from app.core.config import get_settings
 from app.db.models.processing_events import ProcessingEvents
 from app.db.models.telegram_messages import TelegramMessages
 from app.db.models.telegram_session import TelegramSessions
+from app.telegram.processor import process_update
 from app.workers.celery_app import celery_app
 from app.workers.celery_types import CeleryDelayable
 from app.workers.db import worker_db_session
+
+logger = logging.getLogger(__name__)
 
 
 def _parse_uuid(value: str) -> uuid.UUID:
@@ -112,5 +117,26 @@ def process_session(*, session_id: str) -> None:
 
 
 @celery_app.task(name="handle_telegram_update")
-def handle_telegram_update(update: dict):
-    pass
+def handle_telegram_update(update: dict) -> None:
+    """
+    Background task to handle Telegram updates without FastAPI request context.
+    
+    Args:
+        update: The Telegram update dictionary from the webhook
+    """
+    with worker_db_session() as db:
+        settings = get_settings()
+        try:
+            process_update(update=update, session=db, settings=settings)
+        except Exception as exc:
+            db.rollback()
+            logger.exception(
+                "telegram_update_processing_failed",
+                extra={
+                    "error": repr(exc),
+                    "update_id": update.get("update_id"),
+                    "message_id": (update.get("message") or {}).get("message_id"),
+                    "chat_id": ((update.get("message") or {}).get("chat") or {}).get("id"),
+                },
+            )
+            raise
