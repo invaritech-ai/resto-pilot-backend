@@ -30,29 +30,45 @@ INSTANT_COMMANDS: frozenset[str] = frozenset({
 })
 
 
-def _extract_command(update: dict) -> str | None:
+def _extract_command(update: dict) -> tuple[str | None, str | None]:
     """
     Extract the command from a Telegram update's text or caption.
 
-    Returns the command (e.g. "/start") if present, or None.
-    Commands are extracted from the first word if it starts with "/".
+    Returns a tuple of (command, args) where:
+    - command is the normalized command (e.g. "/start") or None
+    - args is the remainder of the text after the command (e.g. "CODE") or None
+
+    Commands are extracted from the first token if it starts with "/".
     """
     message = update.get("message") or update.get("edited_message")
     if not isinstance(message, dict):
-        return None
-    text = message.get("text") or message.get("caption") or ""
-    if not isinstance(text, str):
-        return None
-    first_word = text.strip().split(maxsplit=1)[0] if text.strip() else ""
-    if first_word.startswith("/"):
-        # Handle commands with @botname suffix (e.g. "/start@mybot")
-        return first_word.split("@")[0].lower()
-    return None
+        return None, None
+
+    raw_text = message.get("text")
+    raw_caption = message.get("caption")
+    content = raw_text if isinstance(raw_text, str) and raw_text.strip() else raw_caption
+    if not isinstance(content, str):
+        return None, None
+
+    stripped = content.strip()
+    if not stripped:
+        return None, None
+
+    parts = stripped.split(maxsplit=1)
+    first_token = parts[0]
+    rest = parts[1].strip() if len(parts) == 2 else None
+
+    if not first_token.startswith("/"):
+        return None, None
+
+    # Handle commands with @botname suffix (e.g. "/start@mybot")
+    command = first_token.split("@", 1)[0].lower()
+    return command, (rest or None)
 
 
 def _is_instant_command(update: dict) -> bool:
     """Check if the update contains an instant command that bypasses batching."""
-    command = _extract_command(update)
+    command, _args = _extract_command(update)
     return command is not None and command in INSTANT_COMMANDS
 
 
