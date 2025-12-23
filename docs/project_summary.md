@@ -9,6 +9,7 @@ Resto Pilot is an AI-powered assistant designed for restaurant management and op
 - **Database**: [PostgreSQL](https://www.postgresql.org/) (hosted on [Neon](https://neon.tech/))
 - **ORM**: [SQLAlchemy](https://www.sqlalchemy.org/) with [Alembic](https://alembic.sqlalchemy.org/) for migrations
 - **Integrations**: [Telegram Bot API](https://core.telegram.org/bots/api) for user interactions
+- **Workers**: [Celery](https://docs.celeryq.dev/) for background processing (requires a running worker service)
 - **Package Management**: [uv](https://github.com/astral-sh/uv)
 
 ## Project Structure & Architecture
@@ -20,6 +21,7 @@ The codebase follows a modular structure within the `app` directory:
 - `app/db/`: Database models, schemas, and session management.
 - `app/domain/`: Core business logic and services (e.g., restaurant management, user handling).
 - `app/telegram/`: Logic for processing Telegram webhooks and AI interactions.
+- `app/workers/`: Celery task entry points and worker DB helpers.
 - `app/schemas/`: Pydantic models for data validation and API responses.
 - `app/handler.py`: Entry point for AWS Lambda deployment.
 
@@ -30,6 +32,8 @@ The codebase follows a modular structure within the `app` directory:
 - **AI Integration**: Processes incoming messages to provide intelligent assistance (implemented in `app/telegram`).
 - **Scalable Serverless Infrastructure**: Designed for cost-effective scaling on AWS Lambda.
 - **Robust Database Schema**: Managed models for Users, Restaurants, and Invite codes.
+
+Note: even if the HTTP API is deployed serverless (e.g. Lambda), Celery tasks require a separate worker process/service to consume queued work.
 
 ## Getting Started (Quick Links)
 

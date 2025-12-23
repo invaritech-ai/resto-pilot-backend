@@ -1,8 +1,14 @@
 ## Local dev
 - Copy `.env.example` to `.env` and set `APP_DATABASE_URL` to your Neon connection string (e.g. `postgresql+psycopg://user:pass@host/db?sslmode=require`).
-- Install deps and run `uvicorn app.main:app --reload`.
+- Install deps and run the API: `uv run uvicorn app.main:app --reload`.
 - Create your first migration: `alembic revision --autogenerate -m "init"` then `alembic upgrade head`.
 - Configure CORS origins/settings via `.env` as needed.
+
+## Background workers (Celery)
+The Telegram webhook endpoint enqueues updates to Celery and returns `{"status":"ok"}` immediately. A running Celery worker is required for Telegram updates to be persisted/processed.
+
+- Start Redis (local): `redis-server`
+- Start worker: `uv run celery -A app.workers.celery_app.celery_app worker -l info`
 
 ## Package for AWS Lambda (FastAPI + Mangum)
 - Handler entrypoint is `app.handler.handler` (see `app/handler.py`).
@@ -26,3 +32,6 @@
   ```
 - Configure `APP_TELEGRAM_WEBHOOK_SECRET_TOKEN=<YOUR_WEBHOOK_SECRET>` in your server/Lambda environment.
 - Test by sending a message; logs appear in CloudWatch `/aws/lambda/<function-name>`.
+
+Notes:
+- If you deploy the API to Lambda/serverless but keep Celery, run the Celery worker separately (e.g. ECS/Fargate, EC2, Fly, or a small VM). The API enqueues work; the worker does the DB writes and outbound Telegram Bot API calls.
