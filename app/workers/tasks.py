@@ -12,7 +12,7 @@ from app.core.config import get_settings
 from app.db.models.processing_events import ProcessingEvents
 from app.db.models.telegram_messages import TelegramMessages
 from app.db.models.telegram_session import TelegramSessions
-from app.telegram.processor import process_update
+from app.telegram.handler import handle_update
 from app.workers.celery_app import celery_app
 from app.workers.celery_types import CeleryDelayable
 from app.workers.db import worker_db_session
@@ -127,7 +127,7 @@ def handle_telegram_update(update: dict) -> None:
     with worker_db_session() as db:
         settings = get_settings()
         try:
-            process_update(update=update, session=db, settings=settings)
+            handle_update(update=update, db=db, settings=settings)
         except Exception as exc:
             db.rollback()
             logger.exception(

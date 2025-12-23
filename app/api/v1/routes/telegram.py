@@ -4,12 +4,10 @@ import secrets
 from fastapi import APIRouter, Request
 from fastapi import Depends, Header, HTTPException, status
 from fastapi.responses import JSONResponse
-from sqlalchemy.orm import Session
 
-from app.api.deps import get_db_dep, get_settings_dep
+from app.api.deps import get_settings_dep
 from app.core.config import Settings
-from app.telegram.ingest import ingest_update
-from app.telegram.processor import process_update
+from app.workers.tasks import handle_telegram_update
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -18,7 +16,6 @@ logger = logging.getLogger(__name__)
 @router.post("/telegram")
 async def telegram_webhook(
     request: Request,
-    db: Session = Depends(get_db_dep),
     settings: Settings = Depends(get_settings_dep),
     x_telegram_bot_api_secret_token: str | None = Header(
         default=None, alias="X-Telegram-Bot-Api-Secret-Token"
@@ -28,6 +25,11 @@ async def telegram_webhook(
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Telegram webhook is not configured",
+        )
+    if not settings.celery_broker_url:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Message broker is not configured",
         )
     if not x_telegram_bot_api_secret_token:
         raise HTTPException(
@@ -45,11 +47,5 @@ async def telegram_webhook(
     update = await request.json()
     logger.info("telegram_webhook_received", extra={"update": update})
 
-    if settings.telegram_batching_enabled:
-        ingest_update(update=update, session=db, settings=settings)
-        return JSONResponse({"status": "ok"})
-
-    response = process_update(update=update, session=db, settings=settings)
-    if response is None:
-        return JSONResponse({"status": "ok"})
-    return JSONResponse(response)
+    handle_telegram_update.delay(update)
+    return JSONResponse({"status": "ok"})
