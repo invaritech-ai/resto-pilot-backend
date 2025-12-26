@@ -13,11 +13,26 @@ from app.db.models.processing_events import ProcessingEvents
 from app.db.models.telegram_messages import TelegramMessages
 from app.db.models.telegram_session import TelegramSessions
 from app.telegram.handler import handle_update
+from app.telegram.bot_api import send_message
 from app.workers.celery_app import celery_app
 from app.workers.celery_types import CeleryDelayable
 from app.workers.db import worker_db_session
 
 logger = logging.getLogger(__name__)
+
+SESSION_FLUSH_REPLY_TEXT = "Got it — I'm on it."
+
+
+def _coerce_utc(value: dt.datetime) -> dt.datetime:
+    """
+    Normalize datetimes to UTC-aware.
+
+    SQLite may return naive datetimes even when columns are declared with
+    timezone=True; treat naive values as UTC.
+    """
+    if value.tzinfo is None:
+        return value.replace(tzinfo=dt.UTC)
+    return value.astimezone(dt.UTC)
 
 
 def _parse_uuid(value: str) -> uuid.UUID:
@@ -28,6 +43,7 @@ def _parse_uuid(value: str) -> uuid.UUID:
 def flush_session(*, session_id: str, expected_last_activity_at: str) -> None:
     expected = dt.datetime.fromisoformat(expected_last_activity_at)
     session_uuid = _parse_uuid(session_id)
+    chat_id: int | None = None
 
     with worker_db_session() as db:
         db_session = db.execute(
@@ -39,9 +55,10 @@ def flush_session(*, session_id: str, expected_last_activity_at: str) -> None:
             return
         if db_session.status != "open":
             return
-        if db_session.last_activity_at != expected:
+        if _coerce_utc(db_session.last_activity_at) != _coerce_utc(expected):
             return
 
+        chat_id = db_session.chat_id
         now = dt.datetime.now(dt.UTC)
         db_session.status = "processing"
         db_session.closed_at = now
@@ -57,6 +74,15 @@ def flush_session(*, session_id: str, expected_last_activity_at: str) -> None:
         db.commit()
 
     cast(CeleryDelayable, process_session).delay(session_id=session_id)
+    if isinstance(chat_id, int):
+        settings = get_settings()
+        try:
+            send_message(chat_id=chat_id, text=SESSION_FLUSH_REPLY_TEXT, settings=settings)
+        except Exception as exc:
+            logger.exception(
+                "telegram_flush_reply_failed",
+                extra={"error": repr(exc), "chat_id": chat_id, "session_id": session_id},
+            )
 
 
 @celery_app.task(name="process_session")
