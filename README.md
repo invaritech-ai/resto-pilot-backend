@@ -9,6 +9,7 @@ The Telegram webhook endpoint enqueues updates to Celery and returns `{"status":
 
 - Start Redis (local): `redis-server`
 - Start worker: `uv run celery -A app.workers.celery_app.celery_app worker -l info`
+- Notes on SQS + reliability: `docs/aws-sqs-celery-broker-notes.md`
 
 ## Package for AWS Lambda (FastAPI + Mangum)
 - Handler entrypoint is `app.handler.handler` (see `app/handler.py`).
