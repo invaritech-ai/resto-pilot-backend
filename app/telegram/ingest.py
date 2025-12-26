@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping, cast
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -47,6 +47,18 @@ _HINT_COMMANDS: set[str] = {
     "/reset",
     "/help",
 }
+
+
+def _coerce_utc(value: dt.datetime) -> dt.datetime:
+    """
+    Normalize datetimes to UTC-aware.
+
+    SQLite may return naive datetimes even when columns are declared with
+    timezone=True; treat naive values as UTC.
+    """
+    if value.tzinfo is None:
+        return value.replace(tzinfo=dt.UTC)
+    return value.astimezone(dt.UTC)
 
 
 def _parse_unix_seconds(value: object) -> dt.datetime:
@@ -125,7 +137,9 @@ def parse_update(update: Mapping[str, Any]) -> ParsedTelegramMessage | None:
 
     received_at = _parse_unix_seconds(message.get("date"))
     text = message.get("text") if isinstance(message.get("text"), str) else None
-    caption = message.get("caption") if isinstance(message.get("caption"), str) else None
+    caption = (
+        message.get("caption") if isinstance(message.get("caption"), str) else None
+    )
 
     file_kind: str | None = None
     file_id: str | None = None
@@ -139,20 +153,32 @@ def parse_update(update: Mapping[str, Any]) -> ParsedTelegramMessage | None:
         file_kind = "document"
         file_id = doc.get("file_id") if isinstance(doc.get("file_id"), str) else None
         file_unique_id = (
-            doc.get("file_unique_id") if isinstance(doc.get("file_unique_id"), str) else None
+            doc.get("file_unique_id")
+            if isinstance(doc.get("file_unique_id"), str)
+            else None
         )
-        filename = doc.get("file_name") if isinstance(doc.get("file_name"), str) else None
+        filename = (
+            doc.get("file_name") if isinstance(doc.get("file_name"), str) else None
+        )
         mime = doc.get("mime_type") if isinstance(doc.get("mime_type"), str) else None
         size = doc.get("file_size") if isinstance(doc.get("file_size"), int) else None
     elif "photo" in message:
         best = _pick_photo_variant(message.get("photo"))
         if best is not None:
             file_kind = "photo"
-            file_id = best.get("file_id") if isinstance(best.get("file_id"), str) else None
-            file_unique_id = (
-                best.get("file_unique_id") if isinstance(best.get("file_unique_id"), str) else None
+            file_id = (
+                best.get("file_id") if isinstance(best.get("file_id"), str) else None
             )
-            size = best.get("file_size") if isinstance(best.get("file_size"), int) else None
+            file_unique_id = (
+                best.get("file_unique_id")
+                if isinstance(best.get("file_unique_id"), str)
+                else None
+            )
+            size = (
+                best.get("file_size")
+                if isinstance(best.get("file_size"), int)
+                else None
+            )
 
     return ParsedTelegramMessage(
         update_id=update_id,
@@ -171,9 +197,15 @@ def parse_update(update: Mapping[str, Any]) -> ParsedTelegramMessage | None:
     )
 
 
-def _compute_flush_at(*, started_at: dt.datetime, last_activity_at: dt.datetime, settings: Settings) -> dt.datetime:
-    idle_deadline = last_activity_at + dt.timedelta(seconds=settings.telegram_batch_idle_seconds)
-    cap_deadline = started_at + dt.timedelta(seconds=settings.telegram_batch_max_seconds)
+def _compute_flush_at(
+    *, started_at: dt.datetime, last_activity_at: dt.datetime, settings: Settings
+) -> dt.datetime:
+    idle_deadline = last_activity_at + dt.timedelta(
+        seconds=settings.telegram_batch_idle_seconds
+    )
+    cap_deadline = started_at + dt.timedelta(
+        seconds=settings.telegram_batch_max_seconds
+    )
     return min(idle_deadline, cap_deadline)
 
 
@@ -201,16 +233,22 @@ def ingest_update(
 
     open_session = session.scalar(
         select(TelegramSessions)
-        .where(TelegramSessions.chat_id == parsed.chat_id, TelegramSessions.status == "open")
+        .where(
+            TelegramSessions.chat_id == parsed.chat_id,
+            TelegramSessions.status == "open",
+        )
         .order_by(TelegramSessions.started_at.desc())
         .limit(1)
     )
 
     should_start_new = True
     if open_session is not None:
-        idle_gap = (now - open_session.last_activity_at).total_seconds()
-        age = (now - open_session.started_at).total_seconds()
-        if idle_gap < settings.telegram_batch_idle_seconds and age < settings.telegram_batch_max_seconds:
+        idle_gap = (now - _coerce_utc(open_session.last_activity_at)).total_seconds()
+        age = (now - _coerce_utc(open_session.started_at)).total_seconds()
+        if (
+            idle_gap < settings.telegram_batch_idle_seconds
+            and age < settings.telegram_batch_max_seconds
+        ):
             should_start_new = False
 
     if open_session is None or should_start_new:
@@ -218,7 +256,9 @@ def ingest_update(
             chat_id=parsed.chat_id,
             started_at=now,
             last_activity_at=now,
-            flush_at=_compute_flush_at(started_at=now, last_activity_at=now, settings=settings),
+            flush_at=_compute_flush_at(
+                started_at=now, last_activity_at=now, settings=settings
+            ),
             status="open",
             hint_command=None,
         )
@@ -234,7 +274,9 @@ def ingest_update(
 
     open_session.last_activity_at = now
     open_session.flush_at = _compute_flush_at(
-        started_at=open_session.started_at, last_activity_at=now, settings=settings
+        started_at=_coerce_utc(open_session.started_at),
+        last_activity_at=now,
+        settings=settings,
     )
     if hint == "/done":
         open_session.flush_at = now
@@ -298,3 +340,41 @@ def ingest_update(
     )
 
     return open_session.id
+
+
+def seal_open_session(*, chat_id: int, session: Session) -> uuid.UUID | None:
+    now = dt.datetime.now(dt.UTC)
+
+    latest_open_session_id = (
+        select(TelegramSessions.id)
+        .where(TelegramSessions.chat_id == chat_id, TelegramSessions.status == "open")
+        .order_by(TelegramSessions.started_at.desc())
+        .limit(1)
+        .scalar_subquery()
+    )
+
+    sealed_id = session.execute(
+        update(TelegramSessions)
+        .where(
+            TelegramSessions.id == latest_open_session_id,
+            TelegramSessions.status == "open",
+        )
+        .values(status="processing", closed_at=now)
+        .returning(TelegramSessions.id)
+    ).scalar_one_or_none()
+
+    if sealed_id is None:
+        return None
+
+    session.add(
+        ProcessingEvents(
+            session_id=sealed_id,
+            at=now,
+            event="session_sealed_by_command",
+            payload_json=None,
+            error=None,
+        )
+    )
+
+    session.commit()
+    return sealed_id

@@ -8,6 +8,7 @@ Telegram updates, keeping the webhook route thin.
 from __future__ import annotations
 
 import logging
+from typing import cast
 
 from sqlalchemy.orm import Session
 
@@ -15,8 +16,9 @@ from app.core.config import Settings
 from app.domain.services.user_service import UserService
 from app.schemas.user import TelegramUserCreate
 from app.telegram.bot_api import send_message
-from app.telegram.ingest import ingest_update
+from app.telegram.ingest import ingest_update, seal_open_session
 from app.telegram.processor import process_update
+from app.workers.celery_types import CeleryDelayable
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +32,13 @@ INSTANT_COMMANDS: frozenset[str] = frozenset({
     "/respond",
     "/done",
 })
+
+FORCE_FLUSH_COMMANDS: frozenset[str] = frozenset({
+    "/respond",
+    "/done",
+})
+
+FORCE_FLUSH_REPLY_TEXT = "Got it — I'm on it."
 
 
 def _extract_command(update: dict) -> tuple[str | None, str | None]:
@@ -116,6 +125,37 @@ def handle_update(update: dict, db: Session, settings: Settings) -> None:
     logger.info("handle_update_received", extra={"update_id": update.get("update_id")})
 
     command, _args = _extract_command(update)
+
+    if command in FORCE_FLUSH_COMMANDS:
+        message = update.get("message") or update.get("edited_message")
+        if not isinstance(message, dict):
+            return
+
+        chat_id = (message.get("chat") or {}).get("id")
+        if not isinstance(chat_id, int):
+            return
+
+        _ensure_user_exists_for_update(update, db)
+        ingest_update(update=update, session=db, settings=settings, schedule_flush=False)
+
+        sealed_id = seal_open_session(chat_id=chat_id, session=db)
+        if sealed_id is None:
+            return
+
+        from app.workers.tasks import process_session  # imported lazily
+
+        cast(CeleryDelayable, process_session).delay(session_id=str(sealed_id))
+
+        try:
+            send_message(chat_id=chat_id, text=FORCE_FLUSH_REPLY_TEXT, settings=settings)
+        except Exception as exc:
+            logger.exception(
+                "telegram_force_flush_reply_failed",
+                extra={"error": repr(exc), "chat_id": chat_id, "session_id": str(sealed_id)},
+            )
+
+        return
+
     if command in INSTANT_COMMANDS and command != "/start":
         _ensure_user_exists_for_update(update, db)
         ingest_update(update=update, session=db, settings=settings, schedule_flush=False)
