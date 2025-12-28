@@ -22,6 +22,9 @@ The codebase follows a modular structure within the `app` directory:
 - `app/domain/`: Core business logic and services (e.g., restaurant management, user handling).
 - `app/telegram/`: Logic for processing Telegram webhooks and AI interactions.
 - `app/workers/`: Celery task entry points and worker DB helpers.
+
+See also:
+- Codebase summary: `docs/resto-pilot-codebase-summary.md`
 - `app/schemas/`: Pydantic models for data validation and API responses.
 - `app/handler.py`: Entry point for AWS Lambda deployment.
 
