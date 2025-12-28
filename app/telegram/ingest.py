@@ -15,6 +15,7 @@ from app.db.models.processing_events import ProcessingEvents
 from app.db.models.telegram_messages import TelegramMessages
 from app.db.models.telegram_session import TelegramSessions
 from app.db.models.user import User
+from app.telegram.commands import extract_command
 from app.workers.celery_types import CeleryApplyAsync
 
 logger = logging.getLogger(__name__)
@@ -67,12 +68,10 @@ def _parse_unix_seconds(value: object) -> dt.datetime:
     return dt.datetime.now(dt.UTC)
 
 
-def _extract_hint_command(text: str | None) -> str | None:
-    if not isinstance(text, str):
-        return None
-    token = text.strip().split(maxsplit=1)[0].lower()
-    if token in _HINT_COMMANDS:
-        return token
+def _extract_hint_command(*, text: str | None, caption: str | None) -> str | None:
+    command, _args = extract_command(text, caption)
+    if command in _HINT_COMMANDS:
+        return command
     return None
 
 
@@ -229,7 +228,7 @@ def ingest_update(
         return None
 
     now = dt.datetime.now(dt.UTC)
-    hint = _extract_hint_command(parsed.text)
+    hint = _extract_hint_command(text=parsed.text, caption=parsed.caption)
 
     open_session = session.scalar(
         select(TelegramSessions)
@@ -323,7 +322,7 @@ def ingest_update(
     if not schedule_flush:
         return open_session.id
 
-    countdown = max(0.0, (open_session.flush_at - now).total_seconds())
+    countdown = max(0.0, (_coerce_utc(open_session.flush_at) - now).total_seconds())
 
     if not settings.celery_broker_url:
         logger.warning("celery_broker_not_configured")
