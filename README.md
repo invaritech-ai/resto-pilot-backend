@@ -33,6 +33,7 @@ The Telegram webhook endpoint enqueues updates to Celery and returns `{"status":
   ```
 - Configure `APP_TELEGRAM_WEBHOOK_SECRET_TOKEN=<YOUR_WEBHOOK_SECRET>` in your server/Lambda environment.
 - Test by sending a message; logs appear in CloudWatch `/aws/lambda/<function-name>`.
+- Manage Telegram command menu (optional): `docs/telegram-bot-commands.md`
 
 Notes:
 - If you deploy the API to Lambda/serverless but keep Celery, run the Celery worker separately (e.g. ECS/Fargate, EC2, Fly, or a small VM). The API enqueues work; the worker does the DB writes and outbound Telegram Bot API calls.
