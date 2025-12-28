@@ -7,16 +7,24 @@ Telegram updates, keeping the webhook route thin.
 
 from __future__ import annotations
 
+import datetime as dt
 import logging
+import uuid
 from typing import cast
 
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
+from app.db.models.processing_events import ProcessingEvents
+from app.db.models.telegram_messages import TelegramMessages
+from app.db.models.user import User
 from app.domain.services.user_service import UserService
 from app.schemas.user import TelegramUserCreate
 from app.telegram.bot_api import send_message
-from app.telegram.ingest import ingest_update, seal_open_session
+from app.telegram.commands import extract_command
+from app.telegram.ingest import ingest_update, parse_update, seal_open_session
 from app.telegram.processor import process_update
 from app.workers.celery_types import CeleryDelayable
 
@@ -39,47 +47,67 @@ FORCE_FLUSH_COMMANDS: frozenset[str] = frozenset({
 })
 
 FORCE_FLUSH_REPLY_TEXT = "Got it — I'm on it."
+NOTHING_TO_PROCESS_REPLY_TEXT = "Nothing to process right now."
 
 
-def _extract_command(update: dict) -> tuple[str | None, str | None]:
-    """
-    Extract the command from a Telegram update's text or caption.
+def _persist_update_to_session(*, update: dict, db: Session, session_id: uuid.UUID) -> None:
+    parsed = parse_update(update)
+    if parsed is None:
+        return
 
-    Returns a tuple of (command, args) where:
-    - command is the normalized command (e.g. "/start") or None
-    - args is the remainder of the text after the command (e.g. "CODE") or None
+    user = db.scalar(select(User).where(User.telegram_id == parsed.telegram_id))
+    if user is None:
+        return
 
-    Commands are extracted from the first token if it starts with "/".
-    """
+    now = dt.datetime.now(dt.UTC)
+    db.add(
+        TelegramMessages(
+            session_id=session_id,
+            chat_id=parsed.chat_id,
+            user_id=user.id,
+            telegram_id=parsed.telegram_id,
+            message_id=parsed.message_id,
+            update_id=parsed.update_id,
+            received_at=parsed.received_at,
+            text=parsed.text,
+            caption=parsed.caption,
+            file_id=parsed.file_id,
+            file_unique_id=parsed.file_unique_id,
+            file_kind=parsed.file_kind,
+            mime=parsed.mime,
+            filename=parsed.filename,
+            size=parsed.size,
+        )
+    )
+    db.add(
+        ProcessingEvents(
+            session_id=session_id,
+            at=now,
+            event="ingested_update",
+            payload_json=None,
+            error=None,
+        )
+    )
+
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+
+
+def _extract_command_from_update(update: dict) -> tuple[str | None, str | None]:
     message = update.get("message") or update.get("edited_message")
     if not isinstance(message, dict):
         return None, None
 
-    raw_text = message.get("text")
-    raw_caption = message.get("caption")
-    content = raw_text if isinstance(raw_text, str) and raw_text.strip() else raw_caption
-    if not isinstance(content, str):
-        return None, None
-
-    stripped = content.strip()
-    if not stripped:
-        return None, None
-
-    parts = stripped.split(maxsplit=1)
-    first_token = parts[0]
-    rest = parts[1].strip() if len(parts) == 2 else None
-
-    if not first_token.startswith("/"):
-        return None, None
-
-    # Handle commands with @botname suffix (e.g. "/start@mybot")
-    command = first_token.split("@", 1)[0].lower()
-    return command, (rest or None)
+    text = message.get("text") if isinstance(message.get("text"), str) else None
+    caption = message.get("caption") if isinstance(message.get("caption"), str) else None
+    return extract_command(text, caption)
 
 
 def _is_instant_command(update: dict) -> bool:
     """Check if the update contains an instant command that bypasses batching."""
-    command, _args = _extract_command(update)
+    command, _args = _extract_command_from_update(update)
     return command is not None and command in INSTANT_COMMANDS
 
 
@@ -124,7 +152,7 @@ def handle_update(update: dict, db: Session, settings: Settings) -> None:
     """
     logger.info("handle_update_received", extra={"update_id": update.get("update_id")})
 
-    command, _args = _extract_command(update)
+    command, _args = _extract_command_from_update(update)
 
     if command in FORCE_FLUSH_COMMANDS:
         message = update.get("message") or update.get("edited_message")
@@ -135,12 +163,21 @@ def handle_update(update: dict, db: Session, settings: Settings) -> None:
         if not isinstance(chat_id, int):
             return
 
-        _ensure_user_exists_for_update(update, db)
-        ingest_update(update=update, session=db, settings=settings, schedule_flush=False)
-
         sealed_id = seal_open_session(chat_id=chat_id, session=db)
         if sealed_id is None:
+            try:
+                send_message(
+                    chat_id=chat_id, text=NOTHING_TO_PROCESS_REPLY_TEXT, settings=settings
+                )
+            except Exception as exc:
+                logger.exception(
+                    "telegram_force_flush_nothing_to_process_reply_failed",
+                    extra={"error": repr(exc), "chat_id": chat_id},
+                )
             return
+
+        _ensure_user_exists_for_update(update, db)
+        _persist_update_to_session(update=update, db=db, session_id=sealed_id)
 
         from app.workers.tasks import process_session  # imported lazily
 
