@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping, cast
 import uuid
 
-from sqlalchemy import select, update
+from sqlalchemy import select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -19,6 +19,25 @@ from app.telegram.commands import extract_command
 from app.workers.celery_types import CeleryApplyAsync
 
 logger = logging.getLogger(__name__)
+
+
+def lock_chat_id(*, session: Session, chat_id: int) -> None:
+    """
+    Serialize ingestion per chat_id in Postgres.
+
+    This prevents concurrent requests/workers from creating multiple open sessions
+    or racing updates to session state for the same chat.
+    """
+    bind = session.get_bind()
+    if bind is None or bind.dialect.name != "postgresql":
+        return
+
+    lock_key = int(chat_id)
+    min_i64 = -(2**63)
+    max_i64 = 2**63 - 1
+    if lock_key < min_i64 or lock_key > max_i64:
+        lock_key = hash(lock_key) % max_i64
+    session.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": lock_key})
 
 
 @dataclass(frozen=True)
@@ -217,18 +236,35 @@ def ingest_update(
 ) -> uuid.UUID | None:
     parsed = parse_update(update)
     if parsed is None:
+        logger.info("telegram_ingest_parse_failed")
         return None
+
+    lock_chat_id(session=session, chat_id=parsed.chat_id)
 
     user = session.scalar(select(User).where(User.telegram_id == parsed.telegram_id))
     if user is None:
         logger.info(
             "telegram_ingest_user_not_registered",
-            extra={"telegram_id": parsed.telegram_id, "chat_id": parsed.chat_id},
+            extra={
+                "telegram_id": parsed.telegram_id,
+                "chat_id": parsed.chat_id,
+                "update_id": parsed.update_id,
+                "message_id": parsed.message_id,
+            },
         )
         return None
 
     now = dt.datetime.now(dt.UTC)
     hint = _extract_hint_command(text=parsed.text, caption=parsed.caption)
+    logger.info(
+        "telegram_ingest_start update_id=%s message_id=%s chat_id=%s telegram_id=%s hint=%s schedule_flush=%s",
+        parsed.update_id,
+        parsed.message_id,
+        parsed.chat_id,
+        parsed.telegram_id,
+        hint,
+        schedule_flush,
+    )
 
     open_session = session.scalar(
         select(TelegramSessions)
@@ -263,6 +299,19 @@ def ingest_update(
         )
         session.add(open_session)
         session.flush()
+        logger.info(
+            "telegram_ingest_open_session_created update_id=%s chat_id=%s session_id=%s",
+            parsed.update_id,
+            parsed.chat_id,
+            str(open_session.id),
+        )
+    else:
+        logger.info(
+            "telegram_ingest_open_session_reused update_id=%s chat_id=%s session_id=%s",
+            parsed.update_id,
+            parsed.chat_id,
+            str(open_session.id),
+        )
 
     assert open_session is not None
 
@@ -320,6 +369,12 @@ def ingest_update(
         return None
 
     if not schedule_flush:
+        logger.info(
+            "telegram_ingest_done_no_flush_scheduled update_id=%s chat_id=%s session_id=%s",
+            parsed.update_id,
+            parsed.chat_id,
+            str(open_session.id),
+        )
         return open_session.id
 
     countdown = max(0.0, (_coerce_utc(open_session.flush_at) - now).total_seconds())
@@ -330,12 +385,26 @@ def ingest_update(
 
     from app.workers.tasks import flush_session  # imported lazily
 
-    cast(CeleryApplyAsync, flush_session).apply_async(
+    logger.info(
+        "telegram_ingest_scheduling_flush update_id=%s chat_id=%s session_id=%s countdown=%s",
+        parsed.update_id,
+        parsed.chat_id,
+        str(open_session.id),
+        countdown,
+    )
+    async_result = cast(CeleryApplyAsync, flush_session).apply_async(
         kwargs={
             "session_id": str(open_session.id),
             "expected_last_activity_at": open_session.last_activity_at.isoformat(),
         },
         countdown=countdown,
+    )
+    logger.info(
+        "telegram_ingest_flush_scheduled task_id=%s update_id=%s chat_id=%s session_id=%s",
+        getattr(async_result, "id", None),
+        parsed.update_id,
+        parsed.chat_id,
+        str(open_session.id),
     )
 
     return open_session.id
@@ -343,6 +412,8 @@ def ingest_update(
 
 def seal_open_session(*, chat_id: int, session: Session) -> uuid.UUID | None:
     now = dt.datetime.now(dt.UTC)
+
+    lock_chat_id(session=session, chat_id=chat_id)
 
     latest_open_session_id = (
         select(TelegramSessions.id)

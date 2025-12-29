@@ -6,8 +6,15 @@ This project supports a “batched Telegram ingest” mode behind a feature flag
 - `APP_TELEGRAM_BATCHING_ENABLED=true` to enable batching mode for Telegram sessions.
 - `APP_TELEGRAM_BATCH_IDLE_SECONDS=30` inactivity debounce window.
 - `APP_TELEGRAM_BATCH_MAX_SECONDS=180` hard cap window.
-- `APP_CELERY_BROKER_URL=...` (Upstash is typically `rediss://...`).
+- `APP_CELERY_BROKER_URL=...` (Upstash is typically `rediss://...`, SQS is `sqs://`).
 - `APP_CELERY_RESULT_BACKEND=` optional; leave empty unless you need task results (set to a real backend URL).
+
+### If using AWS SQS
+- Install: `celery[sqs]` (already included in this repo's dependencies).
+- Set:
+  - `APP_CELERY_BROKER_URL=sqs://`
+  - `APP_CELERY_SQS_QUEUE_URL=...`
+  - `APP_CELERY_SQS_REGION=...` (or rely on `AWS_DEFAULT_REGION`)
 
 ## What happens in batching mode
 - Webhook validates the secret header, then enqueues `handle_telegram_update(update)` and returns `{"status":"ok"}` immediately.
