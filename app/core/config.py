@@ -21,8 +21,18 @@ class Settings(BaseSettings):
     telegram_batch_idle_seconds: int = 30
     telegram_batch_max_seconds: int = 180
 
+    # Optional AWS profile name for local dev.
+    # If set, the app will use this profile for AWS SDK calls (including Celery SQS broker)
+    # unless AWS_PROFILE is already set in the environment.
+    aws_profile: str = ""
+
     celery_broker_url: str = ""
     celery_result_backend: str = ""
+    celery_sqs_region: str = ""
+    celery_sqs_queue_url: str = ""
+    celery_sqs_queue_name: str = "celery"
+    celery_sqs_visibility_timeout_seconds: int = 60 * 30  # 30 minutes
+    celery_sqs_wait_time_seconds: int = 10  # long polling (max 20)
 
     auth_secret: str = "dev-secret-change-me"
     auth_token_ttl_seconds: int = 60 * 60 * 24 * 7  # 7 days

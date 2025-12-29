@@ -150,9 +150,24 @@ def handle_update(update: dict, db: Session, settings: Settings) -> None:
         db: Database session for persistence operations
         settings: Application settings including batching configuration
     """
-    logger.info("handle_update_received", extra={"update_id": update.get("update_id")})
+    update_id = update.get("update_id") if isinstance(update, dict) else None
+    message = (update.get("message") or update.get("edited_message") or {}) if isinstance(update, dict) else {}
+    chat_id = (message.get("chat") or {}).get("id") if isinstance(message, dict) else None
+
+    logger.info(
+        "handle_update_received update_id=%s chat_id=%s batching_enabled=%s",
+        update_id,
+        chat_id,
+        settings.telegram_batching_enabled,
+    )
 
     command, _args = _extract_command_from_update(update)
+    logger.info(
+        "handle_update_routing update_id=%s chat_id=%s command=%s",
+        update_id,
+        chat_id,
+        command,
+    )
 
     if command in FORCE_FLUSH_COMMANDS:
         message = update.get("message") or update.get("edited_message")
@@ -164,6 +179,13 @@ def handle_update(update: dict, db: Session, settings: Settings) -> None:
             return
 
         sealed_id = seal_open_session(chat_id=chat_id, session=db)
+        logger.info(
+            "telegram_force_flush_command update_id=%s chat_id=%s command=%s sealed_session_id=%s",
+            update_id,
+            chat_id,
+            command,
+            str(sealed_id) if sealed_id is not None else None,
+        )
         if sealed_id is None:
             try:
                 send_message(
@@ -181,6 +203,12 @@ def handle_update(update: dict, db: Session, settings: Settings) -> None:
 
         from app.workers.tasks import process_session  # imported lazily
 
+        logger.info(
+            "telegram_force_flush_enqueuing_process_session update_id=%s chat_id=%s session_id=%s",
+            update_id,
+            chat_id,
+            str(sealed_id),
+        )
         cast(CeleryDelayable, process_session).delay(session_id=str(sealed_id))
 
         try:
@@ -195,15 +223,35 @@ def handle_update(update: dict, db: Session, settings: Settings) -> None:
 
     if command in INSTANT_COMMANDS and command != "/start":
         _ensure_user_exists_for_update(update, db)
-        ingest_update(update=update, session=db, settings=settings, schedule_flush=False)
+        session_id = ingest_update(
+            update=update, session=db, settings=settings, schedule_flush=False
+        )
+        logger.info(
+            "telegram_instant_command_ingested update_id=%s chat_id=%s command=%s session_id=%s",
+            update_id,
+            chat_id,
+            command,
+            str(session_id) if session_id is not None else None,
+        )
 
     # Instant commands always bypass batching
     if settings.telegram_batching_enabled and not _is_instant_command(update):
-        ingest_update(update=update, session=db, settings=settings)
+        session_id = ingest_update(update=update, session=db, settings=settings)
+        logger.info(
+            "telegram_batched_message_ingested update_id=%s chat_id=%s session_id=%s",
+            update_id,
+            chat_id,
+            str(session_id) if session_id is not None else None,
+        )
         return
 
     response = process_update(update=update, session=db, settings=settings)
     if response is None:
+        logger.info(
+            "telegram_process_update_noop update_id=%s chat_id=%s",
+            update_id,
+            chat_id,
+        )
         return
 
     method = response.get("method")
@@ -224,6 +272,19 @@ def handle_update(update: dict, db: Session, settings: Settings) -> None:
         return
 
     send_message(chat_id=chat_id, text=text, settings=settings)
+    logger.info(
+        "telegram_send_message_dispatched update_id=%s chat_id=%s",
+        update_id,
+        chat_id,
+    )
 
     if command == "/start":
-        ingest_update(update=update, session=db, settings=settings, schedule_flush=False)
+        session_id = ingest_update(
+            update=update, session=db, settings=settings, schedule_flush=False
+        )
+        logger.info(
+            "telegram_start_ingested update_id=%s chat_id=%s session_id=%s",
+            update_id,
+            chat_id,
+            str(session_id) if session_id is not None else None,
+        )

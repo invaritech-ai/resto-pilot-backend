@@ -7,7 +7,10 @@
 ## Background workers (Celery)
 The Telegram webhook endpoint enqueues updates to Celery and returns `{"status":"ok"}` immediately. A running Celery worker is required for Telegram updates to be persisted/processed.
 
-- Start Redis (local): `redis-server`
+- Broker options:
+  - Redis/Upstash: `APP_CELERY_BROKER_URL=rediss://...`
+  - AWS SQS: `APP_CELERY_BROKER_URL=sqs://` plus `APP_CELERY_SQS_QUEUE_URL` and `APP_CELERY_SQS_REGION`
+- Start Redis (local, if using Redis broker): `redis-server`
 - Start worker: `uv run celery -A app.workers.celery_app.celery_app worker -l info`
 - Notes on SQS + reliability: `docs/aws-sqs-celery-broker-notes.md`
 
