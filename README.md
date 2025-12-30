@@ -44,9 +44,9 @@ When batching is enabled (`APP_TELEGRAM_BATCHING_ENABLED=true`), the Telegram we
 - Manage Telegram command menu (optional): `docs/telegram-bot-commands.md`
 
 ## Deploy to Coolify (temporary)
-This repo includes a `Dockerfile` and `docker-compose.yml` to run the API + Celery worker on a server.
+This repo includes a `Dockerfile` and `docker-compose.yaml` to run the API + Celery worker on a server.
 
-- In Coolify: create a new resource from this git repo and choose **Docker Compose**.
+- In Coolify: create a new resource from this git repo and choose **Docker Compose** (it will look for `docker-compose.yaml`).
 - Expose the `api` service on port `8000` and attach a domain (Coolify will handle TLS).
 - Set environment variables in Coolify (both services need them):
   - `APP_DATABASE_URL` (Neon Postgres)

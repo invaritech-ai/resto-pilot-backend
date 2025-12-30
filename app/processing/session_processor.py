@@ -151,7 +151,7 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
                     ProcessingEvents(
                         session_id=session_uuid,
                         at=dt.datetime.now(dt.UTC),
-                        event="assistant_reply_failed_v0",
+                        event="assistant_reply_attempt_failed_v0",
                         payload_json=None,
                         error=str(exc),
                     )
@@ -212,4 +212,3 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
             )
         )
         db.commit()
-

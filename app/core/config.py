@@ -41,7 +41,12 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     openai_model: str = "gpt-5-mini"
     openai_base_url: str = "https://api.openai.com/v1"
-    openai_timeout_seconds: float = 30.0
+    # This primarily controls the HTTP read timeout (how long we wait for the model response).
+    # "Thinking" models can take 60-120s+, so keep this comfortably above expected latency.
+    openai_timeout_seconds: float = 120.0
+    openai_max_retries: int = 2
+    openai_retry_initial_seconds: float = 0.5
+    openai_retry_max_seconds: float = 4.0
     openrouter_http_referer: str = ""
     openrouter_title: str = ""
 

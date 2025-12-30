@@ -32,6 +32,8 @@ Defaults configured in `app/workers/celery_app.py`:
 - `task_reject_on_worker_lost=True`
 - `worker_prefetch_multiplier=1`
 
+Make sure `APP_CELERY_SQS_VISIBILITY_TIMEOUT_SECONDS` comfortably exceeds your worst-case task runtime (including long “thinking” model calls), otherwise SQS may redeliver while the first attempt is still running.
+
 ## DLQ (dead-letter queue)
 Configure a DLQ with a `maxReceiveCount` so poison messages don’t loop forever:
 - Example: after 5 failed receives, SQS moves the message to the DLQ.
