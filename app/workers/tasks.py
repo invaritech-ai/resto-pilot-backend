@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import datetime as dt
-import json
 import logging
 import uuid
 from typing import cast
@@ -11,8 +10,8 @@ from sqlalchemy import select
 
 from app.core.config import get_settings
 from app.db.models.processing_events import ProcessingEvents
-from app.db.models.telegram_messages import TelegramMessages
 from app.db.models.telegram_session import TelegramSessions
+from app.processing.session_processor import process_session as process_session_impl
 from app.telegram.handler import handle_update
 from app.telegram.bot_api import send_message
 from app.workers.celery_app import celery_app
@@ -167,90 +166,9 @@ def process_session(*, session_id: str) -> None:
         task_id,
         session_id,
     )
-    session_uuid = _parse_uuid(session_id)
-
-    with worker_db_session() as db:
-        db_session = db.execute(
-            select(TelegramSessions)
-            .where(TelegramSessions.id == session_uuid)
-            .with_for_update()
-        ).scalar_one_or_none()
-        if db_session is None:
-            logger.info(
-                "process_session_noop_session_not_found task_id=%s session_id=%s",
-                task_id,
-                session_id,
-            )
-            return
-        if db_session.status == "closed":
-            logger.info(
-                "process_session_noop_already_closed task_id=%s session_id=%s",
-                task_id,
-                session_id,
-            )
-            return
-
-        messages = list(
-            db.scalars(
-                select(TelegramMessages)
-                .where(TelegramMessages.session_id == session_uuid)
-                .order_by(
-                    TelegramMessages.received_at.asc(), TelegramMessages.message_id.asc()
-                )
-            )
-        )
-
-        hint = db_session.hint_command
-        file_kinds = [m.file_kind for m in messages if m.file_kind]
-        mime_types = [m.mime for m in messages if m.mime]
-
-        logger.info(
-            "process_session_loaded task_id=%s session_id=%s status=%s message_count=%s hint=%s",
-            task_id,
-            session_id,
-            db_session.status,
-            len(messages),
-            hint,
-        )
-
-        routing_plan = {
-            "hint_command": hint,
-            "message_count": len(messages),
-            "file_kinds": file_kinds,
-            "mime_types": mime_types,
-        }
-
-        now = dt.datetime.now(dt.UTC)
-        db.add(
-            ProcessingEvents(
-                session_id=session_uuid,
-                at=now,
-                event="router_plan_v0",
-                payload_json=json.dumps(routing_plan),
-                error=None,
-            )
-        )
-
-        db_session.status = "closed"
-        if db_session.closed_at is None:
-            db_session.closed_at = now
-
-        db.add(
-            ProcessingEvents(
-                session_id=session_uuid,
-                at=now,
-                event="session_processed_v0",
-                payload_json=None,
-                error=None,
-            )
-        )
-        db.commit()
-
-    logger.info(
-        "process_session_completed task_id=%s session_id=%s",
-        task_id,
-        session_id,
-    )
+    process_session_impl(session_id=session_id, task_id=task_id)
+    logger.info("process_session_completed task_id=%s session_id=%s", task_id, session_id)
+    return
 
 
 @celery_app.task(name="handle_telegram_update")

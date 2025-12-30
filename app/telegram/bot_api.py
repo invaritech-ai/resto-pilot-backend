@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from typing import Any
+import urllib.parse
 
 import httpx
 
@@ -60,3 +61,43 @@ def send_message(chat_id: int, text: str, settings: Settings) -> None:
             extra={"chat_id": chat_id, "error": str(e)},
         )
         raise
+
+
+def get_file_bytes(*, file_id: str, settings: Settings, max_bytes: int = 2_000_000) -> bytes:
+    """
+    Download a Telegram file by file_id.
+
+    Intended for lightweight image/document processing in background workers.
+    """
+    if not settings.telegram_bot_token:
+        raise ValueError("Telegram bot token is not configured")
+
+    file_id_q = urllib.parse.quote(file_id, safe="")
+    get_file_url = (
+        f"https://api.telegram.org/bot{settings.telegram_bot_token}/getFile?file_id={file_id_q}"
+    )
+    response = httpx.get(get_file_url, timeout=10.0)
+    response.raise_for_status()
+    payload = response.json()
+    if not payload.get("ok"):
+        raise ValueError(f"Telegram getFile failed: {payload}")
+
+    file_path = (payload.get("result") or {}).get("file_path")
+    if not isinstance(file_path, str) or not file_path:
+        raise ValueError(f"Telegram getFile missing file_path: {payload}")
+
+    download_url = (
+        f"https://api.telegram.org/file/bot{settings.telegram_bot_token}/{file_path}"
+    )
+    with httpx.stream("GET", download_url, timeout=30.0) as resp:
+        resp.raise_for_status()
+        chunks: list[bytes] = []
+        total = 0
+        for chunk in resp.iter_bytes():
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError("Telegram file too large")
+            chunks.append(chunk)
+        return b"".join(chunks)
