@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import random
+import time
 from typing import Any
 
 import httpx
@@ -12,6 +14,21 @@ logger = logging.getLogger(__name__)
 
 class OpenAIError(RuntimeError):
     pass
+
+
+def _is_retryable_status(status_code: int) -> bool:
+    return status_code in {408, 409, 425, 429, 500, 502, 503, 504}
+
+
+def _is_retryable_exception(exc: httpx.HTTPError) -> bool:
+    return isinstance(
+        exc,
+        (
+            httpx.TimeoutException,
+            httpx.NetworkError,
+            httpx.RemoteProtocolError,
+        ),
+    )
 
 
 def chat_completions_create(
@@ -48,15 +65,57 @@ def chat_completions_create(
     if tool_choice is not None:
         payload["tool_choice"] = tool_choice
 
-    timeout = httpx.Timeout(settings.openai_timeout_seconds)
-    try:
-        resp = httpx.post(url, headers=headers, json=payload, timeout=timeout)
-        resp.raise_for_status()
-    except httpx.HTTPError as exc:
-        logger.exception("openai_http_error", extra={"error": repr(exc)})
-        raise OpenAIError(f"OpenAI request failed: {exc}") from exc
+    # Use a longer read timeout for "thinking" responses without inflating connect/pool timeouts.
+    timeout = httpx.Timeout(
+        connect=10.0,
+        read=float(settings.openai_timeout_seconds),
+        write=10.0,
+        pool=10.0,
+    )
+    attempts = max(0, int(settings.openai_max_retries)) + 1
+    retry_initial = float(settings.openai_retry_initial_seconds)
+    retry_max = float(settings.openai_retry_max_seconds)
 
-    return resp.json()
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            resp = httpx.post(url, headers=headers, json=payload, timeout=timeout)
+            if resp.status_code >= 400 and _is_retryable_status(resp.status_code) and attempt < attempts:
+                logger.warning(
+                    "openai_retryable_status",
+                    extra={
+                        "status_code": resp.status_code,
+                        "attempt": attempt,
+                        "attempts": attempts,
+                    },
+                )
+                delay = min(retry_max, retry_initial * (2 ** (attempt - 1)))
+                delay = delay * (0.75 + random.random() * 0.5)
+                time.sleep(delay)
+                continue
+
+            resp.raise_for_status()
+            return resp.json()
+        except httpx.HTTPError as exc:
+            last_exc = exc
+            if attempt < attempts and _is_retryable_exception(exc):
+                logger.warning(
+                    "openai_retryable_error",
+                    extra={
+                        "error": repr(exc),
+                        "attempt": attempt,
+                        "attempts": attempts,
+                    },
+                )
+                delay = min(retry_max, retry_initial * (2 ** (attempt - 1)))
+                delay = delay * (0.75 + random.random() * 0.5)
+                time.sleep(delay)
+                continue
+
+            logger.exception("openai_http_error", extra={"error": repr(exc)})
+            raise OpenAIError(f"OpenAI request failed: {exc}") from exc
+
+    raise OpenAIError(f"OpenAI request failed: {last_exc!r}")
 
 
 def create_chat_completion_text(

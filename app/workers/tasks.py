@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
 import uuid
 from typing import cast
 
 from celery import current_task
-from sqlalchemy import select
+from sqlalchemy import func, select
 
+from app.ai.openai_client import OpenAIError
 from app.core.config import get_settings
 from app.db.models.processing_events import ProcessingEvents
 from app.db.models.telegram_session import TelegramSessions
@@ -15,7 +17,7 @@ from app.processing.session_processor import process_session as process_session_
 from app.telegram.handler import handle_update
 from app.telegram.bot_api import send_message
 from app.workers.celery_app import celery_app
-from app.workers.celery_types import CeleryDelayable
+from app.workers.celery_types import CeleryApplyAsync, CeleryDelayable
 from app.workers.db import worker_db_session
 
 logger = logging.getLogger(__name__)
@@ -166,8 +168,74 @@ def process_session(*, session_id: str) -> None:
         task_id,
         session_id,
     )
-    process_session_impl(session_id=session_id, task_id=task_id)
-    logger.info("process_session_completed task_id=%s session_id=%s", task_id, session_id)
+    try:
+        process_session_impl(session_id=session_id, task_id=task_id)
+    except OpenAIError as exc:
+        session_uuid = _parse_uuid(session_id)
+        with worker_db_session() as db:
+            failures = db.scalar(
+                select(func.count())
+                .select_from(ProcessingEvents)
+                .where(
+                    ProcessingEvents.session_id == session_uuid,
+                    ProcessingEvents.event == "assistant_reply_attempt_failed_v0",
+                )
+            )
+            failure_count = int(failures or 0)
+            delay = min(300, 5 * (2 ** max(0, failure_count - 1)))
+            delay = max(5, delay)
+
+            last_scheduled = db.execute(
+                select(ProcessingEvents)
+                .where(
+                    ProcessingEvents.session_id == session_uuid,
+                    ProcessingEvents.event == "assistant_reply_retry_scheduled_v0",
+                )
+                .order_by(ProcessingEvents.at.desc())
+                .limit(1)
+            ).scalar_one_or_none()
+
+            now = dt.datetime.now(dt.UTC)
+            if (
+                last_scheduled is not None
+                and isinstance(last_scheduled.at, dt.datetime)
+                and (now - last_scheduled.at).total_seconds() < 5
+            ):
+                logger.warning(
+                    "process_session_retry_already_scheduled task_id=%s session_id=%s",
+                    task_id,
+                    session_id,
+                )
+                return
+
+            db.add(
+                ProcessingEvents(
+                    session_id=session_uuid,
+                    at=now,
+                    event="assistant_reply_retry_scheduled_v0",
+                    payload_json=json.dumps({"delay_seconds": delay}),
+                    error=str(exc),
+                )
+            )
+            db.commit()
+
+        logger.warning(
+            "process_session_scheduling_retry task_id=%s session_id=%s delay_seconds=%s error=%s",
+            task_id,
+            session_id,
+            delay,
+            str(exc),
+        )
+        cast(CeleryApplyAsync, process_session).apply_async(
+            kwargs={"session_id": session_id}, countdown=float(delay)
+        )
+        return
+
+    logger.info(
+        "process_session_completed task_id=%s session_id=%s",
+        task_id,
+        session_id,
+    )
     return
 
 

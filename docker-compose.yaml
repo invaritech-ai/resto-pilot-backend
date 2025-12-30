@@ -13,4 +13,3 @@ services:
     command: python -m celery -A app.workers.celery_app.celery_app worker -l info --concurrency ${CELERY_CONCURRENCY:-4}
     environment:
       CELERY_CONCURRENCY: ${CELERY_CONCURRENCY:-4}
-
