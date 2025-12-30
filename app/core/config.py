@@ -38,6 +38,13 @@ class Settings(BaseSettings):
     auth_token_ttl_seconds: int = 60 * 60 * 24 * 7  # 7 days
     telegram_webapp_auth_max_age_seconds: int = 60 * 60 * 24  # 24h
 
+    openai_api_key: str = ""
+    openai_model: str = "gpt-5-mini"
+    openai_base_url: str = "https://api.openai.com/v1"
+    openai_timeout_seconds: float = 30.0
+    openrouter_http_referer: str = ""
+    openrouter_title: str = ""
+
     model_config = SettingsConfigDict(env_file=".env", env_prefix="APP_", extra="ignore")
 
 

@@ -17,7 +17,8 @@ from app.db.models.telegram_messages import TelegramMessages
 from app.db.models.telegram_session import TelegramSessions
 from app.db.models.user import User
 from app.telegram.commands import extract_command
-from app.telegram.ingest import ingest_update, lock_chat_id, parse_update
+from app.telegram.ingest import ingest_update, parse_update
+from app.telegram.session_lock import lock_chat_id
 from app.workers.celery_types import CeleryDelayable
 from app.workers.tasks import handle_telegram_update
 
