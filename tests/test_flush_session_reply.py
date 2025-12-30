@@ -9,7 +9,7 @@ from sqlalchemy.pool import StaticPool
 from app.db.base import Base
 import app.db.models  # noqa: F401
 from app.db.models.telegram_session import TelegramSessions
-from app.workers.tasks import SESSION_FLUSH_REPLY_TEXT, flush_session
+from app.workers.tasks import flush_session
 
 
 def test_flush_session_sends_ack_and_enqueues_processing(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -49,27 +49,24 @@ def test_flush_session_sends_ack_and_enqueues_processing(monkeypatch: pytest.Mon
 
     enqueued: dict[str, object] = {}
 
+    def _fake_ack_delay(*, session_id: str):
+        enqueued["ack_session_id"] = session_id
+        return object()
+
     def _fake_delay(*, session_id: str):
         enqueued["process_session_id"] = session_id
         return object()
 
+    monkeypatch.setattr(worker_tasks.send_session_ack, "delay", _fake_ack_delay)
     monkeypatch.setattr(worker_tasks.process_session, "delay", _fake_delay)
-
-    def _fake_send_message(*, chat_id: int, text: str, settings: object) -> None:
-        enqueued["reply_chat_id"] = chat_id
-        enqueued["reply_text"] = text
-
-    monkeypatch.setattr(worker_tasks, "send_message", _fake_send_message)
 
     flush_session(session_id=session_id, expected_last_activity_at=expected.isoformat())
 
+    assert enqueued["ack_session_id"] == session_id
     assert enqueued["process_session_id"] == session_id
-    assert enqueued["reply_chat_id"] == 10
-    assert enqueued["reply_text"] == SESSION_FLUSH_REPLY_TEXT
 
     with Session(engine) as db:
         sealed = db.scalar(select(TelegramSessions).where(TelegramSessions.id == session_row.id))
         assert sealed is not None
         assert sealed.status == "processing"
         assert sealed.closed_at is not None
-

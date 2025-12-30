@@ -28,6 +28,10 @@ celery_app.conf.update(
     result_serializer="json",
     enable_utc=True,
     timezone="UTC",
+    # Fairness + reliability defaults (esp. helpful with SQS + >1 concurrency).
+    worker_prefetch_multiplier=1,
+    task_acks_late=True,
+    task_reject_on_worker_lost=True,
 )
 
 logger.info(

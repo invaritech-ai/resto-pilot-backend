@@ -13,7 +13,7 @@ This doc captures the current agreed direction for ingesting Telegram messages/f
 - Private chats only (no group chat support).
 - `chat_id` equals the user’s `telegram_id` for private chats; session key is effectively per-user.
 - We are not fixating on “sending files back” yet; but workers will send simple status messages (e.g., “processing now”).
-- Redis + Celery is the initial queue/worker system; can later target SQS if desired.
+- Celery is the worker system; the broker can be Redis/Upstash or AWS SQS.
 
 ## Supported upload types (expected)
 - Images (photo/document)
@@ -70,19 +70,20 @@ Block/session start:
 On every update:
 1) Verify Telegram webhook secret header.
 2) Parse JSON.
-3) Enqueue the update to Celery (`handle_telegram_update(update)`).
-4) Return immediately with `{"status":"ok"}`.
+3) Persist the update into Postgres (`telegram_sessions` + `telegram_messages`) in a single transaction.
+4) Schedule a delayed Celery `flush_session(session_id, expected_last_activity_at)` at `flush_at`.
+5) Return immediately with `{"status":"ok"}`.
 
-The webhook should not do DB writes or call external APIs; it only validates + enqueues.
+Notes:
+- In Postgres, ingestion is serialized per `chat_id` (advisory lock) to avoid race conditions under concurrency.
+- The webhook should not call external APIs; it should remain “DB-only + enqueue”.
 
 ## Worker ingest responsibilities
-The Celery worker (consumer) is responsible for persistence and routing:
-1) Parse user identity (`telegram_id`, `chat_id`) and message content (text/caption) and any file metadata.
-2) Enforce onboarding: unregistered users must `/start` (current direction).
-3) Persist:
-   - an immutable “message/event” row for observability and replay of intent (no bytes required)
-   - a “session” record (create or update `last_activity_at`, `flush_at`, and `hint_command`)
-4) Schedule a Celery task to flush at `flush_at` (see below).
+The Celery worker (consumer) is responsible for flushing + processing:
+1) `flush_session(...)` transitions eligible sessions to `processing` and enqueues:
+   - `send_session_ack(session_id)` (sends “Got it — I’m on it.” once per session)
+   - `process_session(session_id)`
+2) `process_session(session_id)` loads the “batch evidence” and runs the router + processing pipeline.
 
 Notes:
 - Webhook response JSON is not used for delayed user feedback. Worker will send “processing now” asynchronously.

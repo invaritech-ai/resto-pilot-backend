@@ -55,7 +55,6 @@ def flush_session(*, session_id: str, expected_last_activity_at: str) -> None:
     )
     expected = dt.datetime.fromisoformat(expected_last_activity_at)
     session_uuid = _parse_uuid(session_id)
-    chat_id: int | None = None
 
     with worker_db_session() as db:
         db_session = db.execute(
@@ -86,12 +85,9 @@ def flush_session(*, session_id: str, expected_last_activity_at: str) -> None:
             )
             return
 
-        chat_id = db_session.chat_id
         now = dt.datetime.now(dt.UTC)
         db_session.status = "processing"
         db_session.closed_at = now
-        if db_session.ack_sent_at is None:
-            db_session.ack_sent_at = now
         db.add(
             ProcessingEvents(
                 session_id=db_session.id,
@@ -108,16 +104,8 @@ def flush_session(*, session_id: str, expected_last_activity_at: str) -> None:
         task_id,
         session_id,
     )
+    cast(CeleryDelayable, send_session_ack).delay(session_id=session_id)
     cast(CeleryDelayable, process_session).delay(session_id=session_id)
-    if isinstance(chat_id, int):
-        settings = get_settings()
-        try:
-            send_message(chat_id=chat_id, text=SESSION_FLUSH_REPLY_TEXT, settings=settings)
-        except Exception as exc:
-            logger.exception(
-                "telegram_flush_reply_failed",
-                extra={"error": repr(exc), "chat_id": chat_id, "session_id": session_id},
-            )
 
 
 @celery_app.task(name="send_session_ack")
@@ -152,22 +140,23 @@ def send_session_ack(*, session_id: str, text: str = SESSION_FLUSH_REPLY_TEXT) -
                 session_id,
             )
             return
-        now = dt.datetime.now(dt.UTC)
-        db_session.ack_sent_at = now
         chat_id = db_session.chat_id
+        settings = get_settings()
+        try:
+            send_message(chat_id=chat_id, text=text, settings=settings)
+        except Exception as exc:
+            db.rollback()
+            logger.exception(
+                "telegram_ack_send_failed",
+                extra={"error": repr(exc), "chat_id": chat_id, "session_id": session_id},
+            )
+            raise
+
+        db_session.ack_sent_at = dt.datetime.now(dt.UTC)
         db.commit()
 
     if not isinstance(chat_id, int):
         return
-
-    settings = get_settings()
-    try:
-        send_message(chat_id=chat_id, text=text, settings=settings)
-    except Exception as exc:
-        logger.exception(
-            "telegram_ack_send_failed",
-            extra={"error": repr(exc), "chat_id": chat_id, "session_id": session_id},
-        )
 
 
 @celery_app.task(name="process_session")

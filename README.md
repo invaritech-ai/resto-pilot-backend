@@ -1,17 +1,22 @@
 ## Local dev
 - Copy `.env.example` to `.env` and set `APP_DATABASE_URL` to your Neon connection string (e.g. `postgresql+psycopg://user:pass@host/db?sslmode=require`).
-- Install deps and run the API: `uv run uvicorn app.main:app --reload`.
+- Install deps and run the API: `./scripts/run_api.sh` (or `uv run uvicorn app.main:app --reload`).
 - Create your first migration: `alembic revision --autogenerate -m "init"` then `alembic upgrade head`.
 - Configure CORS origins/settings via `.env` as needed.
 
 ## Background workers (Celery)
-The Telegram webhook endpoint enqueues updates to Celery and returns `{"status":"ok"}` immediately. A running Celery worker is required for Telegram updates to be persisted/processed.
+When batching is enabled (`APP_TELEGRAM_BATCHING_ENABLED=true`), the Telegram webhook persists incoming updates to Postgres and schedules Celery tasks for flushing + processing sessions. A running Celery worker is required for:
+- scheduled session flushes (`flush_session`)
+- sending session ack messages (`send_session_ack`)
+- processing sessions (`process_session`)
+- non-batching flows and `/start` routing (`handle_telegram_update`)
 
 - Broker options:
   - Redis/Upstash: `APP_CELERY_BROKER_URL=rediss://...`
   - AWS SQS: `APP_CELERY_BROKER_URL=sqs://` plus `APP_CELERY_SQS_QUEUE_URL` and `APP_CELERY_SQS_REGION`
 - Start Redis (local, if using Redis broker): `redis-server`
-- Start worker: `uv run celery -A app.workers.celery_app.celery_app worker -l info`
+- Start worker: `./scripts/run_worker.sh` (or `uv run celery -A app.workers.celery_app.celery_app worker -l info`)
+- Start both API + worker: `./scripts/run_dev.sh`
 - Notes on SQS + reliability: `docs/aws-sqs-celery-broker-notes.md`
 
 ## Package for AWS Lambda (FastAPI + Mangum)
@@ -39,4 +44,5 @@ The Telegram webhook endpoint enqueues updates to Celery and returns `{"status":
 - Manage Telegram command menu (optional): `docs/telegram-bot-commands.md`
 
 Notes:
-- If you deploy the API to Lambda/serverless but keep Celery, run the Celery worker separately (e.g. ECS/Fargate, EC2, Fly, or a small VM). The API enqueues work; the worker does the DB writes and outbound Telegram Bot API calls.
+- Scripts may need permissions once: `chmod +x scripts/*.sh`.
+- If you deploy the API to Lambda/serverless but keep Celery, run the Celery worker separately (e.g. ECS/Fargate, EC2, Fly, or a small VM). In batching mode, the API persists updates and Celery performs flushing/ack/processing.
