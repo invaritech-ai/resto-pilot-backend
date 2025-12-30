@@ -48,6 +48,7 @@ This repo includes a `Dockerfile` and `docker-compose.yaml` to run the API + Cel
 
 - In Coolify: create a new resource from this git repo and choose **Docker Compose** (it will look for `docker-compose.yaml`).
 - Expose the `api` service on port `8000` and attach a domain (Coolify will handle TLS).
+- If deployment fails with “port is already allocated”, set `API_HOST_PORT` in Coolify to a free port (the container still listens on `8000`).
 - Set environment variables in Coolify (both services need them):
   - `APP_DATABASE_URL` (Neon Postgres)
   - `APP_TELEGRAM_WEBHOOK_SECRET_TOKEN`
