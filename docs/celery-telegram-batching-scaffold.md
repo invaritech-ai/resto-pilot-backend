@@ -17,19 +17,21 @@ This project supports a “batched Telegram ingest” mode behind a feature flag
   - `APP_CELERY_SQS_REGION=...` (or rely on `AWS_DEFAULT_REGION`)
 
 ## What happens in batching mode
-- Webhook validates the secret header, then enqueues `handle_telegram_update(update)` and returns `{"status":"ok"}` immediately.
-- Celery worker runs `handle_update(...)` which persists `telegram_sessions` + `telegram_messages`.
-- Worker schedules a delayed Celery task `flush_session(...)` at `flush_at`.
-- `flush_session` no-ops if the session has newer activity; otherwise marks the session `processing` and enqueues `process_session`.
+- Webhook validates the secret header, persists the update into Postgres (`telegram_sessions` + `telegram_messages`), schedules a delayed Celery task `flush_session(...)` at `flush_at`, then returns `{"status":"ok"}`.
+- `flush_session` no-ops if the session has newer activity; otherwise marks the session `processing` and enqueues two tasks:
+  - `send_session_ack(session_id)` (sends “Got it — I’m on it.” once per session)
+  - `process_session(session_id)`
 - `process_session` is currently a stub that writes `processing_events` with a v0 routing plan.
 
 ## Reserved commands
-Some commands are treated as “instant” and bypass the normal 30s batching delay (currently: `/start`, `/respond`, `/done`). Even when batching is enabled, these commands are handled immediately by the worker.
+Some commands bypass the normal 30s batching delay (currently: `/start`, `/respond`, `/done`).
+- `/start` is delegated to Celery to handle registration/invites and to send responses.
+- `/respond` and `/done` seal the current open session (`status=open -> processing`) and enqueue `send_session_ack` + `process_session`.
 
 ## Run locally (example)
 - Start Redis (local): `redis-server`
-- Start API: `uv run uvicorn app.main:app --reload`
-- Start worker: `uv run celery -A app.workers.celery_app.celery_app worker -l info`
+- Start API: `./scripts/run_api.sh` (or `uv run uvicorn app.main:app --reload`)
+- Start worker: `./scripts/run_worker.sh` (or `uv run celery -A app.workers.celery_app.celery_app worker -l info`)
 
 ## Reliability note (Redis eviction)
 If your Redis provider enables eviction, queued Celery tasks can be dropped under memory pressure. For correctness, prefer a broker with eviction disabled (or use Postgres as the durable source of truth and re-drive “due sessions” periodically).

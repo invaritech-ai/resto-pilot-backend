@@ -1,6 +1,6 @@
-# AWS SQS + Celery notes (for later)
+# AWS SQS + Celery notes
 
-This project currently uses Redis as the Celery broker. This note captures what changes when the broker is **AWS SQS**, and the reliability/cost concepts to keep in mind.
+This project supports using **AWS SQS** as the Celery broker. This note captures what changes relative to Redis and the reliability/cost concepts to keep in mind.
 
 ## Mental model: broker vs worker
 - **Broker (SQS/Redis/RabbitMQ)** stores *queued* tasks until a worker consumes them.
@@ -26,6 +26,11 @@ Rule of thumb for this repo (long-ish tasks, correctness matters):
 - Prefer **ack late + idempotent processing + DLQ**.
 - Set visibility timeout to **> p99 task runtime + buffer** (often 2× p99).
   - If tasks can be ~10–15 minutes, a visibility timeout of **30–45 minutes** is a common starting point.
+
+Defaults configured in `app/workers/celery_app.py`:
+- `task_acks_late=True`
+- `task_reject_on_worker_lost=True`
+- `worker_prefetch_multiplier=1`
 
 ## DLQ (dead-letter queue)
 Configure a DLQ with a `maxReceiveCount` so poison messages don’t loop forever:
@@ -61,4 +66,3 @@ Seeing “kombu” output is expected:
   - DLQ + maxReceiveCount.
   - Long polling (reduces empty receives).
 - Add runtime measurements (e.g., write `processing_events` for start/end timestamps) to compute p95/p99 and tune settings confidently.
-

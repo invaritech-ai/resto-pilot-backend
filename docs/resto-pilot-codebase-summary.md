@@ -7,7 +7,7 @@ Resto Pilot is an AI-powered assistant for restaurant workflows. Today it’s ce
 - **Serverless entrypoint**: Mangum wrapper for Lambda (`app/handler.py`).
 - **Database**: Postgres (commonly Neon) via SQLAlchemy + Alembic migrations (`alembic/`).
 - **Background workers**: Celery tasks (`app/workers/tasks.py`) plus a worker DB session helper (`app/workers/db.py`).
-- **Broker**: Redis/Upstash today (configured via `APP_CELERY_BROKER_URL`). Notes on SQS tradeoffs: `docs/aws-sqs-celery-broker-notes.md`.
+- **Broker**: Redis/Upstash or AWS SQS (configured via `APP_CELERY_BROKER_URL`). Notes on SQS: `docs/aws-sqs-celery-broker-notes.md`.
 - **Auth/security**:
   - JWT access tokens for API endpoints (`app/api/security.py`).
   - Telegram WebApp init data verification for webapp auth (`app/api/v1/routes/auth.py`).
@@ -21,7 +21,8 @@ Resto Pilot is an AI-powered assistant for restaurant workflows. Today it’s ce
 `POST /api/v1/telegram` (`app/api/v1/routes/telegram.py`)
 - Validates secret header.
 - Returns `503` if webhook secret or broker URL is missing.
-- Enqueues `handle_telegram_update.delay(update)` and returns `{"status":"ok"}` immediately.
+- When batching is enabled, persists the update into Postgres (`telegram_sessions` + `telegram_messages`), schedules a delayed `flush_session(...)`, and returns `{"status":"ok"}`.
+- When batching is disabled, enqueues `handle_telegram_update.delay(update)` and returns `{"status":"ok"}`.
 
 ### Worker entrypoint
 `handle_telegram_update(update)` (`app/workers/tasks.py`)
@@ -50,15 +51,17 @@ Some commands bypass batching:
   - Immediate behavior is handled by `process_update(...)` (`app/telegram/processor.py`) which can create/register the user and accept deep-link invite codes.
   - `/start` is also persisted into the audit tables for history.
 - `/done` and `/respond`:
-  - Force-flush flow: `seal_open_session(chat_id)` atomically flips the latest open session to `processing` (`app/telegram/ingest.py`) and enqueues `process_session.delay(session_id=...)` (`app/telegram/handler.py`).
-  - If there is **no open session**, the bot sends a fixed “Nothing to process right now.” reply and does not enqueue work.
+  - Force-flush flow: the webhook seals the latest open session (`open -> processing`) and enqueues `send_session_ack.delay(session_id=...)` + `process_session.delay(session_id=...)`.
+  - If there is **no open session**, the update is still accepted but no work is enqueued.
 
 ## Background tasks (Celery)
 Defined in `app/workers/tasks.py`:
 - `flush_session(session_id, expected_last_activity_at)`:
   - Used for the normal debounce window.
   - Uses DB locking + the `expected_last_activity_at` guard to no-op stale flushes.
-  - When it seals the session, it sends a “Got it — I’m on it.” message to the chat.
+  - When it seals the session, it enqueues `send_session_ack` and `process_session`.
+- `send_session_ack(session_id)`:
+  - Sends a “Got it — I’m on it.” message once per session (guarded by `telegram_sessions.ack_sent_at`).
 - `process_session(session_id)`:
   - Loads all messages for the session from the DB.
   - Writes a v0 “routing plan” event (`router_plan_v0`) and marks the session closed (`session_processed_v0`).
@@ -88,4 +91,3 @@ Routes live in `app/api/v1/routes/` and are included under `/api/v1` via `app/ap
 ## Telegram command menu (optional)
 To manage the Telegram command menu programmatically:
 - `docs/telegram-bot-commands.md`
-
