@@ -43,6 +43,26 @@ When batching is enabled (`APP_TELEGRAM_BATCHING_ENABLED=true`), the Telegram we
 - Test by sending a message; logs appear in CloudWatch `/aws/lambda/<function-name>`.
 - Manage Telegram command menu (optional): `docs/telegram-bot-commands.md`
 
+## Deploy to Coolify (temporary)
+This repo includes a `Dockerfile` and `docker-compose.yml` to run the API + Celery worker on a server.
+
+- In Coolify: create a new resource from this git repo and choose **Docker Compose**.
+- Expose the `api` service on port `8000` and attach a domain (Coolify will handle TLS).
+- Set environment variables in Coolify (both services need them):
+  - `APP_DATABASE_URL` (Neon Postgres)
+  - `APP_TELEGRAM_WEBHOOK_SECRET_TOKEN`
+  - `APP_TELEGRAM_BOT_TOKEN`
+  - `APP_TELEGRAM_BATCHING_ENABLED=true`
+  - `APP_CELERY_BROKER_URL=sqs://` + `APP_CELERY_SQS_QUEUE_URL` + `APP_CELERY_SQS_REGION`
+  - AWS creds (either `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` + `AWS_DEFAULT_REGION`, or an IAM role if your server supports it)
+  - OpenRouter/OpenAI-compatible settings:
+    - `APP_OPENAI_BASE_URL=https://openrouter.ai/api/v1`
+    - `APP_OPENAI_API_KEY=<OPENROUTER_KEY>`
+    - `APP_OPENAI_MODEL=<model-slug>`
+    - Optional: `APP_OPENROUTER_HTTP_REFERER` + `APP_OPENROUTER_TITLE`
+- Run DB migrations once (Coolify exec into the `api` container): `alembic upgrade head`
+- Point Telegram webhook to your public domain: `https://<your-domain>/api/v1/telegram` with the same `secret_token`.
+
 Notes:
 - Scripts may need permissions once: `chmod +x scripts/*.sh`.
 - If you deploy the API to Lambda/serverless but keep Celery, run the Celery worker separately (e.g. ECS/Fargate, EC2, Fly, or a small VM). In batching mode, the API persists updates and Celery performs flushing/ack/processing.
