@@ -11,10 +11,14 @@
 - [x] Add `chat_completions_create_with_http_info()` in `app/ai/openai_client.py` (returns `(data, headers, latency_ms)`)
 - [x] Add `create_chat_completion_text_allow_empty_with_http_info()` in `app/ai/openai_client.py` (returns `str | None` + http info)
 - [x] Add `extract_openrouter_usage()` in `app/ai/openrouter_usage.py` (parses `prompt_tokens/completion_tokens/total_tokens`)
+- [x] Add `extract_openrouter_generation_id()` in `app/ai/openrouter_generation.py` (parses generation id from response headers/body)
+- [ ] Add `fetch_openrouter_generation()` in `app/ai/openrouter_generation.py` (GET `/generation?id=...`)
+- [ ] Add `schedule_openrouter_cost_backfill()` in `app/workers/telemetry.py` (enqueue backfill task with 15–20 min delay)
+- [ ] Add `backfill_llm_call_costs()` in `app/workers/tasks.py` (Celery task to fill billed cost/latency)
 - [ ] Add `estimate_cost_usd()` in `app/ai/openrouter_cost.py` (computes cost from usage + env-configured price map)
-- [ ] Add `get_model_prices()` in `app/ai/model_config.py` (reads `APP_MODEL_PRICES_JSON`, falls back to defaults)
-- [ ] Add `get_ack_model()` in `app/ai/model_config.py` (env override, default = main model)
-- [ ] Add `get_gate_model()` in `app/ai/model_config.py` (env override, default = main model)
+- [x] Add `get_model_prices()` in `app/ai/model_config.py` (reads `APP_MODEL_PRICES_JSON`, falls back to defaults)
+- [x] Add `get_ack_model()` in `app/ai/model_config.py` (env override, default = main model)
+- [x] Add `get_gate_model()` in `app/ai/model_config.py` (env override, default = main model)
 
 ### C) DB writes (telemetry + outgoing messages + chat state)
 - [ ] Add `record_llm_call()` in `app/workers/telemetry.py` (inserts into `llm_calls`)
@@ -48,3 +52,7 @@
 - [ ] Add `generate_session_reply_with_metrics()` in `app/ai/session_reply.py` (returns reply + aggregated tokens/latency across tool rounds)
 - [ ] Modify `process_session()` in `app/processing/session_processor.py` to use `generate_session_reply_with_metrics()` and write a `llm_calls` row for the expensive reply
 - [ ] Modify `process_session()` in `app/processing/session_processor.py` to store the final outgoing reply in `telegram_outgoing_messages` (with returned `telegram_message_id`)
+
+### H) Env wiring
+- [x] Modify `Settings` in `app/core/config.py` to include `openai_ack_model`, `openai_gate_model`, `model_prices_json`
+- [x] Update `.env.example` to include `APP_OPENAI_ACK_MODEL`, `APP_OPENAI_GATE_MODEL`, `APP_MODEL_PRICES_JSON`
