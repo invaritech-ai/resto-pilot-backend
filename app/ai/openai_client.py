@@ -231,3 +231,30 @@ def create_chat_completion_text(
     if not isinstance(content, str) or not content.strip():
         raise OpenAIError("OpenAI returned empty content")
     return content.strip()
+
+
+def create_chat_completion_text_allow_empty_with_http_info(
+    *,
+    settings: Settings,
+    messages: list[dict[str, Any]],
+    temperature: float = 0.2,
+    extra_headers: dict[str, str] | None = None,
+) -> tuple[str | None, dict[str, Any], dict[str, str], int]:
+    data, headers, latency_ms = chat_completions_create_with_http_info(
+        settings=settings,
+        messages=messages,
+        temperature=temperature,
+        extra_headers=extra_headers,
+    )
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except Exception as exc:
+        raise OpenAIError(f"Unexpected OpenAI response shape: {data}") from exc
+
+    if not isinstance(content, str):
+        raise OpenAIError(f"Unexpected OpenAI response content type: {type(content)!r}")
+
+    text = content.strip()
+    if not text:
+        return None, data, headers, latency_ms
+    return text, data, headers, latency_ms

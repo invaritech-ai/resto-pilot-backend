@@ -9,8 +9,8 @@
 
 ### B) OpenRouter call instrumentation (HTTP + usage + cost)
 - [x] Add `chat_completions_create_with_http_info()` in `app/ai/openai_client.py` (returns `(data, headers, latency_ms)`)
-- [ ] Add `create_chat_completion_text_allow_empty_with_http_info()` in `app/ai/openai_client.py` (returns `str | None` + http info)
-- [ ] Add `extract_openrouter_usage()` in `app/ai/openrouter_usage.py` (parses `prompt_tokens/completion_tokens/total_tokens`)
+- [x] Add `create_chat_completion_text_allow_empty_with_http_info()` in `app/ai/openai_client.py` (returns `str | None` + http info)
+- [x] Add `extract_openrouter_usage()` in `app/ai/openrouter_usage.py` (parses `prompt_tokens/completion_tokens/total_tokens`)
 - [ ] Add `estimate_cost_usd()` in `app/ai/openrouter_cost.py` (computes cost from usage + env-configured price map)
 - [ ] Add `get_model_prices()` in `app/ai/model_config.py` (reads `APP_MODEL_PRICES_JSON`, falls back to defaults)
 - [ ] Add `get_ack_model()` in `app/ai/model_config.py` (env override, default = main model)
