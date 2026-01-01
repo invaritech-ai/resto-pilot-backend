@@ -40,6 +40,9 @@ class Settings(BaseSettings):
 
     openai_api_key: str = ""
     openai_model: str = "gpt-5-mini"
+    # Optional overrides for dedicated "cheap" models.
+    openai_ack_model: str = ""
+    openai_gate_model: str = ""
     openai_base_url: str = "https://api.openai.com/v1"
     # This primarily controls the HTTP read timeout (how long we wait for the model response).
     # "Thinking" models can take 60-120s+, so keep this comfortably above expected latency.
@@ -49,6 +52,10 @@ class Settings(BaseSettings):
     openai_retry_max_seconds: float = 4.0
     openrouter_http_referer: str = ""
     openrouter_title: str = ""
+
+    # JSON mapping of model -> {input_per_million, output_per_million}
+    # Used for local cost estimation from token usage.
+    model_prices_json: str = ""
 
     model_config = SettingsConfigDict(env_file=".env", env_prefix="APP_", extra="ignore")
 
