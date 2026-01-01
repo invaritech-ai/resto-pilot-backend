@@ -13,7 +13,7 @@ from app.core.config import Settings
 logger = logging.getLogger(__name__)
 
 
-def send_message(chat_id: int, text: str, settings: Settings) -> None:
+def send_message(chat_id: int, text: str, settings: Settings) -> int | None:
     """
     Send a text message to a Telegram chat via the Bot API.
 
@@ -21,6 +21,9 @@ def send_message(chat_id: int, text: str, settings: Settings) -> None:
         chat_id: The Telegram chat ID to send the message to
         text: The message text to send
         settings: Application settings containing the bot token
+
+    Returns:
+        Telegram message_id when available; otherwise None.
 
     Raises:
         httpx.HTTPError: If the API request fails
@@ -50,11 +53,14 @@ def send_message(chat_id: int, text: str, settings: Settings) -> None:
                     "description": result.get("description"),
                 },
             )
+            return None
         else:
+            message_id = (result.get("result") or {}).get("message_id")
             logger.info(
                 "telegram_message_sent",
-                extra={"chat_id": chat_id, "message_id": result.get("result", {}).get("message_id")},
+                extra={"chat_id": chat_id, "message_id": message_id},
             )
+            return message_id if isinstance(message_id, int) else None
     except httpx.HTTPError as e:
         logger.error(
             "telegram_send_message_http_error",
