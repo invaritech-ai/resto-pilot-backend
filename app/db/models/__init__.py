@@ -5,6 +5,7 @@ from app.db.models.user import User
 from app.db.models.processing_events import ProcessingEvents
 from app.db.models.telegram_messages import TelegramMessages
 from app.db.models.telegram_session import TelegramSessions
+from app.db.models.llm_calls import LLMCalls
 
 __all__ = [
     "Restaurant",
@@ -14,4 +15,5 @@ __all__ = [
     "ProcessingEvents",
     "TelegramMessages",
     "TelegramSessions",
+    "LLMCalls",
 ]
