@@ -2,6 +2,11 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
+import httpx
+
+from app.ai.openai_client import OpenAIError
+from app.core.config import Settings
+
 
 def extract_openrouter_generation_id(
     *, headers: Mapping[str, str] | None = None, data: Mapping[str, Any] | None = None
@@ -37,3 +42,28 @@ def extract_openrouter_generation_id(
 
     return None
 
+
+def fetch_openrouter_generation(
+    *, settings: Settings, generation_id: str, timeout_seconds: float = 10.0
+) -> dict[str, Any]:
+    """
+    Fetch OpenRouter generation details, including billed cost, via GET /generation?id=...
+
+    Requires APP_OPENAI_BASE_URL to be OpenRouter (e.g. https://openrouter.ai/api/v1).
+    """
+    gen_id = generation_id.strip()
+    if not gen_id:
+        raise ValueError("generation_id is required")
+
+    if not settings.openai_api_key:
+        raise OpenAIError("OpenAI API key is not configured (APP_OPENAI_API_KEY)")
+
+    base_url = settings.openai_base_url.rstrip("/")
+    url = f"{base_url}/generation"
+    headers = {"Authorization": f"Bearer {settings.openai_api_key}"}
+    resp = httpx.get(url, headers=headers, params={"id": gen_id}, timeout=timeout_seconds)
+    resp.raise_for_status()
+    data = resp.json()
+    if not isinstance(data, dict):
+        raise OpenAIError(f"Unexpected OpenRouter generation response shape: {data!r}")
+    return data
