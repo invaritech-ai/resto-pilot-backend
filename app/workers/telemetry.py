@@ -3,11 +3,12 @@ from __future__ import annotations
 import datetime as dt
 import decimal
 import uuid
-from typing import Any, Mapping
+from typing import Any, Mapping, cast
 
 from sqlalchemy.orm import Session
 
 from app.db.models.llm_calls import LLMCalls
+from app.workers.celery_types import CeleryApplyAsync
 
 
 def record_llm_call(
@@ -63,3 +64,12 @@ def record_llm_call(
     db.flush()
     return row.id
 
+
+def schedule_openrouter_cost_backfill(*, llm_call_id: uuid.UUID, delay_seconds: int = 120) -> str | None:
+    from app.workers.tasks import backfill_llm_call_costs  # imported lazily
+
+    async_result = cast(CeleryApplyAsync, backfill_llm_call_costs).apply_async(
+        kwargs={"llm_call_id": str(llm_call_id)},
+        countdown=float(max(0, int(delay_seconds))),
+    )
+    return getattr(async_result, "id", None)
