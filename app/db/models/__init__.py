@@ -7,6 +7,7 @@ from app.db.models.telegram_messages import TelegramMessages
 from app.db.models.telegram_session import TelegramSessions
 from app.db.models.llm_calls import LLMCalls
 from app.db.models.telegram_outgoing_messages import TelegramOutgoingMessages
+from app.db.models.telegram_chat_states import TelegramChatStates
 
 __all__ = [
     "Restaurant",
@@ -18,4 +19,5 @@ __all__ = [
     "TelegramSessions",
     "LLMCalls",
     "TelegramOutgoingMessages",
+    "TelegramChatStates",
 ]
