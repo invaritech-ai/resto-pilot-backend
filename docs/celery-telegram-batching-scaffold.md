@@ -19,9 +19,9 @@ This project supports a “batched Telegram ingest” mode behind a feature flag
 ## What happens in batching mode
 - Webhook validates the secret header, persists the update into Postgres (`telegram_sessions` + `telegram_messages`), schedules a delayed Celery task `flush_session(...)` at `flush_at`, then returns `{"status":"ok"}`.
 - `flush_session` no-ops if the session has newer activity; otherwise marks the session `processing` and enqueues two tasks:
-  - `send_session_ack(session_id)` (sends “Got it — I’m on it.” once per session)
+  - `send_session_ack(session_id)` (best-effort short backchannel ack; may be skipped for naturalness)
   - `process_session(session_id)`
-- `process_session` is currently a stub that writes `processing_events` with a v0 routing plan.
+- `process_session` runs a cheap on-topic gate and then generates a single assistant reply.
 
 ## Reserved commands
 Some commands bypass the normal 30s batching delay (currently: `/start`, `/respond`, `/done`).

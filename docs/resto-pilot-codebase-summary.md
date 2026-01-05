@@ -51,7 +51,7 @@ Some commands bypass batching:
   - Immediate behavior is handled by `process_update(...)` (`app/telegram/processor.py`) which can create/register the user and accept deep-link invite codes.
   - `/start` is also persisted into the audit tables for history.
 - `/done` and `/respond`:
-  - Force-flush flow: the webhook seals the latest open session (`open -> processing`) and enqueues `send_session_ack.delay(session_id=...)` + `process_session.delay(session_id=...)`.
+  - Force-flush flow: the webhook seals the latest open session (`open -> processing`) and enqueues `send_session_ack` + `process_session`.
   - If there is **no open session**, the update is still accepted but no work is enqueued.
 
 ## Background tasks (Celery)
@@ -61,11 +61,11 @@ Defined in `app/workers/tasks.py`:
   - Uses DB locking + the `expected_last_activity_at` guard to no-op stale flushes.
   - When it seals the session, it enqueues `send_session_ack` and `process_session`.
 - `send_session_ack(session_id)`:
-  - Sends a “Got it — I’m on it.” message once per session (guarded by `telegram_sessions.ack_sent_at`).
+  - Sends a best-effort short backchannel ack once per session (guarded by `telegram_sessions.ack_sent_at`); may be skipped for naturalness.
 - `process_session(session_id)`:
   - Loads all messages for the session from the DB.
-  - Writes a v0 “routing plan” event (`router_plan_v0`) and marks the session closed (`session_processed_v0`).
-  - This is the main hook to extend into real AI/file processing.
+  - Runs a cheap on-topic gate: if off-topic, sends one redirect then ghosts until on-topic again.
+  - Generates a single assistant reply and persists telemetry (`llm_calls`) and outbound messages (`telegram_outgoing_messages`).
 
 ## Processing timeline (processing_events)
 For a typical session you’ll see events like:

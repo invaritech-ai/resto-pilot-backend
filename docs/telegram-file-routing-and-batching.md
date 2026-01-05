@@ -81,7 +81,7 @@ Notes:
 ## Worker ingest responsibilities
 The Celery worker (consumer) is responsible for flushing + processing:
 1) `flush_session(...)` transitions eligible sessions to `processing` and enqueues:
-   - `send_session_ack(session_id)` (sends “Got it — I’m on it.” once per session)
+   - `send_session_ack(session_id)` (best-effort short backchannel ack; may be skipped for naturalness)
    - `process_session(session_id)`
 2) `process_session(session_id)` loads the “batch evidence” and runs the router + processing pipeline.
 
