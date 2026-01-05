@@ -7,6 +7,11 @@ import uuid
 
 from sqlalchemy import select
 
+from app.ai.chat_memory import (
+    load_chat_history_messages,
+    load_chat_memory_summary,
+    update_chat_memory_summary,
+)
 from app.ai.openai_client import OpenAIError
 from app.ai.openrouter_generation import extract_openrouter_generation_id
 from app.ai.openrouter_usage import extract_openrouter_usage
@@ -14,6 +19,7 @@ from app.ai.session_reply import generate_session_reply_with_metrics
 from app.ai.topic_gate import classify_on_topic
 from app.core.config import get_settings
 from app.db.models.processing_events import ProcessingEvents
+from app.db.models.telegram_chat_memory import TelegramChatMemory
 from app.db.models.telegram_messages import TelegramMessages
 from app.db.models.telegram_session import TelegramSessions
 from app.telegram.bot_api import send_message
@@ -319,8 +325,19 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
         reply_llm_call_id: uuid.UUID | None = None
         if reply_text is None:
             try:
+                memory_summary = load_chat_memory_summary(db=db, chat_id=db_session.chat_id)
+                history_messages = load_chat_history_messages(
+                    db=db,
+                    chat_id=db_session.chat_id,
+                    exclude_session_id=session_uuid,
+                    limit=50,
+                )
                 reply, metrics = generate_session_reply_with_metrics(
-                    messages=messages, hint_command=hint, settings=settings
+                    messages=messages,
+                    hint_command=hint,
+                    settings=settings,
+                    memory_summary=memory_summary,
+                    history_messages=history_messages,
                 )
             except OpenAIError as exc:
                 db.add(
@@ -418,6 +435,68 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
             telegram_message_id=telegram_message_id,
             llm_call_id=reply_llm_call_id,
         )
+
+        try:
+            memory_summary = load_chat_memory_summary(db=db, chat_id=db_session.chat_id)
+            history_messages = load_chat_history_messages(
+                db=db,
+                chat_id=db_session.chat_id,
+                exclude_session_id=None,
+                limit=50,
+            )
+            new_summary, sum_data, sum_headers, sum_latency_ms = update_chat_memory_summary(
+                settings=settings,
+                previous_summary=memory_summary,
+                history_messages=history_messages,
+            )
+            if isinstance(new_summary, str) and new_summary.strip():
+                row = db.scalar(
+                    select(TelegramChatMemory).where(
+                        TelegramChatMemory.chat_id == db_session.chat_id
+                    )
+                )
+                if row is None:
+                    row = TelegramChatMemory(chat_id=db_session.chat_id, summary_text=new_summary)
+                    db.add(row)
+                else:
+                    row.summary_text = new_summary
+
+                usage = extract_openrouter_usage(sum_data)
+                generation_id = extract_openrouter_generation_id(
+                    headers=sum_headers, data=sum_data
+                )
+                model_raw = sum_data.get("model")
+                model = model_raw if isinstance(model_raw, str) else settings.openai_model
+                usage_obj = sum_data.get("usage")
+                total_cost_usd = (
+                    float(usage_obj.get("cost"))
+                    if isinstance(usage_obj, dict)
+                    and isinstance(usage_obj.get("cost"), (int, float))
+                    else None
+                )
+                llm_call_id = record_llm_call(
+                    db=db,
+                    session_id=session_uuid,
+                    chat_id=db_session.chat_id,
+                    purpose="memory",
+                    model=model,
+                    openrouter_generation_id=generation_id,
+                    upstream_id=None,
+                    provider_name=None,
+                    usage=usage,
+                    latency_ms=sum_latency_ms,
+                    total_cost_usd=total_cost_usd,
+                    error=None,
+                )
+                if generation_id is not None:
+                    schedule_openrouter_cost_backfill(
+                        llm_call_id=llm_call_id, delay_seconds=120
+                    )
+        except Exception:
+            logger.exception(
+                "chat_memory_update_failed",
+                extra={"session_id": session_id, "chat_id": db_session.chat_id},
+            )
 
         final_now = dt.datetime.now(dt.UTC)
         db.add(
