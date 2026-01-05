@@ -15,6 +15,7 @@ from app.ai.chat_memory import (
 from app.ai.openai_client import OpenAIError
 from app.ai.openrouter_generation import extract_openrouter_generation_id
 from app.ai.openrouter_usage import extract_openrouter_usage
+from app.ai.capability_gate import classify_capability, inventory_outlet_list_refusal, is_outlet_list_request
 from app.ai.session_reply import generate_session_reply_with_metrics
 from app.ai.topic_gate import classify_on_topic
 from app.core.config import get_settings
@@ -36,8 +37,8 @@ from app.workers.db import worker_db_session
 logger = logging.getLogger(__name__)
 
 OFF_TOPIC_REDIRECT_TEXT = (
-    "I can help with restaurant/outlet operations (invoices, inventory, menu, pricing, staff). "
-    "What are you working on right now?"
+    "Only inventory updates are supported right now. "
+    "What inventory change do you want to make (item + quantity) and for which outlet?"
 )
 
 
@@ -288,6 +289,126 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
             return
 
         chat_state = get_or_create_chat_state(db=db, chat_id=db_session.chat_id)
+
+        capability_ok, capability_reject_text = classify_capability(
+            messages=messages, hint_command=hint, settings=settings
+        )
+        if not capability_ok:
+            if chat_state.off_topic_mode:
+                logger.info(
+                    "process_session_capability_ghost task_id=%s session_id=%s chat_id=%s",
+                    task_id,
+                    session_id,
+                    db_session.chat_id,
+                )
+                now = dt.datetime.now(dt.UTC)
+                db_session.status = "closed"
+                if db_session.closed_at is None:
+                    db_session.closed_at = now
+                db.add(
+                    ProcessingEvents(
+                        session_id=session_uuid,
+                        at=now,
+                        event="session_capability_ghost_v0",
+                        payload_json=None,
+                        error=None,
+                    )
+                )
+                db.add(
+                    ProcessingEvents(
+                        session_id=session_uuid,
+                        at=now,
+                        event="session_processed_v0",
+                        payload_json=None,
+                        error=None,
+                    )
+                )
+                db.commit()
+                return
+
+            logger.info(
+                "process_session_capability_reject task_id=%s session_id=%s chat_id=%s",
+                task_id,
+                session_id,
+                db_session.chat_id,
+            )
+            telegram_message_id = send_message(
+                chat_id=db_session.chat_id, text=capability_reject_text, settings=settings
+            )
+            record_outgoing_message(
+                db=db,
+                session_id=session_uuid,
+                chat_id=db_session.chat_id,
+                kind="capability_reject",
+                text=capability_reject_text,
+                telegram_message_id=telegram_message_id,
+                llm_call_id=None,
+            )
+            set_chat_off_topic(db=db, chat_id=db_session.chat_id)
+            now = dt.datetime.now(dt.UTC)
+            db_session.status = "closed"
+            if db_session.closed_at is None:
+                db_session.closed_at = now
+            db.add(
+                ProcessingEvents(
+                    session_id=session_uuid,
+                    at=now,
+                    event="session_capability_reject_sent_v0",
+                    payload_json=None,
+                    error=None,
+                )
+            )
+            db.add(
+                ProcessingEvents(
+                    session_id=session_uuid,
+                    at=now,
+                    event="session_processed_v0",
+                    payload_json=None,
+                    error=None,
+                )
+            )
+            db.commit()
+            return
+
+        if is_outlet_list_request(messages=messages):
+            reply_text = inventory_outlet_list_refusal()
+            telegram_message_id = send_message(
+                chat_id=db_session.chat_id, text=reply_text, settings=settings
+            )
+            record_outgoing_message(
+                db=db,
+                session_id=session_uuid,
+                chat_id=db_session.chat_id,
+                kind="reply",
+                text=reply_text,
+                telegram_message_id=telegram_message_id,
+                llm_call_id=None,
+            )
+            final_now = dt.datetime.now(dt.UTC)
+            db.add(
+                ProcessingEvents(
+                    session_id=session_uuid,
+                    at=final_now,
+                    event="assistant_reply_sent_v0",
+                    payload_json=None,
+                    error=None,
+                )
+            )
+            db_session.status = "closed"
+            if db_session.closed_at is None:
+                db_session.closed_at = final_now
+            db.add(
+                ProcessingEvents(
+                    session_id=session_uuid,
+                    at=final_now,
+                    event="session_processed_v0",
+                    payload_json=None,
+                    error=None,
+                )
+            )
+            db.commit()
+            return
+
         if chat_state.off_topic_mode:
             set_chat_on_topic(db=db, chat_id=db_session.chat_id)
 

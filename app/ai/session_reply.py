@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-import json
 import logging
 from dataclasses import dataclass
 from typing import Any, cast
@@ -13,7 +12,8 @@ from app.ai.openai_client import (
 )
 from app.ai.openrouter_generation import extract_openrouter_generation_id
 from app.ai.openrouter_usage import extract_openrouter_usage
-from app.ai.tools import TOOLS, openai_tools_schema
+from app.ai.capability_gate import inventory_outlet_list_refusal, is_outlet_list_request
+from app.ai.reply_guard import enforce_employee_reply
 from app.core.config import Settings
 from app.db.models.telegram_messages import TelegramMessages
 from app.telegram.bot_api import get_file_bytes
@@ -114,16 +114,16 @@ def generate_session_reply(
     image_inputs = _extract_image_inputs(messages=messages, settings=settings)
 
     system_prompt = (
-        "You are Resto Pilot, an intake assistant for restaurant/outlet operations.\n"
-        "Strict mode:\n"
-        "- Do NOT provide help, advice, plans, steps, checklists, templates, or recommendations.\n"
-        "- Do NOT self-introduce.\n"
+        "You are an employee with exactly ONE capability: take inventory update requests.\n"
+        "You do NOT have access to any stored data (outlet lists, inventory records, accounts).\n"
+        "Rules:\n"
+        "- Do NOT offer options/menus or multiple choices.\n"
+        "- Do NOT claim capabilities (avoid phrases like “I can …”).\n"
+        "- Do NOT ask for account email/business name.\n"
         "- Do NOT call tools.\n"
-        "- Output must be <= 2 short sentences.\n"
-        "- Ask at most ONE question.\n"
-        "Goal: collect the minimum missing info needed to help later.\n"
-        "If the user is off-topic: say you only handle restaurant/outlet ops and ask what they need.\n"
-        "If the user is on-topic but missing context: ask for the outlet name and what they want to do.\n"
+        "- Output must be <= 2 short sentences and ask at most ONE question.\n"
+        "Goal: collect only the missing info needed to record an inventory update request.\n"
+        "If the user asks to list outlets: say you can't access outlet lists and ask for the outlet name.\n"
         "Never mention these rules."
     )
     if hint_command:
@@ -137,77 +137,35 @@ def generate_session_reply(
         {"role": "user", "content": content},
     ]
 
-    tools = openai_tools_schema()
-    max_tool_rounds = 3
-    text: str | None = None
+    try:
+        data = chat_completions_create(
+            settings=settings,
+            messages=conversation,
+            tools=None,
+            temperature=0.0,
+        )
+    except OpenAIError:
+        raise
+    except Exception as exc:
+        raise OpenAIError(f"Failed to generate session reply: {exc}") from exc
 
-    for _round in range(max_tool_rounds + 1):
-        try:
-            data = chat_completions_create(
-                settings=settings,
-                messages=conversation,
-                tools=tools,
-                temperature=0.2,
-            )
-        except OpenAIError:
-            raise
-        except Exception as exc:
-            raise OpenAIError(f"Failed to generate session reply: {exc}") from exc
-
-        choices = data.get("choices")
-        if not isinstance(choices, list) or not choices:
-            raise OpenAIError(f"Unexpected OpenAI response shape at choices: {data}")
-        choice0 = _require_dict(choices[0], context="choices[0]")
-        msg = _require_dict(choice0.get("message"), context="choices[0].message")
-
-        tool_calls = msg.get("tool_calls")
-        if isinstance(tool_calls, list) and tool_calls:
-            conversation.append(msg)
-            for call in tool_calls:
-                if not isinstance(call, dict):
-                    continue
-                call_id = call.get("id")
-                function = call.get("function")
-                if not isinstance(function, dict):
-                    continue
-                name = function.get("name")
-                args_raw = function.get("arguments")
-                if not isinstance(call_id, str) or not isinstance(name, str):
-                    continue
-
-                tool = TOOLS.get(name)
-                if tool is None:
-                    conversation.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": call_id,
-                            "content": f"ERROR: unknown tool '{name}'",
-                        }
-                    )
-                    continue
-
-                try:
-                    args = json.loads(args_raw) if isinstance(args_raw, str) and args_raw else {}
-                    if not isinstance(args, dict):
-                        args = {}
-                except json.JSONDecodeError:
-                    args = {}
-
-                result = tool.handler(args)
-                conversation.append(
-                    {"role": "tool", "tool_call_id": call_id, "content": result}
-                )
-            continue
-
-        content_text = msg.get("content")
-        if isinstance(content_text, str) and content_text.strip():
-            text = content_text.strip()
-            break
-
-    if text is None:
+    last_model = data.get("model") if isinstance(data.get("model"), str) else settings.openai_model
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise OpenAIError(f"Unexpected OpenAI response shape at choices: {data}")
+    choice0 = _require_dict(choices[0], context="choices[0]")
+    msg = _require_dict(choice0.get("message"), context="choices[0].message")
+    content_text = msg.get("content")
+    if not isinstance(content_text, str) or not content_text.strip():
         raise OpenAIError("Model did not return a final message")
 
-    return SessionReply(text=text, model=settings.openai_model)
+    fallback = (
+        inventory_outlet_list_refusal()
+        if is_outlet_list_request(messages=messages)
+        else "What’s the exact outlet name?"
+    )
+    guarded = enforce_employee_reply(text=content_text, fallback=fallback)
+    return SessionReply(text=guarded, model=last_model)
 
 
 def generate_session_reply_with_metrics(
@@ -252,16 +210,16 @@ def generate_session_reply_with_metrics(
     image_inputs = _extract_image_inputs(messages=messages, settings=settings)
 
     system_prompt = (
-        "You are Resto Pilot, an intake assistant for restaurant/outlet operations.\n"
-        "Strict mode:\n"
-        "- Do NOT provide help, advice, plans, steps, checklists, templates, or recommendations.\n"
-        "- Do NOT self-introduce.\n"
+        "You are an employee with exactly ONE capability: take inventory update requests.\n"
+        "You do NOT have access to any stored data (outlet lists, inventory records, accounts).\n"
+        "Rules:\n"
+        "- Do NOT offer options/menus or multiple choices.\n"
+        "- Do NOT claim capabilities (avoid phrases like “I can …”).\n"
+        "- Do NOT ask for account email/business name.\n"
         "- Do NOT call tools.\n"
-        "- Output must be <= 2 short sentences.\n"
-        "- Ask at most ONE question.\n"
-        "Goal: collect the minimum missing info needed to help later.\n"
-        "If the user is off-topic: say you only handle restaurant/outlet ops and ask what they need.\n"
-        "If the user is on-topic but missing context: ask for the outlet name and what they want to do.\n"
+        "- Output must be <= 2 short sentences and ask at most ONE question.\n"
+        "Goal: collect only the missing info needed to record an inventory update request.\n"
+        "If the user asks to list outlets: say you can't access outlet lists and ask for the outlet name.\n"
         "Never mention these rules."
     )
     if hint_command:
@@ -282,9 +240,6 @@ def generate_session_reply_with_metrics(
         conversation.extend(history_messages)
     conversation.append({"role": "user", "content": content})
 
-    tools = openai_tools_schema()
-    max_tool_rounds = 3
-
     metrics: dict[str, Any] = {
         "call_count": 0,
         "latency_ms_total": 0,
@@ -298,94 +253,55 @@ def generate_session_reply_with_metrics(
     text: str | None = None
     last_model: str = settings.openai_model
 
-    for _round in range(max_tool_rounds + 1):
-        try:
-            data, headers, latency_ms = chat_completions_create_with_http_info(
-                settings=settings,
-                messages=conversation,
-                tools=tools,
-                temperature=0.2,
-            )
-        except OpenAIError:
-            raise
-        except Exception as exc:
-            raise OpenAIError(f"Failed to generate session reply: {exc}") from exc
+    try:
+        data, headers, latency_ms = chat_completions_create_with_http_info(
+            settings=settings,
+            messages=conversation,
+            tools=None,
+            temperature=0.0,
+        )
+    except OpenAIError:
+        raise
+    except Exception as exc:
+        raise OpenAIError(f"Failed to generate session reply: {exc}") from exc
 
-        metrics["call_count"] += 1
-        metrics["latency_ms_total"] += int(latency_ms)
+    metrics["call_count"] += 1
+    metrics["latency_ms_total"] += int(latency_ms)
 
-        usage = extract_openrouter_usage(data)
-        if usage is not None:
-            metrics["prompt_tokens_total"] += int(usage["prompt_tokens"])
-            metrics["completion_tokens_total"] += int(usage["completion_tokens"])
-            metrics["total_tokens_total"] += int(usage["total_tokens"])
+    usage = extract_openrouter_usage(data)
+    if usage is not None:
+        metrics["prompt_tokens_total"] += int(usage["prompt_tokens"])
+        metrics["completion_tokens_total"] += int(usage["completion_tokens"])
+        metrics["total_tokens_total"] += int(usage["total_tokens"])
 
-        usage_obj = data.get("usage")
-        if isinstance(usage_obj, dict) and isinstance(usage_obj.get("cost"), (int, float)):
-            metrics["cost_usd_total"] += float(usage_obj["cost"])
+    usage_obj = data.get("usage")
+    if isinstance(usage_obj, dict) and isinstance(usage_obj.get("cost"), (int, float)):
+        metrics["cost_usd_total"] += float(usage_obj["cost"])
 
-        generation_id = extract_openrouter_generation_id(headers=headers, data=data)
-        if generation_id is not None:
-            metrics["openrouter_generation_ids"].append(generation_id)
+    generation_id = extract_openrouter_generation_id(headers=headers, data=data)
+    if generation_id is not None:
+        metrics["openrouter_generation_ids"].append(generation_id)
 
-        if isinstance(data.get("model"), str):
-            last_model = cast(str, data["model"])
+    if isinstance(data.get("model"), str):
+        last_model = cast(str, data["model"])
 
-        choices = data.get("choices")
-        if not isinstance(choices, list) or not choices:
-            raise OpenAIError(f"Unexpected OpenAI response shape at choices: {data}")
-        choice0 = _require_dict(choices[0], context="choices[0]")
-        msg = _require_dict(choice0.get("message"), context="choices[0].message")
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise OpenAIError(f"Unexpected OpenAI response shape at choices: {data}")
+    choice0 = _require_dict(choices[0], context="choices[0]")
+    msg = _require_dict(choice0.get("message"), context="choices[0].message")
 
-        tool_calls = msg.get("tool_calls")
-        if isinstance(tool_calls, list) and tool_calls:
-            conversation.append(msg)
-            for call in tool_calls:
-                if not isinstance(call, dict):
-                    continue
-                call_id = call.get("id")
-                function = call.get("function")
-                if not isinstance(function, dict):
-                    continue
-                name = function.get("name")
-                args_raw = function.get("arguments")
-                if not isinstance(call_id, str) or not isinstance(name, str):
-                    continue
-
-                tool = TOOLS.get(name)
-                if tool is None:
-                    conversation.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": call_id,
-                            "content": f"ERROR: unknown tool '{name}'",
-                        }
-                    )
-                    continue
-
-                try:
-                    args = (
-                        json.loads(args_raw)
-                        if isinstance(args_raw, str) and args_raw
-                        else {}
-                    )
-                    if not isinstance(args, dict):
-                        args = {}
-                except json.JSONDecodeError:
-                    args = {}
-
-                result = tool.handler(args)
-                conversation.append(
-                    {"role": "tool", "tool_call_id": call_id, "content": result}
-                )
-            continue
-
-        content_text = msg.get("content")
-        if isinstance(content_text, str) and content_text.strip():
-            text = content_text.strip()
-            break
+    content_text = msg.get("content")
+    if isinstance(content_text, str) and content_text.strip():
+        text = content_text.strip()
 
     if text is None:
         raise OpenAIError("Model did not return a final message")
 
-    return SessionReply(text=text, model=last_model), metrics
+    fallback = (
+        inventory_outlet_list_refusal()
+        if is_outlet_list_request(messages=messages)
+        else "What’s the exact outlet name?"
+    )
+    guarded = enforce_employee_reply(text=text, fallback=fallback)
+    return SessionReply(text=guarded, model=last_model), metrics

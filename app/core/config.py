@@ -57,6 +57,10 @@ class Settings(BaseSettings):
     # Used for local cost estimation from token usage.
     model_prices_json: str = ""
 
+    # Comma-separated enabled capabilities for the main processing bot.
+    # For now this is intentionally restrictive and defaults to a single capability.
+    enabled_capabilities_csv: str = "inventory"
+
     model_config = SettingsConfigDict(env_file=".env", env_prefix="APP_", extra="ignore")
 
 
