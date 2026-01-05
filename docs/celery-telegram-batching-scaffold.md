@@ -17,7 +17,7 @@ This project supports a “batched Telegram ingest” mode behind a feature flag
   - `APP_CELERY_SQS_REGION=...` (or rely on `AWS_DEFAULT_REGION`)
 
 ## What happens in batching mode
-- Webhook validates the secret header, persists the update into Postgres (`telegram_sessions` + `telegram_messages`), schedules a delayed Celery task `flush_session(...)` at `flush_at`, then returns `{"status":"ok"}`.
+- Webhook validates the secret header, persists the update into Postgres (`telegram_sessions` + `telegram_messages`), may enqueue an immediate per-message backchannel (`send_message_backchannel(...)`), schedules a delayed Celery task `flush_session(...)` at `flush_at`, then returns `{"status":"ok"}`.
 - `flush_session` no-ops if the session has newer activity; otherwise marks the session `processing` and enqueues two tasks:
   - `send_session_ack(session_id)` (best-effort short backchannel ack; may be skipped for naturalness)
   - `process_session(session_id)`
