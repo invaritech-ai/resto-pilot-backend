@@ -19,6 +19,13 @@ When batching is enabled (`APP_TELEGRAM_BATCHING_ENABLED=true`), the Telegram we
 - Start both API + worker: `./scripts/run_dev.sh`
 - Notes on SQS + reliability: `docs/aws-sqs-celery-broker-notes.md`
 
+## LLM configuration (OpenRouter/OpenAI-compatible)
+This project uses the Chat Completions endpoint and supports splitting “cheap” vs “expensive” models:
+- `APP_OPENAI_MODEL`: main model (session processing; currently configured for strict “intake only” responses).
+- `APP_OPENAI_ACK_MODEL`: optional cheap model for backchannel acks (when batching).
+- `APP_OPENAI_GATE_MODEL`: optional cheap model for on-topic gating + chat memory summarization.
+- Optional: `APP_MODEL_PRICES_JSON=...` for local cost estimation fallback (primary cost source is OpenRouter `/generation` backfill).
+
 ## Package for AWS Lambda (FastAPI + Mangum)
 - Handler entrypoint is `app.handler.handler` (see `app/handler.py`).
 - Build the deployable zip from repo root for Lambda Python 3.12:
@@ -59,10 +66,12 @@ This repo includes a `Dockerfile` and `docker-compose.yaml` to run the API + Cel
   - OpenRouter/OpenAI-compatible settings:
     - `APP_OPENAI_BASE_URL=https://openrouter.ai/api/v1`
     - `APP_OPENAI_API_KEY=<OPENROUTER_KEY>`
-    - `APP_OPENAI_MODEL=<model-slug>`
+    - `APP_OPENAI_MODEL=<main-model-slug>`
+    - Optional: `APP_OPENAI_ACK_MODEL=<cheap-ack-model-slug>`
+    - Optional: `APP_OPENAI_GATE_MODEL=<cheap-gate-model-slug>`
     - Optional: `APP_OPENROUTER_HTTP_REFERER` + `APP_OPENROUTER_TITLE`
-- Run DB migrations once (Coolify exec into the `api` container): `alembic upgrade head`
-- Point Telegram webhook to your public domain: `https://<your-domain>/api/v1/telegram` with the same `secret_token`.
+  - Run DB migrations once (Coolify exec into the `api` container): `alembic upgrade head`
+  - Point Telegram webhook to your public domain: `https://<your-domain>/api/v1/telegram` with the same `secret_token`.
 
 Notes:
 - Scripts may need permissions once: `chmod +x scripts/*.sh`.
