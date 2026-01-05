@@ -118,16 +118,32 @@ def generate_backchannel_text(
         else settings
     )
 
+    last = messages[-1] if messages else None
+    last_content = ""
+    if last is not None:
+        last_text = (last.text or "").strip()
+        last_caption = (last.caption or "").strip()
+        last_content = (last_text or last_caption).strip()
+    normalized_last = re.sub(r"\s+", " ", last_content.lower()).strip()
+    looks_like_question = ("?" in last_content) or bool(
+        re.match(
+            r"^(what|which|where|when|why|how|did|do|does|can|could|is|are|have|has|will|would)\b",
+            normalized_last,
+        )
+    )
+
     system_prompt = (
         "You are a tiny backchannel generator.\n"
         "Your job is to keep the conversation moving without answering.\n"
         "Rules:\n"
         "- Do NOT answer questions.\n"
         "- Do NOT provide details, steps, or advice.\n"
+        "- If the user asks a question (status/info), prefer a \"checking\" style ack.\n"
+        "- If the user gives an instruction or info, prefer a \"got it\" style ack.\n"
         "- Output either:\n"
         "  (A) a very short acknowledgement (1-4 words, no punctuation), OR\n"
         "  (B) a single space character to indicate silence.\n"
-        "Examples of (A): ok | okay | got it | on it | understood | yep\n"
+        "Examples of (A): checking | one sec | let me check | ok | got it | on it\n"
     )
 
     text, data, headers, latency_ms = create_chat_completion_text_allow_empty_with_http_info(
@@ -155,5 +171,21 @@ def generate_backchannel_text(
         return None, data, headers, latency_ms
     if any(ch.isdigit() for ch in cleaned):
         return None, data, headers, latency_ms
+
+    # If they asked a question, prefer "checking" over an acknowledgement that can
+    # read like a confirmation of action completion.
+    if looks_like_question:
+        ack_like = {
+            "ok",
+            "okay",
+            "got it",
+            "on it",
+            "understood",
+            "sure",
+            "yep",
+            "yeah",
+        }
+        if cleaned.lower() in ack_like:
+            cleaned = random.choice(["checking", "one sec", "looking"])
 
     return cleaned, data, headers, latency_ms
