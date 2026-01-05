@@ -25,6 +25,7 @@ This project uses the Chat Completions endpoint and supports splitting â€œcheapâ
 - `APP_OPENAI_ACK_MODEL`: optional cheap model for backchannel acks (when batching).
 - `APP_OPENAI_GATE_MODEL`: optional cheap model for on-topic gating + chat memory summarization.
 - Optional: `APP_MODEL_PRICES_JSON=...` for local cost estimation fallback (primary cost source is OpenRouter `/generation` backfill).
+- Capability lock-down (default deny): `APP_ENABLED_CAPABILITIES_CSV` (see `docs/capabilities.md`).
 
 ## Package for AWS Lambda (FastAPI + Mangum)
 - Handler entrypoint is `app.handler.handler` (see `app/handler.py`).
