@@ -9,12 +9,13 @@ This bot uses Telegram batching + a worker pipeline to keep UX responsive while 
 
 ### Negative paths (expected + controlled)
 - **Off-topic**: bot sends a single redirect message, sets off-topic mode (`telegram_chat_states.off_topic_mode=true`), then ghosts until the user becomes on-topic again.
+- **Unsupported capability**: bot sends a single capability-reject message, sets off-topic mode, then ghosts until the user returns to the enabled capability.
 - **Ack skipped**: to avoid feeling robotic, `send_session_ack` may intentionally produce no message.
 - **Transient provider issues**: expensive replies retry via Celery backoff; cost details can be backfilled later via OpenRouter `/generation`.
 
 ### Data/telemetry
 - Incoming messages: `telegram_messages`
-- Outgoing messages: `telegram_outgoing_messages` (`kind`: `ack|redirect|reply`)
-- LLM call telemetry: `llm_calls` (`purpose`: `ack|gate|reply|memory`)
+- Outgoing messages: `telegram_outgoing_messages` (`kind`: `ack|ack_message|redirect|capability_reject|reply`)
+- LLM call telemetry: `llm_calls` (`purpose`: `ack|ack_message|gate|reply|memory`)
 - Chat state: `telegram_chat_states` (off-topic ghosting mode)
 - Memory summary: `telegram_chat_memory`
