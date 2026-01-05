@@ -33,9 +33,12 @@
 ### E) Backchannel ack (cheap + “human”, skip ~30–40%)
 - [x] Add `should_attempt_backchannel()` in `app/ai/backchannel.py` (cheap heuristics; can early-skip)
 - [x] Add `generate_backchannel_text()` in `app/ai/backchannel.py` (calls ack model; may return `None` to skip)
+- [x] Add `send_message_backchannel()` in `app/workers/tasks.py` (per-message immediate backchannel; does not set `ack_sent_at`)
+- [x] Modify `ingest_update()` in `app/telegram/ingest.py` to randomly enqueue per-message backchannel (40% skip) after persisting the message
 - [x] Modify `flush_session()` in `app/workers/tasks.py` to schedule `send_session_ack` with small countdown/jitter (so it’s “soon after” but race-friendly)
 - [x] Modify `send_session_ack()` in `app/workers/tasks.py` to:
   - skip if `telegram_chat_states.off_topic_mode` is true (“ghosting mode”)
+  - skip if a per-message backchannel was already sent for the session
   - generate backchannel (or no-op)
   - send via `send_message()` and write `telegram_outgoing_messages`
   - write `llm_calls` (model/tokens/latency/cost) when a model call happens

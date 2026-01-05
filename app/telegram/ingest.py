@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 from dataclasses import dataclass
+import random
 from typing import Any, Mapping, cast
 import uuid
 
@@ -20,6 +21,8 @@ from app.telegram.session_lock import lock_chat_id
 from app.workers.celery_types import CeleryApplyAsync
 
 logger = logging.getLogger(__name__)
+
+MESSAGE_BACKCHANNEL_SKIP_PROBABILITY = 0.40
 
 
 @dataclass(frozen=True)
@@ -349,6 +352,23 @@ def ingest_update(
             extra={"update_id": parsed.update_id, "chat_id": parsed.chat_id},
         )
         return None
+
+    # Per-message backchannel (best-effort): decide quickly whether to respond with a
+    # short ack now, without waiting for the session flush.
+    if schedule_flush and settings.celery_broker_url:
+        if random.random() >= MESSAGE_BACKCHANNEL_SKIP_PROBABILITY:
+            from app.workers.tasks import send_message_backchannel  # imported lazily
+
+            logger.info(
+                "telegram_ingest_scheduling_message_backchannel update_id=%s chat_id=%s session_id=%s",
+                parsed.update_id,
+                parsed.chat_id,
+                str(open_session.id),
+            )
+            cast(CeleryApplyAsync, send_message_backchannel).apply_async(
+                kwargs={"session_id": str(open_session.id)},
+                countdown=0.0,
+            )
 
     if not schedule_flush:
         logger.info(

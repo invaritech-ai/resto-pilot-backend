@@ -71,15 +71,17 @@ On every update:
 1) Verify Telegram webhook secret header.
 2) Parse JSON.
 3) Persist the update into Postgres (`telegram_sessions` + `telegram_messages`) in a single transaction.
-4) Schedule a delayed Celery `flush_session(session_id, expected_last_activity_at)` at `flush_at`.
-5) Return immediately with `{"status":"ok"}`.
+4) Optionally enqueue an immediate per-message backchannel (`send_message_backchannel(session_id)`) to keep the conversation feeling responsive (best-effort; may intentionally skip).
+5) Schedule a delayed Celery `flush_session(session_id, expected_last_activity_at)` at `flush_at`.
+6) Return immediately with `{"status":"ok"}`.
 
 Notes:
 - In Postgres, ingestion is serialized per `chat_id` (advisory lock) to avoid race conditions under concurrency.
-- The webhook should not call external APIs; it should remain “DB-only + enqueue”.
+- The webhook should not call external APIs; it should remain “DB-only + enqueue” (including enqueueing backchannel tasks).
 
 ## Worker ingest responsibilities
 The Celery worker (consumer) is responsible for flushing + processing:
+0) `send_message_backchannel(session_id)` may run shortly after ingestion to send a quick, non-answering ack (best-effort).
 1) `flush_session(...)` transitions eligible sessions to `processing` and enqueues:
    - `send_session_ack(session_id)` (best-effort short backchannel ack; may be skipped for naturalness)
    - `process_session(session_id)`
