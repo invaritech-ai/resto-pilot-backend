@@ -10,7 +10,7 @@ from sqlalchemy import select
 from app.ai.openai_client import OpenAIError
 from app.ai.openrouter_generation import extract_openrouter_generation_id
 from app.ai.openrouter_usage import extract_openrouter_usage
-from app.ai.session_reply import generate_session_reply
+from app.ai.session_reply import generate_session_reply_with_metrics
 from app.ai.topic_gate import classify_on_topic
 from app.core.config import get_settings
 from app.db.models.processing_events import ProcessingEvents
@@ -183,19 +183,20 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
                 generation_id = extract_openrouter_generation_id(
                     headers=gate_headers, data=gate_data
                 )
-                model = (
-                    gate_data.get("model")
-                    if isinstance(gate_data.get("model"), str)
-                    else settings.openai_model
-                )
+
+                model_raw = gate_data.get("model")
+                model = model_raw if isinstance(model_raw, str) else settings.openai_model
+
+                upstream_id_raw = gate_data.get("id")
                 upstream_id = (
-                    gate_data.get("id") if isinstance(gate_data.get("id"), str) else None
+                    upstream_id_raw if isinstance(upstream_id_raw, str) else None
                 )
+
+                provider_name_raw = gate_data.get("provider")
                 provider_name = (
-                    gate_data.get("provider")
-                    if isinstance(gate_data.get("provider"), str)
-                    else None
+                    provider_name_raw if isinstance(provider_name_raw, str) else None
                 )
+
                 total_cost_usd = None
                 usage_obj = gate_data.get("usage")
                 if isinstance(usage_obj, dict) and isinstance(
@@ -315,9 +316,10 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
             except json.JSONDecodeError:
                 reply_text = None
 
+        reply_llm_call_id: uuid.UUID | None = None
         if reply_text is None:
             try:
-                reply = generate_session_reply(
+                reply, metrics = generate_session_reply_with_metrics(
                     messages=messages, hint_command=hint, settings=settings
                 )
             except OpenAIError as exc:
@@ -334,6 +336,38 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
                 raise
 
             reply_text = reply.text
+            reply_model = reply.model if isinstance(reply.model, str) else settings.openai_model
+            generation_ids = metrics.get("openrouter_generation_ids") or []
+            generation_id = (
+                generation_ids[0]
+                if isinstance(generation_ids, list) and len(generation_ids) == 1
+                else None
+            )
+            usage = {
+                "prompt_tokens": int(metrics.get("prompt_tokens_total") or 0),
+                "completion_tokens": int(metrics.get("completion_tokens_total") or 0),
+                "total_tokens": int(metrics.get("total_tokens_total") or 0),
+            }
+            total_cost_usd = metrics.get("cost_usd_total")
+            total_cost_usd = float(total_cost_usd) if isinstance(total_cost_usd, (int, float)) else None
+            latency_ms_total = metrics.get("latency_ms_total")
+            latency_ms_total = int(latency_ms_total) if isinstance(latency_ms_total, int) else None
+
+            llm_call_id = record_llm_call(
+                db=db,
+                session_id=session_uuid,
+                chat_id=db_session.chat_id,
+                purpose="reply",
+                model=reply_model,
+                openrouter_generation_id=generation_id,
+                upstream_id=None,
+                provider_name=None,
+                usage=usage,
+                latency_ms=latency_ms_total,
+                total_cost_usd=total_cost_usd,
+                error=None,
+            )
+            reply_llm_call_id = llm_call_id
             db.add(
                 ProcessingEvents(
                     session_id=session_uuid,
@@ -347,8 +381,21 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
             )
             db.commit()
 
+            if generation_id is not None:
+                try:
+                    schedule_openrouter_cost_backfill(
+                        llm_call_id=llm_call_id, delay_seconds=120
+                    )
+                except Exception:
+                    logger.exception(
+                        "process_session_cost_backfill_schedule_failed",
+                        extra={"llm_call_id": str(llm_call_id), "session_id": session_id},
+                    )
+
         try:
-            send_message(chat_id=db_session.chat_id, text=reply_text, settings=settings)
+            telegram_message_id = send_message(
+                chat_id=db_session.chat_id, text=reply_text, settings=settings
+            )
         except Exception as exc:
             db.add(
                 ProcessingEvents(
@@ -361,6 +408,16 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
             )
             db.commit()
             raise
+
+        record_outgoing_message(
+            db=db,
+            session_id=session_uuid,
+            chat_id=db_session.chat_id,
+            kind="reply",
+            text=reply_text,
+            telegram_message_id=telegram_message_id,
+            llm_call_id=reply_llm_call_id,
+        )
 
         final_now = dt.datetime.now(dt.UTC)
         db.add(
