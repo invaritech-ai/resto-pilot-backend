@@ -59,7 +59,9 @@ def _extract_image_inputs(
             continue
 
         try:
-            data = get_file_bytes(file_id=msg.file_id, settings=settings, max_bytes=max_bytes)
+            data = get_file_bytes(
+                file_id=msg.file_id, settings=settings, max_bytes=max_bytes
+            )
         except Exception as exc:
             logger.exception(
                 "telegram_file_download_failed",
@@ -149,7 +151,8 @@ def generate_session_reply(
     except Exception as exc:
         raise OpenAIError(f"Failed to generate session reply: {exc}") from exc
 
-    last_model = data.get("model") if isinstance(data.get("model"), str) else settings.openai_model
+    model_raw = data.get("model")
+    last_model: str = model_raw if isinstance(model_raw, str) else settings.openai_model
     choices = data.get("choices")
     if not isinstance(choices, list) or not choices:
         raise OpenAIError(f"Unexpected OpenAI response shape at choices: {data}")
@@ -162,7 +165,7 @@ def generate_session_reply(
     fallback = (
         inventory_outlet_list_refusal()
         if is_outlet_list_request(messages=messages)
-        else "What’s the exact outlet name?"
+        else "What's the exact outlet name?"
     )
     guarded = enforce_employee_reply(text=content_text, fallback=fallback)
     return SessionReply(text=guarded, model=last_model)
@@ -301,7 +304,7 @@ def generate_session_reply_with_metrics(
     fallback = (
         inventory_outlet_list_refusal()
         if is_outlet_list_request(messages=messages)
-        else "What’s the exact outlet name?"
+        else "What's the exact outlet name?"
     )
     guarded = enforce_employee_reply(text=text, fallback=fallback)
     return SessionReply(text=guarded, model=last_model), metrics
