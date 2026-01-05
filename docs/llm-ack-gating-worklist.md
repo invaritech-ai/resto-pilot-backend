@@ -49,10 +49,15 @@
   - if **on-topic**: clear off-topic mode (if set) and continue to the normal expensive reply path
 
 ### G) Expensive reply telemetry (gpt-5.1)
-- [ ] Add `generate_session_reply_with_metrics()` in `app/ai/session_reply.py` (returns reply + aggregated tokens/latency across tool rounds)
-- [ ] Modify `process_session()` in `app/processing/session_processor.py` to use `generate_session_reply_with_metrics()` and write a `llm_calls` row for the expensive reply
-- [ ] Modify `process_session()` in `app/processing/session_processor.py` to store the final outgoing reply in `telegram_outgoing_messages` (with returned `telegram_message_id`)
+- [x] Add `generate_session_reply_with_metrics()` in `app/ai/session_reply.py` (returns reply + aggregated tokens/latency across tool rounds)
+- [x] Modify `process_session()` in `app/processing/session_processor.py` to use `generate_session_reply_with_metrics()` and write a `llm_calls` row for the expensive reply
+- [x] Modify `process_session()` in `app/processing/session_processor.py` to store the final outgoing reply in `telegram_outgoing_messages` (with returned `telegram_message_id`)
 
 ### H) Env wiring
 - [x] Modify `Settings` in `app/core/config.py` to include `openai_ack_model`, `openai_gate_model`, `model_prices_json`
 - [x] Update `.env.example` to include `APP_OPENAI_ACK_MODEL`, `APP_OPENAI_GATE_MODEL`, `APP_MODEL_PRICES_JSON`
+
+### I) Abuse controls (future)
+- [ ] Add daily budget caps per `chat_id`/`user_id` (tokens + $) before running expensive models
+- [ ] Add throttling/rate limiting per `chat_id`/`user_id` (requests/minute, bursts)
+- [ ] Add file-abuse protection (don’t auto-bypass gate on any file; require caption/hint or cheap confirm step)
