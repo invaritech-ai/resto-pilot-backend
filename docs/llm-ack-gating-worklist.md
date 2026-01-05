@@ -33,16 +33,16 @@
 ### E) Backchannel ack (cheap + “human”, skip ~30–40%)
 - [x] Add `should_attempt_backchannel()` in `app/ai/backchannel.py` (cheap heuristics; can early-skip)
 - [x] Add `generate_backchannel_text()` in `app/ai/backchannel.py` (calls ack model; may return `None` to skip)
-- [ ] Modify `flush_session()` in `app/workers/tasks.py` to schedule `send_session_ack` with small countdown/jitter (so it’s “soon after” but race-friendly)
-- [ ] Modify `send_session_ack()` in `app/workers/tasks.py` to:
+- [x] Modify `flush_session()` in `app/workers/tasks.py` to schedule `send_session_ack` with small countdown/jitter (so it’s “soon after” but race-friendly)
+- [x] Modify `send_session_ack()` in `app/workers/tasks.py` to:
   - skip if `telegram_chat_states.off_topic_mode` is true (“ghosting mode”)
   - generate backchannel (or no-op)
   - send via `send_message()` and write `telegram_outgoing_messages`
   - write `llm_calls` (model/tokens/latency/cost) when a model call happens
 
 ### F) Off-topic gate + redirect once + ghost until on-topic again
-- [ ] Add `classify_on_topic()` in `app/ai/topic_gate.py` (cheap model → `on_topic: bool` + optional reason)
-- [ ] Modify `process_session()` in `app/processing/session_processor.py` to:
+- [x] Add `classify_on_topic()` in `app/ai/topic_gate.py` (cheap model → `on_topic: bool` + optional reason)
+- [x] Modify `process_session()` in `app/processing/session_processor.py` to:
   - run `classify_on_topic()` first (cheap)
   - if **off-topic** and chat not already in off-topic mode: send **one** redirect, set off-topic mode, log outgoing + llm_call, then stop
   - if **off-topic** and already in off-topic mode: **ghost** (no send), just stop

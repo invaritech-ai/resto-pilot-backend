@@ -4,6 +4,7 @@ import datetime as dt
 import decimal
 import json
 import logging
+import random
 import uuid
 from typing import cast
 
@@ -11,10 +12,15 @@ from celery import current_task
 from sqlalchemy import func, select
 
 from app.ai.openai_client import OpenAIError
+from app.ai.backchannel import generate_backchannel_text, should_attempt_backchannel
 from app.ai.openrouter_generation import fetch_openrouter_generation
+from app.ai.openrouter_generation import extract_openrouter_generation_id
+from app.ai.openrouter_usage import extract_openrouter_usage
 from app.core.config import get_settings
 from app.db.models.llm_calls import LLMCalls
 from app.db.models.processing_events import ProcessingEvents
+from app.db.models.telegram_chat_states import TelegramChatStates
+from app.db.models.telegram_messages import TelegramMessages
 from app.db.models.telegram_session import TelegramSessions
 from app.processing.session_processor import process_session as process_session_impl
 from app.telegram.handler import handle_update
@@ -22,6 +28,11 @@ from app.telegram.bot_api import send_message
 from app.workers.celery_app import celery_app
 from app.workers.celery_types import CeleryApplyAsync, CeleryDelayable
 from app.workers.db import worker_db_session
+from app.workers.telemetry import (
+    record_llm_call,
+    record_outgoing_message,
+    schedule_openrouter_cost_backfill,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -108,7 +119,10 @@ def flush_session(*, session_id: str, expected_last_activity_at: str) -> None:
         task_id,
         session_id,
     )
-    cast(CeleryDelayable, send_session_ack).delay(session_id=session_id)
+    ack_countdown = 1.0 + random.random() * 2.0
+    cast(CeleryApplyAsync, send_session_ack).apply_async(
+        kwargs={"session_id": session_id}, countdown=ack_countdown
+    )
     cast(CeleryDelayable, process_session).delay(session_id=session_id)
 
 
@@ -124,6 +138,8 @@ def send_session_ack(*, session_id: str, text: str = SESSION_FLUSH_REPLY_TEXT) -
     )
 
     chat_id: int | None = None
+    off_topic_mode = False
+    recent_messages: list[TelegramMessages] = []
     with worker_db_session() as db:
         db_session = db.execute(
             select(TelegramSessions)
@@ -145,22 +161,175 @@ def send_session_ack(*, session_id: str, text: str = SESSION_FLUSH_REPLY_TEXT) -
             )
             return
         chat_id = db_session.chat_id
-        settings = get_settings()
-        try:
-            send_message(chat_id=chat_id, text=text, settings=settings)
-        except Exception as exc:
-            db.rollback()
-            logger.exception(
-                "telegram_ack_send_failed",
-                extra={"error": repr(exc), "chat_id": chat_id, "session_id": session_id},
+        state = db.scalar(select(TelegramChatStates).where(TelegramChatStates.chat_id == chat_id))
+        if state is not None:
+            off_topic_mode = bool(state.off_topic_mode)
+        recent_messages = list(
+            reversed(
+                list(
+                    db.scalars(
+                        select(TelegramMessages)
+                        .where(TelegramMessages.session_id == session_uuid)
+                        .order_by(
+                            TelegramMessages.received_at.desc(),
+                            TelegramMessages.message_id.desc(),
+                        )
+                        .limit(3)
+                    )
+                )
             )
-            raise
-
-        db_session.ack_sent_at = dt.datetime.now(dt.UTC)
-        db.commit()
+        )
 
     if not isinstance(chat_id, int):
         return
+    if off_topic_mode:
+        logger.info(
+            "send_session_ack_noop_off_topic_mode task_id=%s session_id=%s chat_id=%s",
+            task_id,
+            session_id,
+            chat_id,
+        )
+        with worker_db_session() as db:
+            db_session = db.execute(
+                select(TelegramSessions)
+                .where(TelegramSessions.id == session_uuid)
+                .with_for_update()
+            ).scalar_one_or_none()
+            if db_session is None or db_session.ack_sent_at is not None:
+                return
+            db_session.ack_sent_at = dt.datetime.now(dt.UTC)
+            db.commit()
+        return
+
+    if not should_attempt_backchannel(messages=recent_messages):
+        logger.info(
+            "send_session_ack_noop_should_not_attempt task_id=%s session_id=%s chat_id=%s",
+            task_id,
+            session_id,
+            chat_id,
+        )
+        with worker_db_session() as db:
+            db_session = db.execute(
+                select(TelegramSessions)
+                .where(TelegramSessions.id == session_uuid)
+                .with_for_update()
+            ).scalar_one_or_none()
+            if db_session is None or db_session.ack_sent_at is not None:
+                return
+            db_session.ack_sent_at = dt.datetime.now(dt.UTC)
+            db.commit()
+        return
+
+    settings = get_settings()
+    try:
+        ack_text, data, headers, latency_ms = generate_backchannel_text(
+            messages=recent_messages,
+            settings=settings,
+        )
+    except Exception as exc:
+        logger.exception(
+            "send_session_ack_generation_failed",
+            extra={"error": repr(exc), "chat_id": chat_id, "session_id": session_id},
+        )
+        return
+
+    usage = extract_openrouter_usage(data)
+    generation_id = extract_openrouter_generation_id(headers=headers, data=data)
+    model = data.get("model") if isinstance(data.get("model"), str) else settings.openai_model
+    upstream_id = data.get("id") if isinstance(data.get("id"), str) else None
+    provider_name = data.get("provider") if isinstance(data.get("provider"), str) else None
+    total_cost_usd = None
+    usage_obj = data.get("usage") if isinstance(data.get("usage"), dict) else None
+    if isinstance(usage_obj, dict) and isinstance(usage_obj.get("cost"), (int, float)):
+        total_cost_usd = float(usage_obj["cost"])
+
+    if ack_text is None:
+        with worker_db_session() as db:
+            db_session = db.execute(
+                select(TelegramSessions)
+                .where(TelegramSessions.id == session_uuid)
+                .with_for_update()
+            ).scalar_one_or_none()
+            if db_session is None or db_session.ack_sent_at is not None:
+                return
+            llm_call_id = record_llm_call(
+                db=db,
+                session_id=session_uuid,
+                chat_id=chat_id,
+                purpose="ack",
+                model=model,
+                openrouter_generation_id=generation_id,
+                upstream_id=upstream_id,
+                provider_name=provider_name,
+                usage=usage,
+                latency_ms=latency_ms,
+                total_cost_usd=total_cost_usd,
+                error=None,
+            )
+            db_session.ack_sent_at = dt.datetime.now(dt.UTC)
+            db.commit()
+
+        if generation_id is not None:
+            try:
+                schedule_openrouter_cost_backfill(llm_call_id=llm_call_id, delay_seconds=120)
+            except Exception:
+                logger.exception(
+                    "send_session_ack_cost_backfill_schedule_failed",
+                    extra={"llm_call_id": str(llm_call_id), "session_id": session_id},
+                )
+        return
+
+    try:
+        telegram_message_id = send_message(chat_id=chat_id, text=ack_text, settings=settings)
+    except Exception as exc:
+        logger.exception(
+            "telegram_ack_send_failed",
+            extra={"error": repr(exc), "chat_id": chat_id, "session_id": session_id},
+        )
+        raise
+
+    with worker_db_session() as db:
+        db_session = db.execute(
+            select(TelegramSessions)
+            .where(TelegramSessions.id == session_uuid)
+            .with_for_update()
+        ).scalar_one_or_none()
+        if db_session is None or db_session.ack_sent_at is not None:
+            return
+        llm_call_id = record_llm_call(
+            db=db,
+            session_id=session_uuid,
+            chat_id=chat_id,
+            purpose="ack",
+            model=model,
+            openrouter_generation_id=generation_id,
+            upstream_id=upstream_id,
+            provider_name=provider_name,
+            usage=usage,
+            latency_ms=latency_ms,
+            total_cost_usd=total_cost_usd,
+            error=None,
+        )
+        record_outgoing_message(
+            db=db,
+            session_id=session_uuid,
+            chat_id=chat_id,
+            kind="ack",
+            text=ack_text,
+            telegram_message_id=telegram_message_id,
+            llm_call_id=llm_call_id,
+        )
+        db_session.ack_sent_at = dt.datetime.now(dt.UTC)
+        db.commit()
+
+    if generation_id is not None:
+        try:
+            schedule_openrouter_cost_backfill(llm_call_id=llm_call_id, delay_seconds=120)
+        except Exception:
+            logger.exception(
+                "send_session_ack_cost_backfill_schedule_failed",
+                extra={"llm_call_id": str(llm_call_id), "session_id": session_id},
+            )
 
 
 @celery_app.task(name="process_session")
