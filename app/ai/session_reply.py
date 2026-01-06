@@ -86,6 +86,7 @@ def generate_session_reply(
     messages: list[TelegramMessages],
     hint_command: str | None,
     settings: Settings,
+    user_first_name: str | None = None,
 ) -> SessionReply:
     """
     Generate a single assistant reply for a batch ("session") of Telegram messages.
@@ -130,6 +131,10 @@ def generate_session_reply(
     )
     if hint_command:
         system_prompt += f"\nSession hint command: {hint_command}"
+    if isinstance(user_first_name, str) and user_first_name.strip():
+        system_prompt += (
+            f"\nUser first name: {user_first_name.strip()} (use sparingly; only if natural)."
+        )
 
     content: list[dict[str, Any]] = [{"type": "text", "text": user_text}]
     content.extend(image_inputs)
@@ -178,6 +183,7 @@ def generate_session_reply_with_metrics(
     settings: Settings,
     memory_summary: str | None = None,
     history_messages: list[dict[str, Any]] | None = None,
+    user_first_name: str | None = None,
 ) -> tuple[SessionReply, dict[str, Any]]:
     """
     Like generate_session_reply(), but returns aggregated metrics across tool rounds.
@@ -227,6 +233,10 @@ def generate_session_reply_with_metrics(
     )
     if hint_command:
         system_prompt += f"\nSession hint command: {hint_command}"
+    if isinstance(user_first_name, str) and user_first_name.strip():
+        system_prompt += (
+            f"\nUser first name: {user_first_name.strip()} (use sparingly; only if natural)."
+        )
 
     content: list[dict[str, Any]] = [{"type": "text", "text": user_text}]
     content.extend(image_inputs)

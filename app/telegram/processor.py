@@ -3,9 +3,11 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
+from app.db.models.user import User
 from app.domain.services.invite_service import (
     InviteCodeExpiredError,
     InviteCodeNotValidError,
@@ -35,6 +37,22 @@ def _send_message(*, chat_id: int, text: str) -> TelegramResponse:
 
 
 logger = logging.getLogger(__name__)
+
+COLLECT_PHONE_STATE = "COLLECT_PHONE"
+IDLE_STATE = "IDLE"
+
+
+def _first_name_from_full_name(full_name: str | None) -> str | None:
+    if not isinstance(full_name, str):
+        return None
+    parts = [p for p in full_name.strip().split() if p]
+    return parts[0] if parts else None
+
+
+def _phone_prompt(*, full_name: str | None) -> str:
+    first_name = _first_name_from_full_name(full_name)
+    name_prefix = f"Hi {first_name}. " if first_name else "Hi. "
+    return name_prefix + "What's your phone number (include country code, e.g. +1 415 555 0101)?"
 
 
 def _parse_start_code(text: str) -> str | None:
@@ -68,9 +86,24 @@ def process_update(
             username=user_info.get("username"),
         )
         user = UserService(session).get_or_create(payload)
+        db_user = session.scalar(select(User).where(User.id == user.id))
+        if db_user is None:
+            return _send_message(chat_id=chat_id, text="Welcome!").as_webhook_response()
 
         code = _parse_start_code(text)
         if code is None:
+            if not (isinstance(db_user.phone, str) and db_user.phone.strip()):
+                db_user.state = COLLECT_PHONE_STATE
+                session.add(db_user)
+                session.commit()
+                return _send_message(
+                    chat_id=chat_id,
+                    text=_phone_prompt(full_name=db_user.full_name),
+                ).as_webhook_response()
+            if db_user.state != IDLE_STATE:
+                db_user.state = IDLE_STATE
+                session.add(db_user)
+                session.commit()
             return _send_message(
                 chat_id=chat_id,
                 text=(
@@ -126,9 +159,22 @@ def process_update(
             ).as_webhook_response()
 
         restaurant_name = restaurant.name if restaurant is not None else "the restaurant"
+        joined_text = f"You're now added to {restaurant_name} as {membership.role}."
+        if not (isinstance(db_user.phone, str) and db_user.phone.strip()):
+            db_user.state = COLLECT_PHONE_STATE
+            session.add(db_user)
+            session.commit()
+            return _send_message(
+                chat_id=chat_id,
+                text=joined_text + "\n" + _phone_prompt(full_name=db_user.full_name),
+            ).as_webhook_response()
+        if db_user.state != IDLE_STATE:
+            db_user.state = IDLE_STATE
+            session.add(db_user)
+            session.commit()
         return _send_message(
             chat_id=chat_id,
-            text=f"You're now added to {restaurant_name} as {membership.role}.",
+            text=joined_text,
         ).as_webhook_response()
 
     if text.strip() == "/start":

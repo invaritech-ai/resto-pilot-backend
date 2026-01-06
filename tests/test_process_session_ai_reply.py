@@ -103,6 +103,16 @@ def test_process_session_generates_and_sends_reply(monkeypatch: pytest.MonkeyPat
         "get_settings",
         lambda: Settings(telegram_bot_token="test", openai_api_key="test"),
     )
+    monkeypatch.setattr(
+        session_processor,
+        "classify_on_topic",
+        lambda **_kwargs: (True, "test", {}, {}, 0),
+    )
+    monkeypatch.setattr(
+        session_processor,
+        "classify_capability",
+        lambda **_kwargs: (True, ""),
+    )
 
     called: dict[str, object] = {"generated": 0, "sent": 0}
 
@@ -110,9 +120,17 @@ def test_process_session_generates_and_sends_reply(monkeypatch: pytest.MonkeyPat
         text = "Hello! I can help with invoices, inventory, and questions."
         model = "gpt-5-mini"
 
-    def _fake_generate_session_reply(*, messages, hint_command, settings):
+    def _fake_generate_session_reply_with_metrics(*, messages, hint_command, settings, **_kwargs):
         called["generated"] = int(called["generated"]) + 1
-        return _Reply()
+        return _Reply(), {
+            "call_count": 1,
+            "latency_ms_total": 0,
+            "prompt_tokens_total": 0,
+            "completion_tokens_total": 0,
+            "total_tokens_total": 0,
+            "cost_usd_total": 0.0,
+            "openrouter_generation_ids": [],
+        }
 
     def _fake_send_message(*, chat_id: int, text: str, settings: Settings) -> None:
         called["sent"] = int(called["sent"]) + 1
@@ -120,7 +138,9 @@ def test_process_session_generates_and_sends_reply(monkeypatch: pytest.MonkeyPat
         called["text"] = text
 
     monkeypatch.setattr(
-        session_processor, "generate_session_reply", _fake_generate_session_reply
+        session_processor,
+        "generate_session_reply_with_metrics",
+        _fake_generate_session_reply_with_metrics,
     )
     monkeypatch.setattr(session_processor, "send_message", _fake_send_message)
 

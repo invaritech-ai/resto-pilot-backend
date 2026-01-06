@@ -23,6 +23,7 @@ from app.db.models.processing_events import ProcessingEvents
 from app.db.models.telegram_chat_memory import TelegramChatMemory
 from app.db.models.telegram_messages import TelegramMessages
 from app.db.models.telegram_session import TelegramSessions
+from app.db.models.user import User
 from app.telegram.bot_api import send_message
 from app.workers.telemetry import (
     get_or_create_chat_state,
@@ -40,6 +41,12 @@ OFF_TOPIC_REDIRECT_TEXT = (
     "Only inventory updates are supported right now. "
     "What inventory change do you want to make (item + quantity) and for which outlet?"
 )
+
+def _first_name(full_name: str | None) -> str | None:
+    if not isinstance(full_name, str):
+        return None
+    parts = [p for p in full_name.strip().split() if p]
+    return parts[0] if parts else None
 
 
 def _parse_uuid(value: str) -> uuid.UUID:
@@ -102,14 +109,20 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
                 db.commit()
             return
 
-        messages = list(
-            db.scalars(
-                select(TelegramMessages)
+        rows = list(
+            db.execute(
+                select(TelegramMessages, User.full_name)
+                .join(User, TelegramMessages.user_id == User.id)
                 .where(TelegramMessages.session_id == session_uuid)
                 .order_by(
                     TelegramMessages.received_at.asc(), TelegramMessages.message_id.asc()
                 )
             )
+        )
+        messages = [row[0] for row in rows]
+        user_first_name = next(
+            (_first_name(row[1]) for row in rows if isinstance(row[1], str) and row[1].strip()),
+            None,
         )
 
         hint = db_session.hint_command
@@ -459,6 +472,7 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
                     settings=settings,
                     memory_summary=memory_summary,
                     history_messages=history_messages,
+                    user_first_name=user_first_name,
                 )
             except OpenAIError as exc:
                 db.add(
