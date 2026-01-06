@@ -32,6 +32,13 @@ celery_app.conf.update(
     worker_prefetch_multiplier=1,
     task_acks_late=True,
     task_reject_on_worker_lost=True,
+    # Periodic task schedule
+    beat_schedule={
+        "close-stale-sessions": {
+            "task": "close_stale_sessions",
+            "schedule": 300.0,  # Run every 5 minutes
+        },
+    },
 )
 
 logger.info(

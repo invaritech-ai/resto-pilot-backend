@@ -1,16 +1,20 @@
 services:
-  api:
-    build: .
-    command: python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
-    ports:
-      # Host port is configurable to avoid collisions on shared servers (e.g. Coolify hosts).
-      - "${API_HOST_PORT:-8000}:8000"
-    environment:
-      HOST: "0.0.0.0"
-      PORT: "8000"
+    api:
+        build: .
+        command: python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+        ports:
+            # Host port is configurable to avoid collisions on shared servers (e.g. Coolify hosts).
+            - "${API_HOST_PORT:-8000}:8000"
+        environment:
+            HOST: "0.0.0.0"
+            PORT: "8000"
 
-  worker:
-    build: .
-    command: python -m celery -A app.workers.celery_app.celery_app worker -l info --concurrency ${CELERY_CONCURRENCY:-4}
-    environment:
-      CELERY_CONCURRENCY: ${CELERY_CONCURRENCY:-4}
+    worker:
+        build: .
+        command: python -m celery -A app.workers.celery_app.celery_app worker -l info --concurrency ${CELERY_CONCURRENCY:-4}
+        environment:
+            CELERY_CONCURRENCY: ${CELERY_CONCURRENCY:-4}
+
+    beat:
+        build: .
+        command: python -m celery -A app.workers.celery_app.celery_app beat -l info
