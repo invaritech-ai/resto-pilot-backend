@@ -34,6 +34,7 @@ from app.telegram.commands import extract_command
 from app.telegram.ingest import ingest_update, parse_update, seal_open_session
 from app.telegram.processor import process_update
 from app.workers.celery_types import CeleryDelayable
+from app.workers.telemetry import record_outgoing_message
 
 logger = logging.getLogger(__name__)
 
@@ -42,77 +43,75 @@ logger = logging.getLogger(__name__)
 # Reserved commands that bypass batching and are processed immediately.
 # This is the single source of truth - add new instant commands here.
 # -----------------------------------------------------------------------------
-INSTANT_COMMANDS: frozenset[str] = frozenset({
-    "/start",
-    "/respond",
-    "/done",
-    "/confirm",
-    "/cancel",
-})
+INSTANT_COMMANDS: frozenset[str] = frozenset(
+    {
+        "/start",
+        "/respond",
+        "/done",
+        "/confirm",
+        "/cancel",
+    }
+)
 
-FORCE_FLUSH_COMMANDS: frozenset[str] = frozenset({
-    "/respond",
-    "/done",
-})
+FORCE_FLUSH_COMMANDS: frozenset[str] = frozenset(
+    {
+        "/respond",
+        "/done",
+    }
+)
 
 FORCE_FLUSH_REPLY_TEXT = "Got it — I'm on it."
 NOTHING_TO_PROCESS_REPLY_TEXT = "Nothing to process right now."
 
-COLLECT_PHONE_STATE = "COLLECT_PHONE"
-IDLE_STATE = "IDLE"
+
+def _send_and_log_message(
+    *,
+    db: Session,
+    chat_id: int,
+    text: str,
+    kind: str,
+    settings: Settings,
+    session_id: uuid.UUID | None = None,
+    llm_call_id: uuid.UUID | None = None,
+) -> None:
+    """
+    Send a message and log it to telegram_outgoing_messages.
+    Creates a closed session if session_id is not provided.
+    """
+    telegram_message_id = send_message(chat_id=chat_id, text=text, settings=settings)
+
+    if session_id is None:
+        # Create a closed session for logging
+        now = dt.datetime.now(dt.UTC)
+        closed_session = TelegramSessions(
+            chat_id=chat_id,
+            started_at=now,
+            last_activity_at=now,
+            flush_at=now,
+            status="closed",
+            hint_command=None,
+            closed_at=now,
+            ack_sent_at=None,
+        )
+        db.add(closed_session)
+        db.flush()
+        session_id = closed_session.id
+
+    record_outgoing_message(
+        db=db,
+        session_id=session_id,
+        chat_id=chat_id,
+        kind=kind,
+        text=text,
+        telegram_message_id=telegram_message_id,
+        llm_call_id=llm_call_id,
+    )
+    db.commit()
 
 
-def _first_name_from_full_name(full_name: str | None) -> str | None:
-    if not isinstance(full_name, str):
-        return None
-    parts = [p for p in full_name.strip().split() if p]
-    return parts[0] if parts else None
-
-
-def _normalize_phone(text: str) -> str | None:
-    raw = text.strip()
-    if not raw:
-        return None
-
-    keep = []
-    for ch in raw:
-        if ch.isdigit():
-            keep.append(ch)
-        elif ch == "+" and not keep:
-            keep.append(ch)
-
-    normalized = "".join(keep)
-    if normalized.startswith("00"):
-        normalized = "+" + normalized[2:]
-    digits = "".join(ch for ch in normalized if ch.isdigit())
-    if len(digits) < 8 or len(digits) > 15:
-        return None
-    if normalized.startswith("+"):
-        return "+" + digits
-    return digits
-
-
-def _extract_phone_from_update(update: dict) -> str | None:
-    message = update.get("message") or update.get("edited_message")
-    if not isinstance(message, dict):
-        return None
-
-    contact = message.get("contact")
-    if isinstance(contact, dict):
-        phone = contact.get("phone_number")
-        if isinstance(phone, str):
-            normalized = _normalize_phone(phone)
-            if normalized is not None:
-                return normalized
-
-    text = message.get("text")
-    if isinstance(text, str):
-        return _normalize_phone(text)
-
-    return None
-
-
-def _persist_update_to_closed_session(*, update: dict, db: Session, user: User) -> None:
+def _persist_update_to_closed_session(
+    *, update: dict, db: Session, user: User
+) -> TelegramSessions | None:
     parsed = parse_update(update)
     if parsed is None:
         return
@@ -166,7 +165,9 @@ def _persist_update_to_closed_session(*, update: dict, db: Session, user: User) 
         db.rollback()
 
 
-def _persist_update_to_session(*, update: dict, db: Session, session_id: uuid.UUID) -> None:
+def _persist_update_to_session(
+    *, update: dict, db: Session, session_id: uuid.UUID
+) -> None:
     parsed = parse_update(update)
     if parsed is None:
         return
@@ -217,7 +218,9 @@ def _extract_command_from_update(update: dict) -> tuple[str | None, str | None]:
         return None, None
 
     text = message.get("text") if isinstance(message.get("text"), str) else None
-    caption = message.get("caption") if isinstance(message.get("caption"), str) else None
+    caption = (
+        message.get("caption") if isinstance(message.get("caption"), str) else None
+    )
     return extract_command(text, caption)
 
 
@@ -272,8 +275,14 @@ def handle_update(update: dict, db: Session, settings: Settings) -> None:
         settings: Application settings including batching configuration
     """
     update_id = update.get("update_id") if isinstance(update, dict) else None
-    message = (update.get("message") or update.get("edited_message") or {}) if isinstance(update, dict) else {}
-    chat_id = (message.get("chat") or {}).get("id") if isinstance(message, dict) else None
+    message = (
+        (update.get("message") or update.get("edited_message") or {})
+        if isinstance(update, dict)
+        else {}
+    )
+    chat_id = (
+        (message.get("chat") or {}).get("id") if isinstance(message, dict) else None
+    )
 
     logger.info(
         "handle_update_received update_id=%s chat_id=%s batching_enabled=%s",
@@ -293,49 +302,49 @@ def handle_update(update: dict, db: Session, settings: Settings) -> None:
     parsed = parse_update(update) if isinstance(update, dict) else None
     if parsed is not None:
         user = db.scalar(select(User).where(User.telegram_id == parsed.telegram_id))
-        if user is not None and user.state == COLLECT_PHONE_STATE:
-            phone = _extract_phone_from_update(update)
-            if phone is not None:
-                user.phone = phone
-                user.is_phone_verified = False
-                user.state = IDLE_STATE
-                db.add(user)
-                db.commit()
-                first_name = _first_name_from_full_name(user.full_name)
-                thanks = f"Thanks, {first_name} — you're all set." if first_name else "Thanks — you're all set."
-                send_message(chat_id=parsed.chat_id, text=thanks, settings=settings)
-            else:
-                first_name = _first_name_from_full_name(user.full_name)
-                prefix = f"Hi {first_name}. " if first_name else "Hi. "
-                send_message(
-                    chat_id=parsed.chat_id,
-                    text=prefix + "What's your phone number (include country code, e.g. +1 415 555 0101)?",
-                    settings=settings,
-                )
-
-            try:
-                _persist_update_to_closed_session(update=update, db=db, user=user)
-            except Exception as exc:
-                logger.exception(
-                    "telegram_phone_intake_persist_failed",
-                    extra={"error": repr(exc), "chat_id": parsed.chat_id},
-                )
-                db.rollback()
-
-            return
+        # Phone collection is optional and non-blocking - users can update their phone
+        # later via natural conversation (e.g., "my phone number is +1 234 567 8901")
 
         if user is None and command != "/start":
             try:
-                send_message(
+                welcome_text = (
+                    "Welcome! Please send /start to register, then try again."
+                )
+                telegram_message_id = send_message(
                     chat_id=parsed.chat_id,
-                    text="Welcome! Please send /start to register, then try again.",
+                    text=welcome_text,
                     settings=settings,
                 )
+                # Log the message - create a closed session for it
+                now = dt.datetime.now(dt.UTC)
+                closed_session = TelegramSessions(
+                    chat_id=parsed.chat_id,
+                    started_at=now,
+                    last_activity_at=now,
+                    flush_at=now,
+                    status="closed",
+                    hint_command=None,
+                    closed_at=now,
+                    ack_sent_at=None,
+                )
+                db.add(closed_session)
+                db.flush()
+                record_outgoing_message(
+                    db=db,
+                    session_id=closed_session.id,
+                    chat_id=parsed.chat_id,
+                    kind="reply",
+                    text=welcome_text,
+                    telegram_message_id=telegram_message_id,
+                    llm_call_id=None,
+                )
+                db.commit()
             except Exception as exc:
                 logger.exception(
                     "telegram_unregistered_user_prompt_failed",
                     extra={"error": repr(exc), "chat_id": parsed.chat_id},
                 )
+                db.rollback()
             return
 
     # Handle confirm/cancel commands for pending DB actions
@@ -347,9 +356,11 @@ def handle_update(update: dict, db: Session, settings: Settings) -> None:
         user = db.scalar(select(User).where(User.telegram_id == parsed.telegram_id))
         if user is None:
             try:
-                send_message(
+                _send_and_log_message(
+                    db=db,
                     chat_id=parsed.chat_id,
                     text="Please send /start to register first.",
+                    kind="reply",
                     settings=settings,
                 )
             except Exception as exc:
@@ -363,9 +374,11 @@ def handle_update(update: dict, db: Session, settings: Settings) -> None:
         pending_action = pending_service.get_latest_pending(user_id=user.id)
         if pending_action is None:
             try:
-                send_message(
+                _send_and_log_message(
+                    db=db,
                     chat_id=parsed.chat_id,
                     text="No pending action to confirm or cancel.",
+                    kind="reply",
                     settings=settings,
                 )
             except Exception as exc:
@@ -379,9 +392,11 @@ def handle_update(update: dict, db: Session, settings: Settings) -> None:
         if pending_action.expires_at <= now:
             try:
                 pending_service.cancel(pending=pending_action, cancelled_at=now)
-                send_message(
+                _send_and_log_message(
+                    db=db,
                     chat_id=parsed.chat_id,
                     text="That action has expired. Please start over.",
+                    kind="reply",
                     settings=settings,
                 )
             except Exception as exc:
@@ -400,8 +415,15 @@ def handle_update(update: dict, db: Session, settings: Settings) -> None:
 
                 # Compute per-restaurant roles
                 rows = RestaurantService(db).list_for_user(user_id=user.id)
-                restaurant_roles = {str(membership.restaurant_id): membership.role for _r, membership in rows}
-                actor_role = ROLE_OWNER if any(role == ROLE_OWNER for role in restaurant_roles.values()) else ROLE_STAFF
+                restaurant_roles = {
+                    str(membership.restaurant_id): membership.role
+                    for _r, membership in rows
+                }
+                actor_role = (
+                    ROLE_OWNER
+                    if any(role == ROLE_OWNER for role in restaurant_roles.values())
+                    else ROLE_STAFF
+                )
 
                 normalized_result = normalize_db_action(
                     action=action,
@@ -410,7 +432,9 @@ def handle_update(update: dict, db: Session, settings: Settings) -> None:
                     restaurant_roles=restaurant_roles,
                 )
                 if normalized_result.normalized is None:
-                    raise ValueError(f"pending_action_not_allowed: {normalized_result.reasons}")
+                    raise ValueError(
+                        f"pending_action_not_allowed: {normalized_result.reasons}"
+                    )
 
                 validated = validate_db_action(
                     action=normalized_result.normalized,
@@ -426,7 +450,13 @@ def handle_update(update: dict, db: Session, settings: Settings) -> None:
                     session=db, pending_action=pending_action, now=now
                 )
                 success_msg = f"Done! {result.get('status', 'Action completed')}."
-                send_message(chat_id=parsed.chat_id, text=success_msg, settings=settings)
+                _send_and_log_message(
+                    db=db,
+                    chat_id=parsed.chat_id,
+                    text=success_msg,
+                    kind="reply",
+                    settings=settings,
+                )
                 logger.info(
                     "telegram_action_confirmed_and_executed update_id=%s chat_id=%s pending_id=%s",
                     update_id,
@@ -442,21 +472,11 @@ def handle_update(update: dict, db: Session, settings: Settings) -> None:
                 else:
                     error_msg = "Failed to execute that action. Please try again."
                 try:
-                    send_message(chat_id=parsed.chat_id, text=error_msg, settings=settings)
-                except Exception as send_exc:
-                    logger.exception(
-                        "telegram_confirm_error_send_failed",
-                        extra={"error": repr(send_exc), "chat_id": parsed.chat_id},
-                    )
-                logger.exception(
-                    "telegram_action_confirm_failed",
-                    extra={"error": repr(exc), "chat_id": parsed.chat_id, "pending_id": str(pending_action.id)},
-                )
-            except Exception as exc:
-                try:
-                    send_message(
+                    _send_and_log_message(
+                        db=db,
                         chat_id=parsed.chat_id,
-                        text="Failed to execute that action. Please try again.",
+                        text=error_msg,
+                        kind="reply",
                         settings=settings,
                     )
                 except Exception as send_exc:
@@ -466,14 +486,42 @@ def handle_update(update: dict, db: Session, settings: Settings) -> None:
                     )
                 logger.exception(
                     "telegram_action_confirm_failed",
-                    extra={"error": repr(exc), "chat_id": parsed.chat_id, "pending_id": str(pending_action.id)},
+                    extra={
+                        "error": repr(exc),
+                        "chat_id": parsed.chat_id,
+                        "pending_id": str(pending_action.id),
+                    },
+                )
+            except Exception as exc:
+                try:
+                    _send_and_log_message(
+                        db=db,
+                        chat_id=parsed.chat_id,
+                        text="Failed to execute that action. Please try again.",
+                        kind="reply",
+                        settings=settings,
+                    )
+                except Exception as send_exc:
+                    logger.exception(
+                        "telegram_confirm_error_send_failed",
+                        extra={"error": repr(send_exc), "chat_id": parsed.chat_id},
+                    )
+                logger.exception(
+                    "telegram_action_confirm_failed",
+                    extra={
+                        "error": repr(exc),
+                        "chat_id": parsed.chat_id,
+                        "pending_id": str(pending_action.id),
+                    },
                 )
         elif command == "/cancel":
             try:
                 pending_service.cancel(pending=pending_action, cancelled_at=now)
-                send_message(
+                _send_and_log_message(
+                    db=db,
                     chat_id=parsed.chat_id,
                     text="Action cancelled.",
+                    kind="reply",
                     settings=settings,
                 )
                 logger.info(
@@ -485,12 +533,18 @@ def handle_update(update: dict, db: Session, settings: Settings) -> None:
             except Exception as exc:
                 logger.exception(
                     "telegram_action_cancel_failed",
-                    extra={"error": repr(exc), "chat_id": parsed.chat_id, "pending_id": str(pending_action.id)},
+                    extra={
+                        "error": repr(exc),
+                        "chat_id": parsed.chat_id,
+                        "pending_id": str(pending_action.id),
+                    },
                 )
                 try:
-                    send_message(
+                    _send_and_log_message(
+                        db=db,
                         chat_id=parsed.chat_id,
                         text="Failed to cancel that action.",
+                        kind="reply",
                         settings=settings,
                     )
                 except Exception as send_exc:
@@ -529,8 +583,12 @@ def handle_update(update: dict, db: Session, settings: Settings) -> None:
         )
         if sealed_id is None:
             try:
-                send_message(
-                    chat_id=chat_id, text=NOTHING_TO_PROCESS_REPLY_TEXT, settings=settings
+                _send_and_log_message(
+                    db=db,
+                    chat_id=chat_id,
+                    text=NOTHING_TO_PROCESS_REPLY_TEXT,
+                    kind="reply",
+                    settings=settings,
                 )
             except Exception as exc:
                 logger.exception(
@@ -553,11 +611,28 @@ def handle_update(update: dict, db: Session, settings: Settings) -> None:
         cast(CeleryDelayable, process_session).delay(session_id=str(sealed_id))
 
         try:
-            send_message(chat_id=chat_id, text=FORCE_FLUSH_REPLY_TEXT, settings=settings)
+            telegram_message_id = send_message(
+                chat_id=chat_id, text=FORCE_FLUSH_REPLY_TEXT, settings=settings
+            )
+            if sealed_id is not None:
+                record_outgoing_message(
+                    db=db,
+                    session_id=sealed_id,
+                    chat_id=chat_id,
+                    kind="reply",
+                    text=FORCE_FLUSH_REPLY_TEXT,
+                    telegram_message_id=telegram_message_id,
+                    llm_call_id=None,
+                )
+                db.commit()
         except Exception as exc:
             logger.exception(
                 "telegram_force_flush_reply_failed",
-                extra={"error": repr(exc), "chat_id": chat_id, "session_id": str(sealed_id)},
+                extra={
+                    "error": repr(exc),
+                    "chat_id": chat_id,
+                    "session_id": str(sealed_id),
+                },
             )
 
         return
@@ -610,7 +685,7 @@ def handle_update(update: dict, db: Session, settings: Settings) -> None:
         )
         return
 
-    send_message(chat_id=chat_id, text=text, settings=settings)
+    telegram_message_id = send_message(chat_id=chat_id, text=text, settings=settings)
     logger.info(
         "telegram_send_message_dispatched update_id=%s chat_id=%s",
         update_id,
@@ -627,3 +702,101 @@ def handle_update(update: dict, db: Session, settings: Settings) -> None:
             chat_id,
             str(session_id) if session_id is not None else None,
         )
+
+        # Log the outgoing message and close the session immediately
+        if session_id is not None:
+            record_outgoing_message(
+                db=db,
+                session_id=session_id,
+                chat_id=chat_id,
+                kind="reply",
+                text=text,
+                telegram_message_id=telegram_message_id,
+                llm_call_id=None,
+            )
+            # Close the session immediately since /start is an instant command
+            now = dt.datetime.now(dt.UTC)
+            db_session = db.scalar(
+                select(TelegramSessions).where(TelegramSessions.id == session_id)
+            )
+            if db_session and db_session.status == "open":
+                db_session.status = "closed"
+                if db_session.closed_at is None:
+                    db_session.closed_at = now
+                db.add(
+                    ProcessingEvents(
+                        session_id=session_id,
+                        at=now,
+                        event="session_closed_after_start_v0",
+                        payload_json=None,
+                        error=None,
+                    )
+                )
+                db.commit()
+        else:
+            # If no session was created, create a closed session for logging
+            parsed = parse_update(update)
+            if parsed:
+                now = dt.datetime.now(dt.UTC)
+                closed_session = TelegramSessions(
+                    chat_id=parsed.chat_id,
+                    started_at=now,
+                    last_activity_at=now,
+                    flush_at=now,
+                    status="closed",
+                    hint_command=None,
+                    closed_at=now,
+                    ack_sent_at=None,
+                )
+                db.add(closed_session)
+                db.flush()
+                record_outgoing_message(
+                    db=db,
+                    session_id=closed_session.id,
+                    chat_id=chat_id,
+                    kind="reply",
+                    text=text,
+                    telegram_message_id=telegram_message_id,
+                    llm_call_id=None,
+                )
+                db.commit()
+    else:
+        # For other instant commands, try to log to the session if it exists
+        parsed = parse_update(update)
+        if parsed:
+            # Try to find or create a session for logging
+            session_row = db.scalar(
+                select(TelegramSessions)
+                .where(
+                    TelegramSessions.chat_id == parsed.chat_id,
+                    TelegramSessions.status == "open",
+                )
+                .order_by(TelegramSessions.started_at.desc())
+                .limit(1)
+            )
+            if session_row is None:
+                # Create a closed session for logging
+                now = dt.datetime.now(dt.UTC)
+                session_row = TelegramSessions(
+                    chat_id=parsed.chat_id,
+                    started_at=now,
+                    last_activity_at=now,
+                    flush_at=now,
+                    status="closed",
+                    hint_command=None,
+                    closed_at=now,
+                    ack_sent_at=None,
+                )
+                db.add(session_row)
+                db.flush()
+
+            record_outgoing_message(
+                db=db,
+                session_id=session_row.id,
+                chat_id=chat_id,
+                kind="reply",
+                text=text,
+                telegram_message_id=telegram_message_id,
+                llm_call_id=None,
+            )
+            db.commit()
