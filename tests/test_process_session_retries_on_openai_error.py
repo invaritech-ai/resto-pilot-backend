@@ -84,11 +84,25 @@ def test_process_session_schedules_retry_on_openai_error(
         "get_settings",
         lambda: Settings(telegram_bot_token="test", openai_api_key="test"),
     )
+    monkeypatch.setattr(
+        session_processor,
+        "classify_on_topic",
+        lambda **_kwargs: (True, "test", {}, {}, 0),
+    )
+    monkeypatch.setattr(
+        session_processor,
+        "classify_capability",
+        lambda **_kwargs: (True, ""),
+    )
 
-    def _fail_generate_session_reply(*, messages, hint_command, settings):
+    def _fail_generate_session_reply_with_metrics(*, messages, hint_command, settings, **_kwargs):
         raise OpenAIError("transient")
 
-    monkeypatch.setattr(session_processor, "generate_session_reply", _fail_generate_session_reply)
+    monkeypatch.setattr(
+        session_processor,
+        "generate_session_reply_with_metrics",
+        _fail_generate_session_reply_with_metrics,
+    )
 
     scheduled: dict[str, object] = {}
 
@@ -120,4 +134,3 @@ def test_process_session_schedules_retry_on_openai_error(
         )
         assert "assistant_reply_attempt_failed_v0" in events
         assert "assistant_reply_retry_scheduled_v0" in events
-

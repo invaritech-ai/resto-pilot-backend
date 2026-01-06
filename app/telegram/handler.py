@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 from app.core.config import Settings
 from app.db.models.processing_events import ProcessingEvents
 from app.db.models.telegram_messages import TelegramMessages
+from app.db.models.telegram_session import TelegramSessions
 from app.db.models.user import User
 from app.domain.services.user_service import UserService
 from app.schemas.user import TelegramUserCreate
@@ -48,6 +49,113 @@ FORCE_FLUSH_COMMANDS: frozenset[str] = frozenset({
 
 FORCE_FLUSH_REPLY_TEXT = "Got it — I'm on it."
 NOTHING_TO_PROCESS_REPLY_TEXT = "Nothing to process right now."
+
+COLLECT_PHONE_STATE = "COLLECT_PHONE"
+IDLE_STATE = "IDLE"
+
+
+def _first_name_from_full_name(full_name: str | None) -> str | None:
+    if not isinstance(full_name, str):
+        return None
+    parts = [p for p in full_name.strip().split() if p]
+    return parts[0] if parts else None
+
+
+def _normalize_phone(text: str) -> str | None:
+    raw = text.strip()
+    if not raw:
+        return None
+
+    keep = []
+    for ch in raw:
+        if ch.isdigit():
+            keep.append(ch)
+        elif ch == "+" and not keep:
+            keep.append(ch)
+
+    normalized = "".join(keep)
+    if normalized.startswith("00"):
+        normalized = "+" + normalized[2:]
+    digits = "".join(ch for ch in normalized if ch.isdigit())
+    if len(digits) < 8 or len(digits) > 15:
+        return None
+    if normalized.startswith("+"):
+        return "+" + digits
+    return digits
+
+
+def _extract_phone_from_update(update: dict) -> str | None:
+    message = update.get("message") or update.get("edited_message")
+    if not isinstance(message, dict):
+        return None
+
+    contact = message.get("contact")
+    if isinstance(contact, dict):
+        phone = contact.get("phone_number")
+        if isinstance(phone, str):
+            normalized = _normalize_phone(phone)
+            if normalized is not None:
+                return normalized
+
+    text = message.get("text")
+    if isinstance(text, str):
+        return _normalize_phone(text)
+
+    return None
+
+
+def _persist_update_to_closed_session(*, update: dict, db: Session, user: User) -> None:
+    parsed = parse_update(update)
+    if parsed is None:
+        return
+
+    now = dt.datetime.now(dt.UTC)
+    session_row = TelegramSessions(
+        chat_id=parsed.chat_id,
+        started_at=now,
+        last_activity_at=now,
+        flush_at=now,
+        status="closed",
+        hint_command=None,
+        closed_at=now,
+        ack_sent_at=None,
+    )
+    db.add(session_row)
+    db.flush()
+
+    db.add(
+        TelegramMessages(
+            session_id=session_row.id,
+            chat_id=parsed.chat_id,
+            user_id=user.id,
+            telegram_id=parsed.telegram_id,
+            message_id=parsed.message_id,
+            update_id=parsed.update_id,
+            received_at=parsed.received_at,
+            text=parsed.text,
+            caption=parsed.caption,
+            file_id=parsed.file_id,
+            file_unique_id=parsed.file_unique_id,
+            file_kind=parsed.file_kind,
+            mime=parsed.mime,
+            filename=parsed.filename,
+            size=parsed.size,
+        )
+    )
+    db.add(
+        ProcessingEvents(
+            session_id=session_row.id,
+            at=now,
+            event="ingested_update",
+            payload_json=None,
+            error=None,
+        )
+    )
+
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
 
 
 def _persist_update_to_session(*, update: dict, db: Session, session_id: uuid.UUID) -> None:
@@ -168,6 +276,40 @@ def handle_update(update: dict, db: Session, settings: Settings) -> None:
         chat_id,
         command,
     )
+
+    parsed = parse_update(update) if isinstance(update, dict) else None
+    if parsed is not None:
+        user = db.scalar(select(User).where(User.telegram_id == parsed.telegram_id))
+        if user is not None and user.state == COLLECT_PHONE_STATE:
+            phone = _extract_phone_from_update(update)
+            if phone is not None:
+                user.phone = phone
+                user.is_phone_verified = False
+                user.state = IDLE_STATE
+                db.add(user)
+                db.commit()
+                first_name = _first_name_from_full_name(user.full_name)
+                thanks = f"Thanks, {first_name} — you're all set." if first_name else "Thanks — you're all set."
+                send_message(chat_id=parsed.chat_id, text=thanks, settings=settings)
+            else:
+                first_name = _first_name_from_full_name(user.full_name)
+                prefix = f"Hi {first_name}. " if first_name else "Hi. "
+                send_message(
+                    chat_id=parsed.chat_id,
+                    text=prefix + "What's your phone number (include country code, e.g. +1 415 555 0101)?",
+                    settings=settings,
+                )
+
+            try:
+                _persist_update_to_closed_session(update=update, db=db, user=user)
+            except Exception as exc:
+                logger.exception(
+                    "telegram_phone_intake_persist_failed",
+                    extra={"error": repr(exc), "chat_id": parsed.chat_id},
+                )
+                db.rollback()
+
+            return
 
     if command in FORCE_FLUSH_COMMANDS:
         message = update.get("message") or update.get("edited_message")
