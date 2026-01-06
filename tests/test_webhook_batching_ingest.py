@@ -71,20 +71,17 @@ def test_batching_webhook_persists_messages_and_seals_on_done(
     from app.workers import tasks as worker_tasks
 
     scheduled_flushes: list[tuple[dict, float]] = []
-    enqueued: dict[str, list[dict]] = {"acks": [], "process": []}
+    enqueued: dict[str, list[dict]] = {"process": []}
 
     def _fake_apply_async(*, args=None, kwargs=None, **options):
         scheduled_flushes.append((dict(kwargs or {}), float(options.get("countdown", 0.0))))
         return type("R", (), {"id": "fake"})()
 
-    def _fake_ack_delay(*, session_id: str):
-        enqueued["acks"].append({"session_id": session_id})
-
     def _fake_process_delay(*, session_id: str):
         enqueued["process"].append({"session_id": session_id})
 
     monkeypatch.setattr(worker_tasks.flush_session, "apply_async", _fake_apply_async)
-    monkeypatch.setattr(worker_tasks.send_session_ack, "delay", _fake_ack_delay)
+    monkeypatch.setattr(worker_tasks.send_message_backchannel, "apply_async", lambda *a, **k: object())
     monkeypatch.setattr(worker_tasks.process_session, "delay", _fake_process_delay)
 
     resp = client.post(
@@ -120,9 +117,7 @@ def test_batching_webhook_persists_messages_and_seals_on_done(
     )
     assert resp.status_code == 200
     assert resp.json() == {"status": "ok"}
-    assert len(enqueued["acks"]) == 1
     assert len(enqueued["process"]) == 1
-    assert enqueued["acks"][0]["session_id"] == str(session_id)
     assert enqueued["process"][0]["session_id"] == str(session_id)
 
     with Session(engine) as db:
@@ -155,4 +150,3 @@ def test_batching_webhook_persists_messages_and_seals_on_done(
         )
         assert len(open_sessions) == 1
         assert open_sessions[0].id != session_id
-

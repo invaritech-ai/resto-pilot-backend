@@ -15,10 +15,10 @@ Use this as a step-by-step checklist to align the code with `docs/unified-messag
 File: `app/api/v1/routes/telegram.py`
 
 - [ ] Implement/verify the precedence rules:
-  - [ ] `/respond` and `/done` force-flush immediately.
-  - [ ] `/start` (including `/start <code>`) routes to instant handling.
+  - [x] `/respond` and `/done` force-flush immediately.
+  - [x] `/start` (including `/start <code>`) routes to instant handling.
   - [ ] Other standalone `/...` commands (future) can be declared instant.
-  - [ ] Instant stateful routes are checked before default ingest.
+  - [x] Instant stateful routes are checked before default ingest.
 - [x] Add instant stateful detection:
   - [x] Parse `telegram_id` and load the `users` row (by `telegram_id`).
   - [x] If `users.state` indicates an instant flow, enqueue `handle_telegram_update(update)` and return `200`.
@@ -42,8 +42,8 @@ File: `app/telegram/ingest.py`
 File: `app/workers/tasks.py` (`flush_session`)
 
 - [ ] Verify flush logic:
-  - [ ] Only seals if session is open and expected timestamp matches (stale flush no-ops).
-  - [ ] Transitions `open -> processing` and enqueues `process_session` immediately.
+  - [x] Only seals if session is open and expected timestamp matches (stale flush no-ops).
+  - [x] Transitions `open -> processing` and enqueues `process_session` immediately.
 - [ ] Adjust flush ack behavior to match policy:
   - [x] Ensure any flush-level ack is static or skipped (no cheap LLM here).
   - [x] Avoid duplicate “receipt” acks at flush time.
