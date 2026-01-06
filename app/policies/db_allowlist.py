@@ -14,6 +14,7 @@ SCOPE_RESTAURANT_OWNER: Final[str] = "restaurant_owner"
 
 # Tables that are never exposed via the DB engine.
 BUSINESS_TABLES_DENYLIST: Final[set[str]] = {
+    "db_pending_actions",
     "telegram_sessions",
     "telegram_messages",
     "telegram_outgoing_messages",
