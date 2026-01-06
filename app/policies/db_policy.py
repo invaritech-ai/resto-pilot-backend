@@ -41,15 +41,6 @@ def _get_role_for_restaurant(
     return restaurant_roles.get(restaurant_id)
 
 
-def _get_highest_role(*, restaurant_roles: dict[str, str]) -> str:
-    """Get the highest role across all restaurants (owner > staff)."""
-    if not restaurant_roles:
-        return ROLE_STAFF
-    if ROLE_OWNER in restaurant_roles.values():
-        return ROLE_OWNER
-    return ROLE_STAFF
-
-
 def normalize_db_action(
     *,
     action: DBAction,
@@ -96,13 +87,17 @@ def normalize_db_action(
     normalized.scope = str(scope)
 
     if normalized.columns is not None:
-        normalized.columns = [col for col in normalized.columns if col in allowed_columns]
+        normalized.columns = [
+            col for col in normalized.columns if col in allowed_columns
+        ]
         if not normalized.columns:
             reasons.append("columns_not_allowed")
 
     if normalized.values is not None:
         normalized.values = {
-            key: value for key, value in normalized.values.items() if key in allowed_columns
+            key: value
+            for key, value in normalized.values.items()
+            if key in allowed_columns
         }
         if not normalized.values:
             reasons.append("columns_not_allowed")
@@ -123,7 +118,10 @@ def normalize_db_action(
         else:
             if restaurant_id not in roles:
                 reasons.append("restaurant_scope_required")
-            elif scope == SCOPE_RESTAURANT_OWNER and roles.get(restaurant_id) != ROLE_OWNER:
+            elif (
+                scope == SCOPE_RESTAURANT_OWNER
+                and roles.get(restaurant_id) != ROLE_OWNER
+            ):
                 reasons.append("owner_role_required_for_restaurant")
     else:
         reasons.append("scope_not_supported")
@@ -271,9 +269,3 @@ def _is_self_scope(*, action: DBAction, actor_user_id: str) -> bool:
     if not action.filters:
         return False
     return action.filters.get("by_user_id") == actor_user_id
-
-
-def _is_restaurant_scope(*, restaurant_id: str | None, restaurant_roles: dict[str, str]) -> bool:
-    if not isinstance(restaurant_id, str):
-        return False
-    return restaurant_id in restaurant_roles
