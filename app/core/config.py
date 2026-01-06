@@ -58,8 +58,8 @@ class Settings(BaseSettings):
     model_prices_json: str = ""
 
     # Comma-separated enabled capabilities for the main processing bot.
-    # For now this is intentionally restrictive and defaults to a single capability.
-    enabled_capabilities_csv: str = "inventory"
+    # db_engine allows natural language database queries with role-based access control.
+    enabled_capabilities_csv: str = "inventory,db_engine"
 
     model_config = SettingsConfigDict(env_file=".env", env_prefix="APP_", extra="ignore")
 

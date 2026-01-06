@@ -33,6 +33,10 @@ DB_ALLOWLIST: Final[dict[str, dict[str, dict[str, dict[str, object]]]]] = {
                 "columns": ["full_name", "username", "phone", "is_phone_verified"],
                 "scope": SCOPE_SELF,
             },
+            "update": {
+                "columns": ["full_name", "username", "phone"],
+                "scope": SCOPE_SELF,
+            },
         },
         "restaurants": {
             "read": {

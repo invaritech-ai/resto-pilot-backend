@@ -39,6 +39,7 @@ def classify_db_intent(
     messages: list[TelegramMessages],
     settings: Settings,
     actor_role: str = "staff",
+    history_messages: list[dict[str, Any]] | None = None,
 ) -> DBIntentResult:
     user_text = _combined_user_text(messages=messages)
     if not user_text:
@@ -72,30 +73,52 @@ def classify_db_intent(
     # Get schema descriptions for the role
     schema_description = get_table_column_descriptions(role=actor_role)
 
+    # Build context from history for conversational awareness
+    context_text = ""
+    if history_messages:
+        recent = history_messages[-5:]
+        context_parts = []
+        for msg in recent:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if role and content:
+                truncated = content[:200] + "..." if len(content) > 200 else content
+                context_parts.append(f"{role}: {truncated}")
+        if context_parts:
+            context_text = "\nRecent conversation:\n" + "\n".join(context_parts) + "\n"
+
     system_prompt = (
         "You are a strict classifier that decides if the user is requesting a database action.\n"
         "Database actions include reading or changing records in database tables.\n"
         "\n"
+        "CRITICAL: Consider conversation context! If the bot asked for information and the user is responding,\n"
+        "that's likely a DB action (e.g., bot asked for phone number, user provides phone = update users.phone).\n"
+        "\n"
         f"{schema_description}\n"
         "\n"
-        "If the user is just chatting or asking questions without requesting DB access, return false.\n"
         "Examples of DB actions:\n"
         "- 'I am Bilbo Baggins' → update user name\n"
+        "- '+1 555 1234' (after bot asked for phone) → update user phone\n"
         "- 'How many restaurants do I have?' → read restaurants\n"
         "- 'Add a new outlet' → create restaurant\n"
         "- 'How many employees have I added?' → read restaurant_users\n"
         "- 'Generate an invite code' → create invite_codes\n"
         "\n"
+        "If the user is just chatting without requesting DB access AND not responding to a bot question, return false.\n"
+        "\n"
         "Output ONLY valid JSON in this exact schema:\n"
         '{"is_db_action":true|false,"confidence":0.0,"reason":"short"}\n'
     )
+
+    # Build user prompt with context
+    user_prompt = f"{context_text}Current user message:\n{user_text}"
 
     text, data, headers, latency_ms = (
         create_chat_completion_text_allow_empty_with_http_info(
             settings=gate_settings,
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"User message:\n{user_text}"},
+                {"role": "user", "content": user_prompt},
             ],
             temperature=0.0,
         )
