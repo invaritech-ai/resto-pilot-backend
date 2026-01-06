@@ -225,6 +225,18 @@ async def telegram_webhook(
                 )
                 return JSONResponse({"status": "ok"})
 
+            # Option B: if the user isn't registered yet, route to the instant handler
+            # so we can respond deterministically with "/start" guidance.
+            if user is None:
+                async_result = cast(CeleryDelayable, handle_telegram_update).delay(update)
+                logger.info(
+                    "telegram_webhook_enqueued_unregistered task_id=%s update_id=%s chat_id=%s",
+                    getattr(async_result, "id", None),
+                    update_id,
+                    chat_id,
+                )
+                return JSONResponse({"status": "ok"})
+
         ingest_update(update=update, session=db, settings=settings)
     except HTTPException:
         raise

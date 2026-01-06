@@ -29,7 +29,7 @@ File: `app/api/v1/routes/telegram.py`
 File: `app/telegram/ingest.py`
 
 - [ ] Confirm ingest behavior:
-  - [ ] Requires registered user exists; otherwise deterministic behavior is chosen (drop vs route-to-start UX).
+  - [x] Requires registered user exists; otherwise deterministic behavior is chosen (drop vs route-to-start UX).
   - [ ] Creates/reuses an open `telegram_sessions` row and inserts `telegram_messages`.
   - [ ] Schedules `flush_session` debounce.
 - [ ] Confirm per-message ack behavior:
@@ -87,9 +87,9 @@ Files:
 
 - [ ] Webhook routing tests (batching enabled):
   - [ ] Normal message routes to `ingest_update`.
-  - [ ] `/start` routes to `handle_telegram_update`.
+  - [x] `/start` routes to `handle_telegram_update`.
   - [ ] `/respond` `/done` force-flush and enqueue `process_session`.
-  - [ ] Instant stateful (e.g., `COLLECT_PHONE`) routes to `handle_telegram_update`.
+  - [x] Instant stateful (e.g., `COLLECT_PHONE`) routes to `handle_telegram_update`.
 - [ ] Phone intake end-to-end (batching enabled):
   - [ ] `/start` sets `COLLECT_PHONE`.
   - [ ] Next message with phone is handled immediately (no debounce wait) and persists `users.phone`.
