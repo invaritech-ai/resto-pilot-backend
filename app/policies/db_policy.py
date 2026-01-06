@@ -30,14 +30,35 @@ class DBNormalizationResult:
     reasons: list[str] = field(default_factory=list)
 
 
+def _get_role_for_restaurant(
+    *,
+    restaurant_id: str | None,
+    restaurant_roles: dict[str, str],
+) -> str | None:
+    """Get the role for a specific restaurant, or None if not a member."""
+    if restaurant_id is None:
+        return None
+    return restaurant_roles.get(restaurant_id)
+
+
+def _get_highest_role(*, restaurant_roles: dict[str, str]) -> str:
+    """Get the highest role across all restaurants (owner > staff)."""
+    if not restaurant_roles:
+        return ROLE_STAFF
+    if ROLE_OWNER in restaurant_roles.values():
+        return ROLE_OWNER
+    return ROLE_STAFF
+
+
 def normalize_db_action(
     *,
     action: DBAction,
     actor_user_id: str,
-    actor_role: str,
-    actor_restaurant_ids: set[str] | None = None,
+    actor_role: str,  # Highest role (for allowlist lookup)
+    restaurant_roles: dict[str, str] | None = None,  # Per-restaurant roles
 ) -> DBNormalizationResult:
     reasons: list[str] = []
+    restaurant_roles = restaurant_roles or {}
 
     role_allowlist = DB_ALLOWLIST.get(actor_role, {})
     table_allowlist = role_allowlist.get(action.table)
@@ -91,13 +112,19 @@ def normalize_db_action(
         filters["by_user_id"] = actor_user_id
     elif scope in {SCOPE_OWNED_RESTAURANT, SCOPE_RESTAURANT_OWNER}:
         restaurant_id = filters.get("by_restaurant_id")
+        roles = restaurant_roles or {}
         if not isinstance(restaurant_id, str):
-            if actor_restaurant_ids and len(actor_restaurant_ids) == 1:
-                filters["by_restaurant_id"] = next(iter(actor_restaurant_ids))
+            owned_ids = [rid for rid, role in roles.items() if role == ROLE_OWNER]
+            if len(owned_ids) == 1:
+                filters["by_restaurant_id"] = owned_ids[0]
+                restaurant_id = owned_ids[0]
             else:
                 reasons.append("restaurant_scope_required")
-        elif actor_restaurant_ids and restaurant_id not in actor_restaurant_ids:
-            reasons.append("restaurant_scope_required")
+        else:
+            if restaurant_id not in roles:
+                reasons.append("restaurant_scope_required")
+            elif scope == SCOPE_RESTAURANT_OWNER and roles.get(restaurant_id) != ROLE_OWNER:
+                reasons.append("owner_role_required_for_restaurant")
     else:
         reasons.append("scope_not_supported")
 
@@ -119,10 +146,11 @@ def validate_db_action(
     *,
     action: DBAction,
     actor_user_id: str,
-    actor_role: str,
-    actor_restaurant_ids: set[str] | None = None,
+    actor_role: str,  # Highest role (for allowlist lookup)
+    restaurant_roles: dict[str, str] | None = None,  # Per-restaurant roles
 ) -> DBPolicyResult:
     reasons: list[str] = []
+    restaurant_roles = restaurant_roles or {}
 
     if action.table in BUSINESS_TABLES_DENYLIST:
         reasons.append("table_not_exposed")
@@ -203,11 +231,15 @@ def validate_db_action(
         if not _is_self_scope(action=action, actor_user_id=actor_user_id):
             reasons.append("self_scope_required")
     elif scope in {SCOPE_OWNED_RESTAURANT, SCOPE_RESTAURANT_OWNER}:
-        if not _is_restaurant_scope(
-            action=action,
-            actor_restaurant_ids=actor_restaurant_ids,
-        ):
+        restaurant_id = (action.filters or {}).get("by_restaurant_id")
+        role_for_restaurant = _get_role_for_restaurant(
+            restaurant_id=restaurant_id,
+            restaurant_roles=restaurant_roles or {},
+        )
+        if role_for_restaurant is None:
             reasons.append("restaurant_scope_required")
+        elif scope == SCOPE_RESTAURANT_OWNER and role_for_restaurant != ROLE_OWNER:
+            reasons.append("owner_role_required_for_restaurant")
     else:
         reasons.append("scope_not_supported")
 
@@ -241,16 +273,7 @@ def _is_self_scope(*, action: DBAction, actor_user_id: str) -> bool:
     return action.filters.get("by_user_id") == actor_user_id
 
 
-def _is_restaurant_scope(
-    *,
-    action: DBAction,
-    actor_restaurant_ids: set[str] | None,
-) -> bool:
-    if not action.filters:
-        return False
-    if not actor_restaurant_ids:
-        return False
-    restaurant_id = action.filters.get("by_restaurant_id")
+def _is_restaurant_scope(*, restaurant_id: str | None, restaurant_roles: dict[str, str]) -> bool:
     if not isinstance(restaurant_id, str):
         return False
-    return restaurant_id in actor_restaurant_ids
+    return restaurant_id in restaurant_roles

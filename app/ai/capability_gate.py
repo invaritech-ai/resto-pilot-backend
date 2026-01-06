@@ -12,6 +12,11 @@ def get_enabled_capabilities(*, settings: Settings) -> set[str]:
     return {item for item in items if item}
 
 
+def is_db_engine_enabled(*, settings: Settings) -> bool:
+    """Check if the db_engine capability is enabled."""
+    return "db_engine" in get_enabled_capabilities(settings=settings)
+
+
 def _combined_user_text(*, messages: list[TelegramMessages]) -> str:
     parts: list[str] = []
     for msg in messages:

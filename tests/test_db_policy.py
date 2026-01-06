@@ -110,7 +110,7 @@ def test_normalize_restaurant_scope_autofill() -> None:
         action=action,
         actor_user_id="u1",
         actor_role="owner",
-        actor_restaurant_ids={"r1"},
+        restaurant_roles={"r1": "owner"},
     )
     assert normalized.normalized is not None
     assert normalized.normalized.filters is not None
@@ -130,7 +130,7 @@ def test_normalize_restaurant_scope_requires_filter_when_multiple() -> None:
         action=action,
         actor_user_id="u1",
         actor_role="owner",
-        actor_restaurant_ids={"r1", "r2"},
+        restaurant_roles={"r1": "owner", "r2": "owner"},
     )
     assert "restaurant_scope_required" in normalized.reasons
 
@@ -147,7 +147,7 @@ def test_normalize_strips_disallowed_columns() -> None:
         action=action,
         actor_user_id="u1",
         actor_role="owner",
-        actor_restaurant_ids={"r1"},
+        restaurant_roles={"r1": "owner"},
     )
     assert normalized.normalized is not None
     assert normalized.normalized.columns == ["name"]

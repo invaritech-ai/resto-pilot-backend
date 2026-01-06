@@ -14,6 +14,7 @@ from app.ai.chat_memory import (
     update_chat_memory_summary,
 )
 from app.ai.db_router import classify_db_intent, extract_db_action
+from app.ai.model_config import get_gate_model
 from app.ai.openai_client import (
     OpenAIError,
     create_chat_completion_text_allow_empty_with_http_info,
@@ -23,6 +24,7 @@ from app.ai.openrouter_usage import extract_openrouter_usage
 from app.ai.capability_gate import (
     classify_capability,
     inventory_outlet_list_refusal,
+    is_db_engine_enabled,
     is_outlet_list_request,
 )
 from app.ai.session_reply import generate_session_reply_with_metrics
@@ -57,6 +59,10 @@ OFF_TOPIC_REDIRECT_TEXT = (
     "What inventory change do you want to make (item + quantity) and for which outlet?"
 )
 
+PENDING_ACTION_PROMPT = (
+    "You have a pending action. Please reply /confirm to proceed or /cancel to abort."
+)
+
 
 def _first_name(full_name: str | None) -> str | None:
     if not isinstance(full_name, str):
@@ -69,30 +75,38 @@ def _parse_uuid(value: str) -> uuid.UUID:
     return uuid.UUID(value)
 
 
+def _safe_float(value: Any) -> float | None:
+    """Return float(value) if numeric, else None."""
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
+
 def _get_user_role_and_restaurants(
     *, db: Session, user_id: uuid.UUID
-) -> tuple[str, set[str]]:
+) -> tuple[str, dict[str, str]]:
     """
     Get user's role and restaurant IDs.
 
     Returns:
-        (role, restaurant_ids) where:
-        - role is "owner" or "staff" (highest role if multiple restaurants)
-        - restaurant_ids is a set of restaurant UUIDs as strings
+        (highest_role, restaurant_roles) where:
+        - highest_role is "owner" or "staff" (highest role if multiple restaurants)
+        - restaurant_roles is a map of restaurant_id -> role for per-restaurant checks
     """
     rows = RestaurantService(db).list_for_user(user_id=user_id)
     if not rows:
-        return ROLE_STAFF, set()
+        return ROLE_STAFF, {}
 
-    restaurant_ids: set[str] = set()
+    restaurant_roles: dict[str, str] = {}
     has_owner = False
     for _restaurant, membership in rows:
-        restaurant_ids.add(str(membership.restaurant_id))
+        rid = str(membership.restaurant_id)
+        restaurant_roles[rid] = membership.role
         if membership.role == ROLE_OWNER:
             has_owner = True
 
-    role = ROLE_OWNER if has_owner else ROLE_STAFF
-    return role, restaurant_ids
+    highest_role = ROLE_OWNER if has_owner else ROLE_STAFF
+    return highest_role, restaurant_roles
 
 
 def _generate_confirmation_message(
@@ -101,6 +115,7 @@ def _generate_confirmation_message(
     """
     Generate a natural language confirmation message for a DB action.
 
+    Uses a cheap model for cost efficiency.
     Returns (text_or_none, response_json, response_headers, latency_ms).
     """
     intent = action.intent if hasattr(action, "intent") else "perform this action"
@@ -108,7 +123,9 @@ def _generate_confirmation_message(
     table = action.table if hasattr(action, "table") else "record"
     values = action.values if hasattr(action, "values") else {}
 
-    values_summary = ", ".join(f"{k}={v}" for k, v in (values or {}).items()[:3])
+    # Fix: convert dict_items to list before slicing
+    values_items = list((values or {}).items())[:3]
+    values_summary = ", ".join(f"{k}={v}" for k, v in values_items)
     if values_summary:
         action_desc = f"{crud} {table} ({values_summary})"
     else:
@@ -131,9 +148,17 @@ def _generate_confirmation_message(
     if isinstance(user_first_name, str) and user_first_name.strip():
         user_prompt = f"User: {user_first_name.strip()}\n{user_prompt}"
 
+    # Use cheap model for confirmation message generation
+    gate_model = get_gate_model(settings)
+    cheap_settings = (
+        settings.model_copy(update={"openai_model": gate_model})
+        if gate_model != settings.openai_model
+        else settings
+    )
+
     text, data, headers, latency_ms = (
         create_chat_completion_text_allow_empty_with_http_info(
-            settings=settings,
+            settings=cheap_settings,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -330,12 +355,12 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
                     provider_name_raw if isinstance(provider_name_raw, str) else None
                 )
 
-                total_cost_usd = None
                 usage_obj = gate_data.get("usage")
-                if isinstance(usage_obj, dict) and isinstance(
-                    usage_obj.get("cost"), (int, float)
-                ):
-                    total_cost_usd = float(usage_obj["cost"])
+                total_cost_usd = (
+                    _safe_float(usage_obj.get("cost"))
+                    if isinstance(usage_obj, dict)
+                    else None
+                )
 
                 llm_call_id = record_llm_call(
                     db=db,
@@ -423,34 +448,62 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
 
         chat_state = get_or_create_chat_state(db=db, chat_id=db_session.chat_id)
 
-        capability_ok, capability_reject_text = classify_capability(
-            messages=messages, hint_command=hint, settings=settings
+        # Get user from messages
+        user = None
+        if messages:
+            user = db.scalar(select(User).where(User.id == messages[0].user_id))
+
+        # DB Engine routing - runs BEFORE inventory capability gate
+        # Only if db_engine capability is enabled
+        db_engine_usable = (
+            is_db_engine_enabled(settings=settings)
+            and isinstance(settings.openai_api_key, str)
+            and settings.openai_api_key.strip().lower() not in {"", "test"}
         )
-        if not capability_ok:
-            if chat_state.off_topic_mode:
+        if user is not None and db_engine_usable:
+            # Check for pending DB actions first - short circuit if exists
+            pending_service = DBPendingActionService(db)
+            pending_action = pending_service.get_latest_pending(user_id=user.id)
+            if pending_action is not None:
+                # User has a pending action - prompt them to confirm or cancel
                 logger.info(
-                    "process_session_capability_ghost task_id=%s session_id=%s chat_id=%s",
+                    "process_session_pending_action_exists task_id=%s session_id=%s user_id=%s pending_id=%s",
                     task_id,
                     session_id,
-                    db_session.chat_id,
+                    str(user.id),
+                    str(pending_action.id),
                 )
-                now = dt.datetime.now(dt.UTC)
-                db_session.status = "closed"
-                if db_session.closed_at is None:
-                    db_session.closed_at = now
+                telegram_message_id = send_message(
+                    chat_id=db_session.chat_id,
+                    text=PENDING_ACTION_PROMPT,
+                    settings=settings,
+                )
+                record_outgoing_message(
+                    db=db,
+                    session_id=session_uuid,
+                    chat_id=db_session.chat_id,
+                    kind="reply",
+                    text=PENDING_ACTION_PROMPT,
+                    telegram_message_id=telegram_message_id,
+                    llm_call_id=None,
+                )
+                final_now = dt.datetime.now(dt.UTC)
                 db.add(
                     ProcessingEvents(
                         session_id=session_uuid,
-                        at=now,
-                        event="session_capability_ghost_v0",
+                        at=final_now,
+                        event="assistant_reply_sent_v0",
                         payload_json=None,
                         error=None,
                     )
                 )
+                db_session.status = "closed"
+                if db_session.closed_at is None:
+                    db_session.closed_at = final_now
                 db.add(
                     ProcessingEvents(
                         session_id=session_uuid,
-                        at=now,
+                        at=final_now,
                         event="session_processed_v0",
                         payload_json=None,
                         error=None,
@@ -459,111 +512,7 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
                 db.commit()
                 return
 
-            logger.info(
-                "process_session_capability_reject task_id=%s session_id=%s chat_id=%s",
-                task_id,
-                session_id,
-                db_session.chat_id,
-            )
-            telegram_message_id = send_message(
-                chat_id=db_session.chat_id,
-                text=capability_reject_text,
-                settings=settings,
-            )
-            record_outgoing_message(
-                db=db,
-                session_id=session_uuid,
-                chat_id=db_session.chat_id,
-                kind="capability_reject",
-                text=capability_reject_text,
-                telegram_message_id=telegram_message_id,
-                llm_call_id=None,
-            )
-            set_chat_off_topic(db=db, chat_id=db_session.chat_id)
-            now = dt.datetime.now(dt.UTC)
-            db_session.status = "closed"
-            if db_session.closed_at is None:
-                db_session.closed_at = now
-            db.add(
-                ProcessingEvents(
-                    session_id=session_uuid,
-                    at=now,
-                    event="session_capability_reject_sent_v0",
-                    payload_json=None,
-                    error=None,
-                )
-            )
-            db.add(
-                ProcessingEvents(
-                    session_id=session_uuid,
-                    at=now,
-                    event="session_processed_v0",
-                    payload_json=None,
-                    error=None,
-                )
-            )
-            db.commit()
-            return
-
-        # Get user from messages
-        user = None
-        if messages:
-            user = db.scalar(select(User).where(User.id == messages[0].user_id))
-        if user is not None:
-            pending_service = DBPendingActionService(db)
-            pending_action = pending_service.get_latest_pending(user_id=user.id)
-            if pending_action is not None:
-                # User has a pending action - they should use /confirm or /cancel
-                # This will be handled in the instant handler, so we skip DB routing here
-                logger.info(
-                    "process_session_pending_action_exists task_id=%s session_id=%s user_id=%s pending_id=%s",
-                    task_id,
-                    session_id,
-                    str(user.id),
-                    str(pending_action.id),
-                )
-
-        if is_outlet_list_request(messages=messages):
-            reply_text = inventory_outlet_list_refusal()
-            telegram_message_id = send_message(
-                chat_id=db_session.chat_id, text=reply_text, settings=settings
-            )
-            record_outgoing_message(
-                db=db,
-                session_id=session_uuid,
-                chat_id=db_session.chat_id,
-                kind="reply",
-                text=reply_text,
-                telegram_message_id=telegram_message_id,
-                llm_call_id=None,
-            )
-            final_now = dt.datetime.now(dt.UTC)
-            db.add(
-                ProcessingEvents(
-                    session_id=session_uuid,
-                    at=final_now,
-                    event="assistant_reply_sent_v0",
-                    payload_json=None,
-                    error=None,
-                )
-            )
-            db_session.status = "closed"
-            if db_session.closed_at is None:
-                db_session.closed_at = final_now
-            db.add(
-                ProcessingEvents(
-                    session_id=session_uuid,
-                    at=final_now,
-                    event="session_processed_v0",
-                    payload_json=None,
-                    error=None,
-                )
-            )
-            db.commit()
-            return
-
-        # DB Intent Classification and Action Extraction
-        if user is not None:
+            # DB Intent Classification
             intent_result = classify_db_intent(messages=messages, settings=settings)
             db.add(
                 ProcessingEvents(
@@ -600,12 +549,12 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
                 provider_name = (
                     provider_name_raw if isinstance(provider_name_raw, str) else None
                 )
-                total_cost_usd = None
                 usage_obj = intent_result.data.get("usage")
-                if isinstance(usage_obj, dict) and isinstance(
-                    usage_obj.get("cost"), (int, float)
-                ):
-                    total_cost_usd = float(usage_obj["cost"])
+                total_cost_usd = (
+                    _safe_float(usage_obj.get("cost"))
+                    if isinstance(usage_obj, dict)
+                    else None
+                )
 
                 record_llm_call(
                     db=db,
@@ -623,7 +572,7 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
                 )
 
                 # Extract DB action
-                actor_role, actor_restaurant_ids = _get_user_role_and_restaurants(
+                actor_role, restaurant_roles = _get_user_role_and_restaurants(
                     db=db, user_id=user.id
                 )
                 action_result = extract_db_action(
@@ -671,12 +620,12 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
                 provider_name = (
                     provider_name_raw if isinstance(provider_name_raw, str) else None
                 )
-                total_cost_usd = None
                 usage_obj = action_result.data.get("usage")
-                if isinstance(usage_obj, dict) and isinstance(
-                    usage_obj.get("cost"), (int, float)
-                ):
-                    total_cost_usd = float(usage_obj["cost"])
+                total_cost_usd = (
+                    _safe_float(usage_obj.get("cost"))
+                    if isinstance(usage_obj, dict)
+                    else None
+                )
 
                 record_llm_call(
                     db=db,
@@ -739,12 +688,12 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
                     db.commit()
                     return
 
-                # Normalize and validate action
+                # Normalize and validate action (with per-restaurant role checking)
                 normalized_result = normalize_db_action(
                     action=action_result.action,
                     actor_user_id=str(user.id),
                     actor_role=actor_role,
-                    actor_restaurant_ids=actor_restaurant_ids,
+                    restaurant_roles=restaurant_roles,
                 )
 
                 if normalized_result.normalized is None:
@@ -798,7 +747,7 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
                     action=normalized_action,
                     actor_user_id=str(user.id),
                     actor_role=actor_role,
-                    actor_restaurant_ids=actor_restaurant_ids,
+                    restaurant_roles=restaurant_roles,
                 )
 
                 if not validation_result.allowed:
@@ -994,12 +943,12 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
                             if isinstance(conf_provider_name_raw, str)
                             else None
                         )
-                        conf_total_cost_usd = None
                         conf_usage_obj = conf_data.get("usage")
-                        if isinstance(conf_usage_obj, dict) and isinstance(
-                            conf_usage_obj.get("cost"), (int, float)
-                        ):
-                            conf_total_cost_usd = float(conf_usage_obj["cost"])
+                        conf_total_cost_usd = (
+                            _safe_float(conf_usage_obj.get("cost"))
+                            if isinstance(conf_usage_obj, dict)
+                            else None
+                        )
 
                         conf_llm_call_id = record_llm_call(
                             db=db,
@@ -1030,9 +979,10 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
                                     },
                                 )
 
+                        conf_text_safe = conf_text or "Please confirm to proceed."
                         telegram_message_id = send_message(
                             chat_id=db_session.chat_id,
-                            text=conf_text,
+                            text=conf_text_safe,
                             settings=settings,
                         )
                         record_outgoing_message(
@@ -1040,7 +990,7 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
                             session_id=session_uuid,
                             chat_id=db_session.chat_id,
                             kind="reply",
-                            text=conf_text,
+                            text=conf_text_safe,
                             telegram_message_id=telegram_message_id,
                             llm_call_id=conf_llm_call_id,
                         )
@@ -1113,6 +1063,128 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
                     )
                     db.commit()
                     return
+
+        # Inventory capability gate (runs AFTER db_engine routing)
+        capability_ok, capability_reject_text = classify_capability(
+            messages=messages, hint_command=hint, settings=settings
+        )
+        if not capability_ok:
+            if chat_state.off_topic_mode:
+                logger.info(
+                    "process_session_capability_ghost task_id=%s session_id=%s chat_id=%s",
+                    task_id,
+                    session_id,
+                    db_session.chat_id,
+                )
+                now = dt.datetime.now(dt.UTC)
+                db_session.status = "closed"
+                if db_session.closed_at is None:
+                    db_session.closed_at = now
+                db.add(
+                    ProcessingEvents(
+                        session_id=session_uuid,
+                        at=now,
+                        event="session_capability_ghost_v0",
+                        payload_json=None,
+                        error=None,
+                    )
+                )
+                db.add(
+                    ProcessingEvents(
+                        session_id=session_uuid,
+                        at=now,
+                        event="session_processed_v0",
+                        payload_json=None,
+                        error=None,
+                    )
+                )
+                db.commit()
+                return
+
+            logger.info(
+                "process_session_capability_reject task_id=%s session_id=%s chat_id=%s",
+                task_id,
+                session_id,
+                db_session.chat_id,
+            )
+            telegram_message_id = send_message(
+                chat_id=db_session.chat_id,
+                text=capability_reject_text,
+                settings=settings,
+            )
+            record_outgoing_message(
+                db=db,
+                session_id=session_uuid,
+                chat_id=db_session.chat_id,
+                kind="capability_reject",
+                text=capability_reject_text,
+                telegram_message_id=telegram_message_id,
+                llm_call_id=None,
+            )
+            set_chat_off_topic(db=db, chat_id=db_session.chat_id)
+            now = dt.datetime.now(dt.UTC)
+            db_session.status = "closed"
+            if db_session.closed_at is None:
+                db_session.closed_at = now
+            db.add(
+                ProcessingEvents(
+                    session_id=session_uuid,
+                    at=now,
+                    event="session_capability_reject_sent_v0",
+                    payload_json=None,
+                    error=None,
+                )
+            )
+            db.add(
+                ProcessingEvents(
+                    session_id=session_uuid,
+                    at=now,
+                    event="session_processed_v0",
+                    payload_json=None,
+                    error=None,
+                )
+            )
+            db.commit()
+            return
+
+        if is_outlet_list_request(messages=messages):
+            reply_text = inventory_outlet_list_refusal()
+            telegram_message_id = send_message(
+                chat_id=db_session.chat_id, text=reply_text, settings=settings
+            )
+            record_outgoing_message(
+                db=db,
+                session_id=session_uuid,
+                chat_id=db_session.chat_id,
+                kind="reply",
+                text=reply_text,
+                telegram_message_id=telegram_message_id,
+                llm_call_id=None,
+            )
+            final_now = dt.datetime.now(dt.UTC)
+            db.add(
+                ProcessingEvents(
+                    session_id=session_uuid,
+                    at=final_now,
+                    event="assistant_reply_sent_v0",
+                    payload_json=None,
+                    error=None,
+                )
+            )
+            db_session.status = "closed"
+            if db_session.closed_at is None:
+                db_session.closed_at = final_now
+            db.add(
+                ProcessingEvents(
+                    session_id=session_uuid,
+                    at=final_now,
+                    event="session_processed_v0",
+                    payload_json=None,
+                    error=None,
+                )
+            )
+            db.commit()
+            return
 
         if chat_state.off_topic_mode:
             set_chat_on_topic(db=db, chat_id=db_session.chat_id)
@@ -1198,12 +1270,7 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
                 "completion_tokens": int(metrics.get("completion_tokens_total") or 0),
                 "total_tokens": int(metrics.get("total_tokens_total") or 0),
             }
-            total_cost_usd = metrics.get("cost_usd_total")
-            total_cost_usd = (
-                float(total_cost_usd)
-                if isinstance(total_cost_usd, (int, float))
-                else None
-            )
+            total_cost_usd = _safe_float(metrics.get("cost_usd_total"))
             latency_ms_total = metrics.get("latency_ms_total")
             latency_ms_total = (
                 int(latency_ms_total) if isinstance(latency_ms_total, int) else None
@@ -1268,12 +1335,13 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
             db.commit()
             raise
 
+        reply_text_safe = reply_text or ""
         record_outgoing_message(
             db=db,
             session_id=session_uuid,
             chat_id=db_session.chat_id,
             kind="reply",
-            text=reply_text,
+            text=reply_text_safe,
             telegram_message_id=telegram_message_id,
             llm_call_id=reply_llm_call_id,
         )
@@ -1317,9 +1385,8 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
                 )
                 usage_obj = sum_data.get("usage")
                 total_cost_usd = (
-                    float(usage_obj.get("cost"))
+                    _safe_float(usage_obj.get("cost"))
                     if isinstance(usage_obj, dict)
-                    and isinstance(usage_obj.get("cost"), (int, float))
                     else None
                 )
                 llm_call_id = record_llm_call(
