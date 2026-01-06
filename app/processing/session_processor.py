@@ -71,6 +71,88 @@ def _first_name(full_name: str | None) -> str | None:
     return parts[0] if parts else None
 
 
+def _update_chat_memory(
+    *,
+    db: Session,
+    chat_id: int,
+    session_uuid: uuid.UUID,
+    settings: Settings,
+) -> None:
+    """
+    Update chat memory with the latest conversation history.
+    Should be called after every meaningful interaction, not just LLM replies.
+
+    This ensures the rolling summary stays up to date even for:
+    - Static responses (off-topic redirects, pending action prompts)
+    - DB engine actions (reads, staged CUD operations)
+    - Capability rejections
+    """
+    try:
+        previous_summary = load_chat_memory_summary(db=db, chat_id=chat_id)
+        history = load_chat_history_messages(
+            db=db,
+            chat_id=chat_id,
+            exclude_session_id=None,  # Include current session
+            limit=50,
+        )
+
+        new_summary, sum_data, sum_headers, sum_latency_ms = update_chat_memory_summary(
+            settings=settings,
+            previous_summary=previous_summary,
+            history_messages=history,
+        )
+
+        if isinstance(new_summary, str) and new_summary.strip():
+            row = db.scalar(
+                select(TelegramChatMemory).where(TelegramChatMemory.chat_id == chat_id)
+            )
+            if row is None:
+                row = TelegramChatMemory(chat_id=chat_id, summary_text=new_summary)
+                db.add(row)
+            else:
+                row.summary_text = new_summary
+
+            usage = extract_openrouter_usage(sum_data)
+            generation_id = extract_openrouter_generation_id(
+                headers=sum_headers, data=sum_data
+            )
+            model_raw = sum_data.get("model")
+            model = model_raw if isinstance(model_raw, str) else settings.openai_model
+            total_cost_usd = _extract_cost_from_usage(sum_data)
+
+            llm_call_id = record_llm_call(
+                db=db,
+                session_id=session_uuid,
+                chat_id=chat_id,
+                purpose="memory",
+                model=model,
+                openrouter_generation_id=generation_id,
+                upstream_id=None,
+                provider_name=None,
+                usage=usage,
+                latency_ms=sum_latency_ms,
+                total_cost_usd=total_cost_usd,
+                error=None,
+            )
+
+            if generation_id is not None:
+                try:
+                    schedule_openrouter_cost_backfill(
+                        llm_call_id=llm_call_id, delay_seconds=120
+                    )
+                except Exception:
+                    logger.exception(
+                        "memory_cost_backfill_schedule_failed",
+                        extra={"llm_call_id": str(llm_call_id), "chat_id": chat_id},
+                    )
+            db.commit()
+    except Exception:
+        logger.exception(
+            "chat_memory_update_failed",
+            extra={"session_uuid": str(session_uuid), "chat_id": chat_id},
+        )
+
+
 def _parse_uuid(value: str) -> uuid.UUID:
     return uuid.UUID(value)
 
@@ -357,11 +439,32 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
         }
 
         settings = get_settings()
+
+        # CONTEXT FIRST: Load history and memory BEFORE any classification
+        # This ensures all gates and classifiers have conversational context
+        history_messages = load_chat_history_messages(
+            db=db,
+            chat_id=db_session.chat_id,
+            exclude_session_id=session_uuid,
+            limit=50,
+        )
+        memory_summary = load_chat_memory_summary(db=db, chat_id=db_session.chat_id)
+
+        logger.info(
+            "process_session_context_loaded task_id=%s session_id=%s history_count=%s has_memory=%s",
+            task_id,
+            session_id,
+            len(history_messages),
+            memory_summary is not None,
+        )
+
         on_topic, gate_reason, gate_data, gate_headers, gate_latency_ms = (
             classify_on_topic(
                 messages=messages,
                 settings=settings,
                 hint_command=hint,
+                history_messages=history_messages,
+                memory_summary=memory_summary,
             )
         )
 
@@ -449,6 +552,13 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
                     )
                 )
                 db.commit()
+                # Update memory even for ghost mode - user's message should be in summary
+                _update_chat_memory(
+                    db=db,
+                    chat_id=db_session.chat_id,
+                    session_uuid=session_uuid,
+                    settings=settings,
+                )
                 return
 
             logger.info(
@@ -501,7 +611,13 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
                 )
             )
             db.commit()
-            # Cost backfill already scheduled above with gate_llm_call_id
+            # Update memory with this interaction
+            _update_chat_memory(
+                db=db,
+                chat_id=db_session.chat_id,
+                session_uuid=session_uuid,
+                settings=settings,
+            )
             return
 
         chat_state = get_or_create_chat_state(db=db, chat_id=db_session.chat_id)
@@ -568,6 +684,13 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
                     )
                 )
                 db.commit()
+                # Update memory with this interaction
+                _update_chat_memory(
+                    db=db,
+                    chat_id=db_session.chat_id,
+                    session_uuid=session_uuid,
+                    settings=settings,
+                )
                 return
 
             # Get user role and restaurants before DB routing
@@ -575,17 +698,12 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
                 db=db, user_id=user.id
             )
 
-            # Load chat history for context-aware extraction
-            history_messages = load_chat_history_messages(
-                db=db,
-                chat_id=db_session.chat_id,
-                exclude_session_id=session_uuid,
-                limit=50,
-            )
-
-            # DB Intent Classification
+            # DB Intent Classification (history_messages already loaded at context-first step)
             intent_result = classify_db_intent(
-                messages=messages, settings=settings, actor_role=actor_role
+                messages=messages,
+                settings=settings,
+                actor_role=actor_role,
+                history_messages=history_messages,
             )
             db.add(
                 ProcessingEvents(
@@ -654,6 +772,13 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
                     )
                 )
                 db.commit()
+                # Update memory with this interaction
+                _update_chat_memory(
+                    db=db,
+                    chat_id=db_session.chat_id,
+                    session_uuid=session_uuid,
+                    settings=settings,
+                )
                 return
 
             if intent_result.is_db_action:
@@ -874,6 +999,38 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
                                 error=None,
                             )
                         )
+                        # Close session and return - DB engine handled the action
+                        final_now = dt.datetime.now(dt.UTC)
+                        db.add(
+                            ProcessingEvents(
+                                session_id=session_uuid,
+                                at=final_now,
+                                event="assistant_reply_sent_v0",
+                                payload_json=None,
+                                error=None,
+                            )
+                        )
+                        db_session.status = "closed"
+                        if db_session.closed_at is None:
+                            db_session.closed_at = final_now
+                        db.add(
+                            ProcessingEvents(
+                                session_id=session_uuid,
+                                at=final_now,
+                                event="session_processed_v0",
+                                payload_json=None,
+                                error=None,
+                            )
+                        )
+                        db.commit()
+                        # Update memory with this interaction
+                        _update_chat_memory(
+                            db=db,
+                            chat_id=db_session.chat_id,
+                            session_uuid=session_uuid,
+                            settings=settings,
+                        )
+                        return
                     except Exception as exc:
                         logger.exception(
                             "db_read_execution_failed",
@@ -1019,6 +1176,38 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
                                 error=None,
                             )
                         )
+                        # Close session and return - CUD action staged for confirmation
+                        final_now = dt.datetime.now(dt.UTC)
+                        db.add(
+                            ProcessingEvents(
+                                session_id=session_uuid,
+                                at=final_now,
+                                event="assistant_reply_sent_v0",
+                                payload_json=None,
+                                error=None,
+                            )
+                        )
+                        db_session.status = "closed"
+                        if db_session.closed_at is None:
+                            db_session.closed_at = final_now
+                        db.add(
+                            ProcessingEvents(
+                                session_id=session_uuid,
+                                at=final_now,
+                                event="session_processed_v0",
+                                payload_json=None,
+                                error=None,
+                            )
+                        )
+                        db.commit()
+                        # Update memory with this interaction
+                        _update_chat_memory(
+                            db=db,
+                            chat_id=db_session.chat_id,
+                            session_uuid=session_uuid,
+                            settings=settings,
+                        )
+                        return
                     except Exception as exc:
                         logger.exception(
                             "db_action_staging_failed",
@@ -1075,6 +1264,13 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
                     )
                 )
                 db.commit()
+                # Update memory even for ghost mode
+                _update_chat_memory(
+                    db=db,
+                    chat_id=db_session.chat_id,
+                    session_uuid=session_uuid,
+                    settings=settings,
+                )
                 return
 
             logger.info(
@@ -1121,6 +1317,13 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
                 )
             )
             db.commit()
+            # Update memory with this interaction
+            _update_chat_memory(
+                db=db,
+                chat_id=db_session.chat_id,
+                session_uuid=session_uuid,
+                settings=settings,
+            )
             return
 
         if is_outlet_list_request(messages=messages):
@@ -1160,6 +1363,13 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
                 )
             )
             db.commit()
+            # Update memory with this interaction
+            _update_chat_memory(
+                db=db,
+                chat_id=db_session.chat_id,
+                session_uuid=session_uuid,
+                settings=settings,
+            )
             return
 
         if chat_state.off_topic_mode:
@@ -1201,15 +1411,7 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
         reply_llm_call_id: uuid.UUID | None = None
         if reply_text is None:
             try:
-                memory_summary = load_chat_memory_summary(
-                    db=db, chat_id=db_session.chat_id
-                )
-                history_messages = load_chat_history_messages(
-                    db=db,
-                    chat_id=db_session.chat_id,
-                    exclude_session_id=session_uuid,
-                    limit=50,
-                )
+                # history_messages and memory_summary already loaded at context-first step
                 reply, metrics = generate_session_reply_with_metrics(
                     messages=messages,
                     hint_command=hint,
@@ -1322,67 +1524,13 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
             llm_call_id=reply_llm_call_id,
         )
 
-        try:
-            memory_summary = load_chat_memory_summary(db=db, chat_id=db_session.chat_id)
-            history_messages = load_chat_history_messages(
-                db=db,
-                chat_id=db_session.chat_id,
-                exclude_session_id=None,
-                limit=50,
-            )
-            new_summary, sum_data, sum_headers, sum_latency_ms = (
-                update_chat_memory_summary(
-                    settings=settings,
-                    previous_summary=memory_summary,
-                    history_messages=history_messages,
-                )
-            )
-            if isinstance(new_summary, str) and new_summary.strip():
-                row = db.scalar(
-                    select(TelegramChatMemory).where(
-                        TelegramChatMemory.chat_id == db_session.chat_id
-                    )
-                )
-                if row is None:
-                    row = TelegramChatMemory(
-                        chat_id=db_session.chat_id, summary_text=new_summary
-                    )
-                    db.add(row)
-                else:
-                    row.summary_text = new_summary
-
-                usage = extract_openrouter_usage(sum_data)
-                generation_id = extract_openrouter_generation_id(
-                    headers=sum_headers, data=sum_data
-                )
-                model_raw = sum_data.get("model")
-                model = (
-                    model_raw if isinstance(model_raw, str) else settings.openai_model
-                )
-                total_cost_usd = _extract_cost_from_usage(sum_data)
-                llm_call_id = record_llm_call(
-                    db=db,
-                    session_id=session_uuid,
-                    chat_id=db_session.chat_id,
-                    purpose="memory",
-                    model=model,
-                    openrouter_generation_id=generation_id,
-                    upstream_id=None,
-                    provider_name=None,
-                    usage=usage,
-                    latency_ms=sum_latency_ms,
-                    total_cost_usd=total_cost_usd,
-                    error=None,
-                )
-                if generation_id is not None:
-                    schedule_openrouter_cost_backfill(
-                        llm_call_id=llm_call_id, delay_seconds=120
-                    )
-        except Exception:
-            logger.exception(
-                "chat_memory_update_failed",
-                extra={"session_id": session_id, "chat_id": db_session.chat_id},
-            )
+        # Update memory with this interaction (uses helper function)
+        _update_chat_memory(
+            db=db,
+            chat_id=db_session.chat_id,
+            session_uuid=session_uuid,
+            settings=settings,
+        )
 
         final_now = dt.datetime.now(dt.UTC)
         db.add(

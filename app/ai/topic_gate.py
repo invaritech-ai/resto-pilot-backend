@@ -15,10 +15,13 @@ def classify_on_topic(
     messages: list[TelegramMessages],
     settings: Settings,
     hint_command: str | None = None,
+    history_messages: list[dict[str, Any]] | None = None,
+    memory_summary: str | None = None,
 ) -> tuple[bool, str | None, dict[str, Any], dict[str, str], int]:
     """
-    Conservative topic gate:
+    Conservative topic gate with conversational context:
     - Returns on_topic=True unless we are highly confident it's off-topic.
+    - Considers conversation history to understand context (e.g., user responding to bot's question).
     - Intended to be used before expensive processing to reduce unnecessary compute.
 
     Returns (on_topic, reason, response_json, response_headers, latency_ms).
@@ -83,22 +86,57 @@ def classify_on_topic(
         else settings
     )
 
+    # Build context from history for conversational awareness
+    context_text = ""
+    if history_messages:
+        # Get last 5 messages to understand what bot asked / user responded
+        recent = history_messages[-5:]
+        context_parts = []
+        for msg in recent:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if role and content:
+                # Truncate long messages
+                truncated = content[:200] + "..." if len(content) > 200 else content
+                context_parts.append(f"{role}: {truncated}")
+        if context_parts:
+            context_text = "\n".join(context_parts)
+
+    memory_text = ""
+    if memory_summary:
+        memory_text = memory_summary[:300]  # Truncate if needed
+
     system_prompt = (
         "You are a strict topic classifier for a restaurant/outlet operations assistant.\n"
         "Classify the user's message as:\n"
-        "- on_topic: clearly about restaurant/outlet operations\n"
-        "- off_topic: clearly unrelated\n"
+        "- on_topic: clearly about restaurant/outlet operations OR responding to bot's question\n"
+        "- off_topic: clearly unrelated AND not a response to any bot question\n"
         "- unsure: ambiguous\n"
-        "IMPORTANT: Be conservative. If unsure, choose 'unsure'.\n"
+        "\n"
+        "CRITICAL RULES:\n"
+        "1. If the bot asked a question and the user is responding to it, that's ON TOPIC.\n"
+        "2. Phone numbers, names, confirmations given in response to bot questions are ON TOPIC.\n"
+        "3. Be conservative. If unsure, choose 'unsure'.\n"
+        "4. Consider the conversation context when classifying.\n"
+        "\n"
         "Output ONLY valid JSON in this exact schema:\n"
         '{"verdict":"on_topic|off_topic|unsure","confidence":0.0,"reason":"short"}\n'
     )
+
+    # Build user prompt with context
+    user_prompt_parts = []
+    if memory_text:
+        user_prompt_parts.append(f"Memory context:\n{memory_text}")
+    if context_text:
+        user_prompt_parts.append(f"Recent conversation:\n{context_text}")
+    user_prompt_parts.append(f"Current user message:\n{user_text}")
+    user_prompt = "\n\n".join(user_prompt_parts)
 
     text, data, headers, latency_ms = create_chat_completion_text_allow_empty_with_http_info(
         settings=gate_settings,
         messages=[
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"User message:\n{user_text}"},
+            {"role": "user", "content": user_prompt},
         ],
         temperature=0.0,
     )
