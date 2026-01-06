@@ -26,7 +26,8 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 FORCE_FLUSH_COMMANDS: frozenset[str] = frozenset({"/respond", "/done"})
-INSTANT_STATEFUL_STATES: frozenset[str] = frozenset({"COLLECT_PHONE"})
+# Phone collection is now optional and non-blocking - removed from instant stateful states
+INSTANT_STATEFUL_STATES: frozenset[str] = frozenset()
 
 
 @router.post("/telegram")
@@ -99,18 +100,23 @@ async def telegram_webhook(
         if isinstance(message, dict):
             text = message.get("text") if isinstance(message.get("text"), str) else None
             caption = (
-                message.get("caption") if isinstance(message.get("caption"), str) else None
+                message.get("caption")
+                if isinstance(message.get("caption"), str)
+                else None
             )
             command, _args = extract_command(text, caption)
 
         if command == "/start":
             parsed = parse_update(update)
             if parsed is not None:
-                if db.scalar(
-                    select(TelegramMessages.id).where(
-                        TelegramMessages.update_id == parsed.update_id
+                if (
+                    db.scalar(
+                        select(TelegramMessages.id).where(
+                            TelegramMessages.update_id == parsed.update_id
+                        )
                     )
-                ) is not None:
+                    is not None
+                ):
                     return JSONResponse({"status": "ok"})
             async_result = cast(CeleryDelayable, handle_telegram_update).delay(update)
             logger.info(
@@ -124,11 +130,14 @@ async def telegram_webhook(
         if command in {"/confirm", "/cancel"}:
             parsed = parse_update(update)
             if parsed is not None:
-                if db.scalar(
-                    select(TelegramMessages.id).where(
-                        TelegramMessages.update_id == parsed.update_id
+                if (
+                    db.scalar(
+                        select(TelegramMessages.id).where(
+                            TelegramMessages.update_id == parsed.update_id
+                        )
                     )
-                ) is not None:
+                    is not None
+                ):
                     return JSONResponse({"status": "ok"})
             async_result = cast(CeleryDelayable, handle_telegram_update).delay(update)
             logger.info(
@@ -145,9 +154,14 @@ async def telegram_webhook(
             if parsed is None:
                 return JSONResponse({"status": "ok"})
 
-            if db.scalar(
-                select(TelegramMessages.id).where(TelegramMessages.update_id == parsed.update_id)
-            ) is not None:
+            if (
+                db.scalar(
+                    select(TelegramMessages.id).where(
+                        TelegramMessages.update_id == parsed.update_id
+                    )
+                )
+                is not None
+            ):
                 return JSONResponse({"status": "ok"})
 
             lock_chat_id(session=db, chat_id=parsed.chat_id)
@@ -214,18 +228,23 @@ async def telegram_webhook(
 
             from app.workers.tasks import process_session  # imported lazily
 
-            cast(CeleryDelayable, process_session).delay(session_id=str(open_session.id))
+            cast(CeleryDelayable, process_session).delay(
+                session_id=str(open_session.id)
+            )
             return JSONResponse({"status": "ok"})
 
         # Instant stateful routes (e.g., phone intake) must bypass batching so the user
         # doesn't wait for the debounce window before seeing feedback.
         parsed = parse_update(update)
         if parsed is not None:
-            if db.scalar(
-                select(TelegramMessages.id).where(
-                    TelegramMessages.update_id == parsed.update_id
+            if (
+                db.scalar(
+                    select(TelegramMessages.id).where(
+                        TelegramMessages.update_id == parsed.update_id
+                    )
                 )
-            ) is not None:
+                is not None
+            ):
                 return JSONResponse({"status": "ok"})
 
             user = db.scalar(select(User).where(User.telegram_id == parsed.telegram_id))
@@ -234,7 +253,9 @@ async def telegram_webhook(
                 and isinstance(user.state, str)
                 and user.state in INSTANT_STATEFUL_STATES
             ):
-                async_result = cast(CeleryDelayable, handle_telegram_update).delay(update)
+                async_result = cast(CeleryDelayable, handle_telegram_update).delay(
+                    update
+                )
                 logger.info(
                     "telegram_webhook_enqueued_instant_state task_id=%s update_id=%s chat_id=%s state=%s",
                     getattr(async_result, "id", None),
@@ -247,7 +268,9 @@ async def telegram_webhook(
             # Option B: if the user isn't registered yet, route to the instant handler
             # so we can respond deterministically with "/start" guidance.
             if user is None:
-                async_result = cast(CeleryDelayable, handle_telegram_update).delay(update)
+                async_result = cast(CeleryDelayable, handle_telegram_update).delay(
+                    update
+                )
                 logger.info(
                     "telegram_webhook_enqueued_unregistered task_id=%s update_id=%s chat_id=%s",
                     getattr(async_result, "id", None),
