@@ -190,6 +190,27 @@ async def telegram_webhook(
             cast(CeleryDelayable, process_session).delay(session_id=str(open_session.id))
             return JSONResponse({"status": "ok"})
 
+        # Instant stateful routes (e.g., phone intake) must bypass batching so the user
+        # doesn't wait for the debounce window before seeing feedback.
+        parsed = parse_update(update)
+        if parsed is not None:
+            if db.scalar(
+                select(TelegramMessages.id).where(TelegramMessages.update_id == parsed.update_id)
+            ) is not None:
+                return JSONResponse({"status": "ok"})
+
+            user = db.scalar(select(User).where(User.telegram_id == parsed.telegram_id))
+            if user is not None and user.state == "COLLECT_PHONE":
+                async_result = handle_telegram_update.delay(update)
+                logger.info(
+                    "telegram_webhook_enqueued_instant_state task_id=%s update_id=%s chat_id=%s state=%s",
+                    getattr(async_result, "id", None),
+                    update_id,
+                    chat_id,
+                    user.state,
+                )
+                return JSONResponse({"status": "ok"})
+
         ingest_update(update=update, session=db, settings=settings)
     except HTTPException:
         raise

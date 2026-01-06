@@ -49,20 +49,14 @@ def test_flush_session_sends_ack_and_enqueues_processing(monkeypatch: pytest.Mon
 
     enqueued: dict[str, object] = {}
 
-    def _fake_ack_delay(*, session_id: str):
-        enqueued["ack_session_id"] = session_id
-        return object()
-
     def _fake_delay(*, session_id: str):
         enqueued["process_session_id"] = session_id
         return object()
 
-    monkeypatch.setattr(worker_tasks.send_session_ack, "delay", _fake_ack_delay)
     monkeypatch.setattr(worker_tasks.process_session, "delay", _fake_delay)
 
     flush_session(session_id=session_id, expected_last_activity_at=expected.isoformat())
 
-    assert enqueued["ack_session_id"] == session_id
     assert enqueued["process_session_id"] == session_id
 
     with Session(engine) as db:

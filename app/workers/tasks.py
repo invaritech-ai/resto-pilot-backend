@@ -121,10 +121,8 @@ def flush_session(*, session_id: str, expected_last_activity_at: str) -> None:
         task_id,
         session_id,
     )
-    ack_countdown = 1.0 + random.random() * 2.0
-    cast(CeleryApplyAsync, send_session_ack).apply_async(
-        kwargs={"session_id": session_id}, countdown=ack_countdown
-    )
+    # Policy: do not send a model-based "receipt ack" at flush time.
+    # Per-message acks (best-effort, ~60%) are handled in ingest_update().
     cast(CeleryDelayable, process_session).delay(session_id=session_id)
 
 
