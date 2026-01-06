@@ -88,10 +88,11 @@ Write down:
 ### Step 1: enable it in configuration
 
 Set `.env`:
-- `APP_ENABLED_CAPABILITIES_CSV=<slug>`
+- `APP_ENABLED_CAPABILITIES_CSV=<slug>` (comma-separated if multiple)
 
-If you want multiple capabilities later (not recommended until v1 is stable):
-- `APP_ENABLED_CAPABILITIES_CSV=inventory,pricing`
+Current slugs in use:
+- `inventory` (existing employee-style intake)
+- `db_engine` (natural language CRUD with strict role/scope allowlist; gated per restaurant)
 
 ### Step 2: teach the pre-LLM capability gate how to recognize it
 
@@ -172,4 +173,3 @@ Supporting prompts:
 
 Hard validation (not a prompt):
 - `app/ai/reply_guard.py`
-

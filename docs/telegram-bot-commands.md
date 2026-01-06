@@ -8,7 +8,9 @@ curl -sS -X POST "https://api.telegram.org/bot$APP_TELEGRAM_BOT_TOKEN/setMyComma
   -d '{"commands":[
     {"command":"start","description":"Start / register"},
     {"command":"respond","description":"Force process current session"},
-    {"command":"done","description":"Finish and process"}
+    {"command":"done","description":"Finish and process"},
+    {"command":"confirm","description":"Confirm pending action"},
+    {"command":"cancel","description":"Cancel pending action"}
   ]}'
 ```
 
@@ -17,4 +19,3 @@ curl -sS -X POST "https://api.telegram.org/bot$APP_TELEGRAM_BOT_TOKEN/setMyComma
 ```bash
 curl -sS "https://api.telegram.org/bot$APP_TELEGRAM_BOT_TOKEN/getMyCommands"
 ```
-

@@ -5,7 +5,7 @@ This doc defines the **target unified message flow** when `telegram_batching_ena
 Goals:
 - Immediate user feedback (best-effort) without waiting for the batching debounce window.
 - A single, consistent routing model that supports:
-  - **instant commands** (`/start`, `/respond`, `/done`, and future standalone `/...` commands),
+- **instant commands** (`/start`, `/respond`, `/done`, `/confirm`, `/cancel`, and future standalone `/...` commands),
   - **instant stateful routes** (multi-step flows like phone intake or DB-write confirmations),
   - **batched sessions** (normal conversational messages).
 - Deterministic database writes (especially for confirmations and CRUD), with LLM used for:
@@ -36,6 +36,7 @@ For each update:
 2) Route to **instant** if any of the following is true:
    - command is in `{/respond, /done}` (force flush),
    - command is `/start` (including `/start <code>` deep-link),
+   - command is `/confirm` or `/cancel` (DB pending action confirmation),
    - command is any other standalone `/...` command we choose to treat as instant,
    - user/chat is in an **instant stateful** mode (e.g., phone intake, pending DB-write confirmation).
 3) If instant: enqueue `handle_telegram_update(update)` and return `200`.
@@ -128,6 +129,7 @@ Legend:
 |---|---|---|---|
 | `command in {"/respond","/done"}` | instant | append to current open session (if any) + seal open→processing + enqueue `process_session` | optional static flush-ack OR skip |
 | `command == "/start"` (includes `/start <code>`) | instant | get/create user; accept invite code (upsert membership); may set user state | respond immediately (no per-message cheap ack) |
+| `command in {"/confirm","/cancel"}` | instant | resolve pending DB action confirmation; deterministic apply/cancel | respond immediately (no per-message cheap ack) |
 | `command is other standalone "/X"` (future) | instant | deterministic command handler; may write DB | respond immediately (no per-message cheap ack) |
 | `user_state in {COLLECT_PHONE, PENDING_CONFIRM_WRITE, ...}` (instant stateful) | instant | deterministic parse/update state and/or apply confirmed write; persist audit | respond immediately (deterministic or LLM-authored prompt as needed) |
 | otherwise (normal message; no command; no stateful pending) | batched | ingest into open session; persist message; schedule flush | per-message cheap ack ~60% right after ingest |
@@ -146,4 +148,3 @@ Legend:
 - The webhook should remain fast because it **enqueues** work to Celery and returns immediately.
 - `/start <code>` for existing users should be supported as an idempotent “add me to restaurant” path (membership upsert).
 - The worker may do a few DB reads/writes (user upsert, invite validation, membership upsert), but this should not affect webhook latency.
-
