@@ -22,7 +22,11 @@ from app.db.models.telegram_messages import TelegramMessages
 from app.db.models.telegram_session import TelegramSessions
 from app.db.models.user import User
 from app.db_engine.write_executor import execute_confirmed_action
+from app.policies.db_allowlist import ROLE_OWNER, ROLE_STAFF
+from app.domain.services.restaurant_service import RestaurantService
 from app.domain.services.db_pending_action_service import DBPendingActionService
+from app.policies.db_policy import normalize_db_action, validate_db_action
+from app.schemas.db_action import parse_db_action
 from app.domain.services.user_service import UserService
 from app.schemas.user import TelegramUserCreate
 from app.telegram.bot_api import send_message
@@ -389,6 +393,34 @@ def handle_update(update: dict, db: Session, settings: Settings) -> None:
 
         if command == "/confirm":
             try:
+                # Re-validate the pending action before executing
+                action, errors = parse_db_action(pending_action.action_json)
+                if action is None:
+                    raise ValueError(f"pending_action_invalid: {errors}")
+
+                # Compute per-restaurant roles
+                rows = RestaurantService(db).list_for_user(user_id=user.id)
+                restaurant_roles = {str(membership.restaurant_id): membership.role for _r, membership in rows}
+                actor_role = ROLE_OWNER if any(role == ROLE_OWNER for role in restaurant_roles.values()) else ROLE_STAFF
+
+                normalized_result = normalize_db_action(
+                    action=action,
+                    actor_user_id=str(user.id),
+                    actor_role=actor_role,
+                    restaurant_roles=restaurant_roles,
+                )
+                if normalized_result.normalized is None:
+                    raise ValueError(f"pending_action_not_allowed: {normalized_result.reasons}")
+
+                validated = validate_db_action(
+                    action=normalized_result.normalized,
+                    actor_user_id=str(user.id),
+                    actor_role=actor_role,
+                    restaurant_roles=restaurant_roles,
+                )
+                if not validated.allowed:
+                    raise ValueError(f"pending_action_not_allowed: {validated.reasons}")
+
                 pending_service.confirm(pending=pending_action, confirmed_at=now)
                 result = execute_confirmed_action(
                     session=db, pending_action=pending_action, now=now
