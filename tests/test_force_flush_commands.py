@@ -222,6 +222,7 @@ def test_non_instant_message_is_ingested_in_batching_mode(monkeypatch: pytest.Mo
             return object()
 
         monkeypatch.setattr(worker_tasks.flush_session, "apply_async", _fake_apply_async)
+        monkeypatch.setattr(worker_tasks.send_message_backchannel, "apply_async", _fake_apply_async)
 
         def _fail_send_message(*args, **kwargs):
             raise AssertionError("send_message should not be called in batching mode")
@@ -277,6 +278,7 @@ def test_caption_command_sets_session_hint_in_batching_mode(monkeypatch: pytest.
             return object()
 
         monkeypatch.setattr(worker_tasks.flush_session, "apply_async", _fake_apply_async)
+        monkeypatch.setattr(worker_tasks.send_message_backchannel, "apply_async", _fake_apply_async)
 
         def _fail_send_message(*args, **kwargs):
             raise AssertionError("send_message should not be called in batching mode")
