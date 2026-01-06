@@ -29,7 +29,7 @@ from app.ai.capability_gate import (
 )
 from app.ai.session_reply import generate_session_reply_with_metrics
 from app.ai.topic_gate import classify_on_topic
-from app.core.config import get_settings
+from app.core.config import Settings, get_settings
 from app.db.models.processing_events import ProcessingEvents
 from app.db.models.telegram_chat_memory import TelegramChatMemory
 from app.db.models.telegram_messages import TelegramMessages
@@ -80,6 +80,85 @@ def _safe_float(value: Any) -> float | None:
     if isinstance(value, (int, float)):
         return float(value)
     return None
+
+
+def _extract_cost_from_usage(data: dict[str, Any]) -> float | None:
+    """
+    Extract cost from LLM response data.
+
+    Args:
+        data: Response data dictionary containing usage information
+
+    Returns:
+        Cost as float, or None if not available
+    """
+    usage_obj = data.get("usage")
+    if not isinstance(usage_obj, dict):
+        return None
+    return _safe_float(usage_obj.get("cost"))
+
+
+def _handle_db_error_and_close_session(
+    *,
+    db: Session,
+    session_uuid: uuid.UUID,
+    db_session: TelegramSessions,
+    chat_id: int,
+    error_msg: str,
+    event_name: str,
+    event_payload: dict[str, Any] | None = None,
+    settings: Settings,
+) -> None:
+    """
+    Handle DB action error: send message, record event, close session.
+
+    Args:
+        db: Database session
+        session_uuid: Session UUID
+        db_session: Telegram session object
+        chat_id: Chat ID for sending message
+        error_msg: Error message to send to user
+        event_name: Processing event name
+        event_payload: Optional payload for the event
+        settings: Application settings
+    """
+    telegram_message_id = send_message(
+        chat_id=chat_id, text=error_msg, settings=settings
+    )
+    record_outgoing_message(
+        db=db,
+        session_id=session_uuid,
+        chat_id=chat_id,
+        kind="reply",
+        text=error_msg,
+        telegram_message_id=telegram_message_id,
+        llm_call_id=None,
+    )
+    db.add(
+        ProcessingEvents(
+            session_id=session_uuid,
+            at=dt.datetime.now(dt.UTC),
+            event=event_name,
+            payload_json=json.dumps(event_payload, ensure_ascii=False)
+            if event_payload
+            else None,
+            error=None,
+        )
+    )
+    final_now = dt.datetime.now(dt.UTC)
+    db_session.status = "closed"
+    if db_session.closed_at is None:
+        db_session.closed_at = final_now
+    db.add(
+        ProcessingEvents(
+            session_id=session_uuid,
+            at=final_now,
+            event="session_processed_v0",
+            payload_json=None,
+            error=None,
+        )
+    )
+    db.commit()
 
 
 def _get_user_role_and_restaurants(
@@ -355,12 +434,7 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
                     provider_name_raw if isinstance(provider_name_raw, str) else None
                 )
 
-                usage_obj = gate_data.get("usage")
-                total_cost_usd = (
-                    _safe_float(usage_obj.get("cost"))
-                    if isinstance(usage_obj, dict)
-                    else None
-                )
+                total_cost_usd = _extract_cost_from_usage(gate_data)
 
                 llm_call_id = record_llm_call(
                     db=db,
@@ -512,8 +586,23 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
                 db.commit()
                 return
 
+            # Get user role and restaurants before DB routing
+            actor_role, restaurant_roles = _get_user_role_and_restaurants(
+                db=db, user_id=user.id
+            )
+
+            # Load chat history for context-aware extraction
+            history_messages = load_chat_history_messages(
+                db=db,
+                chat_id=db_session.chat_id,
+                exclude_session_id=session_uuid,
+                limit=50,
+            )
+
             # DB Intent Classification
-            intent_result = classify_db_intent(messages=messages, settings=settings)
+            intent_result = classify_db_intent(
+                messages=messages, settings=settings, actor_role=actor_role
+            )
             db.add(
                 ProcessingEvents(
                     session_id=session_uuid,
@@ -530,6 +619,58 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
                     error=None,
                 )
             )
+
+            # Handle capability queries
+            if intent_result.is_capability_query:
+                from app.ai.db_schema import get_allowed_tables_for_role
+
+                schema = get_allowed_tables_for_role(role=actor_role)
+
+                # Create a concise summary for the user
+                summary_lines = [f"You have '{actor_role}' role. You can access:\n"]
+                for table_name, table_info in schema.items():
+                    permissions = table_info.get("permissions", {})
+                    if permissions:
+                        crud_ops = list(permissions.keys())
+                        summary_lines.append(f"- {table_name}: {', '.join(crud_ops)}")
+
+                reply_text = "\n".join(summary_lines)
+                telegram_message_id = send_message(
+                    chat_id=db_session.chat_id, text=reply_text, settings=settings
+                )
+                record_outgoing_message(
+                    db=db,
+                    session_id=session_uuid,
+                    chat_id=db_session.chat_id,
+                    kind="reply",
+                    text=reply_text,
+                    telegram_message_id=telegram_message_id,
+                    llm_call_id=None,
+                )
+                final_now = dt.datetime.now(dt.UTC)
+                db.add(
+                    ProcessingEvents(
+                        session_id=session_uuid,
+                        at=final_now,
+                        event="assistant_reply_sent_v0",
+                        payload_json=None,
+                        error=None,
+                    )
+                )
+                db_session.status = "closed"
+                if db_session.closed_at is None:
+                    db_session.closed_at = final_now
+                db.add(
+                    ProcessingEvents(
+                        session_id=session_uuid,
+                        at=final_now,
+                        event="session_processed_v0",
+                        payload_json=None,
+                        error=None,
+                    )
+                )
+                db.commit()
+                return
 
             if intent_result.is_db_action:
                 # Record LLM call for intent classification
@@ -549,12 +690,7 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
                 provider_name = (
                     provider_name_raw if isinstance(provider_name_raw, str) else None
                 )
-                usage_obj = intent_result.data.get("usage")
-                total_cost_usd = (
-                    _safe_float(usage_obj.get("cost"))
-                    if isinstance(usage_obj, dict)
-                    else None
-                )
+                total_cost_usd = _extract_cost_from_usage(intent_result.data)
 
                 record_llm_call(
                     db=db,
@@ -571,12 +707,12 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
                     error=None,
                 )
 
-                # Extract DB action
-                actor_role, restaurant_roles = _get_user_role_and_restaurants(
-                    db=db, user_id=user.id
-                )
+                # Extract DB action with history context
                 action_result = extract_db_action(
-                    messages=messages, settings=settings, actor_role=actor_role
+                    messages=messages,
+                    settings=settings,
+                    actor_role=actor_role,
+                    history_messages=history_messages,
                 )
 
                 db.add(
@@ -620,12 +756,7 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
                 provider_name = (
                     provider_name_raw if isinstance(provider_name_raw, str) else None
                 )
-                usage_obj = action_result.data.get("usage")
-                total_cost_usd = (
-                    _safe_float(usage_obj.get("cost"))
-                    if isinstance(usage_obj, dict)
-                    else None
-                )
+                total_cost_usd = _extract_cost_from_usage(action_result.data)
 
                 record_llm_call(
                     db=db,
@@ -649,43 +780,16 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
                         if action_result.errors
                         else "Please try rephrasing."
                     )
-                    telegram_message_id = send_message(
-                        chat_id=db_session.chat_id, text=error_msg, settings=settings
-                    )
-                    record_outgoing_message(
+                    _handle_db_error_and_close_session(
                         db=db,
-                        session_id=session_uuid,
+                        session_uuid=session_uuid,
+                        db_session=db_session,
                         chat_id=db_session.chat_id,
-                        kind="reply",
-                        text=error_msg,
-                        telegram_message_id=telegram_message_id,
-                        llm_call_id=None,
+                        error_msg=error_msg,
+                        event_name="db_action_validation_failed_v0",
+                        event_payload={"errors": action_result.errors},
+                        settings=settings,
                     )
-                    db.add(
-                        ProcessingEvents(
-                            session_id=session_uuid,
-                            at=dt.datetime.now(dt.UTC),
-                            event="db_action_validation_failed_v0",
-                            payload_json=json.dumps(
-                                {"errors": action_result.errors}, ensure_ascii=False
-                            ),
-                            error=None,
-                        )
-                    )
-                    final_now = dt.datetime.now(dt.UTC)
-                    db_session.status = "closed"
-                    if db_session.closed_at is None:
-                        db_session.closed_at = final_now
-                    db.add(
-                        ProcessingEvents(
-                            session_id=session_uuid,
-                            at=final_now,
-                            event="session_processed_v0",
-                            payload_json=None,
-                            error=None,
-                        )
-                    )
-                    db.commit()
                     return
 
                 # Normalize and validate action (with per-restaurant role checking)
@@ -702,44 +806,16 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
                         if normalized_result.reasons
                         else "Please check your permissions."
                     )
-                    telegram_message_id = send_message(
-                        chat_id=db_session.chat_id, text=error_msg, settings=settings
-                    )
-                    record_outgoing_message(
+                    _handle_db_error_and_close_session(
                         db=db,
-                        session_id=session_uuid,
+                        session_uuid=session_uuid,
+                        db_session=db_session,
                         chat_id=db_session.chat_id,
-                        kind="reply",
-                        text=error_msg,
-                        telegram_message_id=telegram_message_id,
-                        llm_call_id=None,
+                        error_msg=error_msg,
+                        event_name="db_action_validation_failed_v0",
+                        event_payload={"reasons": normalized_result.reasons},
+                        settings=settings,
                     )
-                    db.add(
-                        ProcessingEvents(
-                            session_id=session_uuid,
-                            at=dt.datetime.now(dt.UTC),
-                            event="db_action_validation_failed_v0",
-                            payload_json=json.dumps(
-                                {"reasons": normalized_result.reasons},
-                                ensure_ascii=False,
-                            ),
-                            error=None,
-                        )
-                    )
-                    final_now = dt.datetime.now(dt.UTC)
-                    db_session.status = "closed"
-                    if db_session.closed_at is None:
-                        db_session.closed_at = final_now
-                    db.add(
-                        ProcessingEvents(
-                            session_id=session_uuid,
-                            at=final_now,
-                            event="session_processed_v0",
-                            payload_json=None,
-                            error=None,
-                        )
-                    )
-                    db.commit()
                     return
 
                 normalized_action = normalized_result.normalized
@@ -756,44 +832,16 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
                         if validation_result.reasons
                         else "Please check your permissions."
                     )
-                    telegram_message_id = send_message(
-                        chat_id=db_session.chat_id, text=error_msg, settings=settings
-                    )
-                    record_outgoing_message(
+                    _handle_db_error_and_close_session(
                         db=db,
-                        session_id=session_uuid,
+                        session_uuid=session_uuid,
+                        db_session=db_session,
                         chat_id=db_session.chat_id,
-                        kind="reply",
-                        text=error_msg,
-                        telegram_message_id=telegram_message_id,
-                        llm_call_id=None,
+                        error_msg=error_msg,
+                        event_name="db_action_validation_failed_v0",
+                        event_payload={"reasons": validation_result.reasons},
+                        settings=settings,
                     )
-                    db.add(
-                        ProcessingEvents(
-                            session_id=session_uuid,
-                            at=dt.datetime.now(dt.UTC),
-                            event="db_action_validation_failed_v0",
-                            payload_json=json.dumps(
-                                {"reasons": validation_result.reasons},
-                                ensure_ascii=False,
-                            ),
-                            error=None,
-                        )
-                    )
-                    final_now = dt.datetime.now(dt.UTC)
-                    db_session.status = "closed"
-                    if db_session.closed_at is None:
-                        db_session.closed_at = final_now
-                    db.add(
-                        ProcessingEvents(
-                            session_id=session_uuid,
-                            at=final_now,
-                            event="session_processed_v0",
-                            payload_json=None,
-                            error=None,
-                        )
-                    )
-                    db.commit()
                     return
 
                 # Execute action based on CRUD type
@@ -851,56 +899,42 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
                             },
                         )
                         error_msg = "Failed to read data. Please try again."
-                        telegram_message_id = send_message(
+                        _handle_db_error_and_close_session(
+                            db=db,
+                            session_uuid=session_uuid,
+                            db_session=db_session,
                             chat_id=db_session.chat_id,
-                            text=error_msg,
+                            error_msg=error_msg,
+                            event_name="db_read_execution_failed_v0",
+                            event_payload={"error": str(exc)},
                             settings=settings,
                         )
-                        record_outgoing_message(
-                            db=db,
-                            session_id=session_uuid,
-                            chat_id=db_session.chat_id,
-                            kind="reply",
-                            text=error_msg,
-                            telegram_message_id=telegram_message_id,
-                            llm_call_id=None,
-                        )
-                        db.add(
-                            ProcessingEvents(
-                                session_id=session_uuid,
-                                at=dt.datetime.now(dt.UTC),
-                                event="db_read_execution_failed_v0",
-                                payload_json=None,
-                                error=str(exc),
-                            )
-                        )
-
-                    final_now = dt.datetime.now(dt.UTC)
-                    db.add(
-                        ProcessingEvents(
-                            session_id=session_uuid,
-                            at=final_now,
-                            event="assistant_reply_sent_v0",
-                            payload_json=None,
-                            error=None,
-                        )
-                    )
-                    db_session.status = "closed"
-                    if db_session.closed_at is None:
-                        db_session.closed_at = final_now
-                    db.add(
-                        ProcessingEvents(
-                            session_id=session_uuid,
-                            at=final_now,
-                            event="session_processed_v0",
-                            payload_json=None,
-                            error=None,
-                        )
-                    )
-                    db.commit()
-                    return
+                        return
 
                 elif normalized_action.crud in {"create", "update", "delete"}:
+                    # Check for duplicates before staging (for create operations)
+                    if normalized_action.crud == "create":
+                        from app.db_engine.write_executor import _check_duplicate
+
+                        duplicate_info = _check_duplicate(
+                            session=db,
+                            action=normalized_action,
+                            values=normalized_action.values or {},
+                        )
+                        if duplicate_info:
+                            error_msg = f"Cannot create: {duplicate_info}"
+                            _handle_db_error_and_close_session(
+                                db=db,
+                                session_uuid=session_uuid,
+                                db_session=db_session,
+                                chat_id=db_session.chat_id,
+                                error_msg=error_msg,
+                                event_name="db_duplicate_detected_v0",
+                                event_payload={"duplicate_info": duplicate_info},
+                                settings=settings,
+                            )
+                            return
+
                     # Stage CUD action for confirmation
                     try:
                         pending_row = stage_cud_action(
@@ -943,12 +977,7 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
                             if isinstance(conf_provider_name_raw, str)
                             else None
                         )
-                        conf_usage_obj = conf_data.get("usage")
-                        conf_total_cost_usd = (
-                            _safe_float(conf_usage_obj.get("cost"))
-                            if isinstance(conf_usage_obj, dict)
-                            else None
-                        )
+                        conf_total_cost_usd = _extract_cost_from_usage(conf_data)
 
                         conf_llm_call_id = record_llm_call(
                             db=db,
@@ -1015,54 +1044,17 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
                             },
                         )
                         error_msg = "Failed to prepare that action. Please try again."
-                        telegram_message_id = send_message(
+                        _handle_db_error_and_close_session(
+                            db=db,
+                            session_uuid=session_uuid,
+                            db_session=db_session,
                             chat_id=db_session.chat_id,
-                            text=error_msg,
+                            error_msg=error_msg,
+                            event_name="db_action_staging_failed_v0",
+                            event_payload={"error": str(exc)},
                             settings=settings,
                         )
-                        record_outgoing_message(
-                            db=db,
-                            session_id=session_uuid,
-                            chat_id=db_session.chat_id,
-                            kind="reply",
-                            text=error_msg,
-                            telegram_message_id=telegram_message_id,
-                            llm_call_id=None,
-                        )
-                        db.add(
-                            ProcessingEvents(
-                                session_id=session_uuid,
-                                at=dt.datetime.now(dt.UTC),
-                                event="db_action_staging_failed_v0",
-                                payload_json=None,
-                                error=str(exc),
-                            )
-                        )
-
-                    final_now = dt.datetime.now(dt.UTC)
-                    db.add(
-                        ProcessingEvents(
-                            session_id=session_uuid,
-                            at=final_now,
-                            event="assistant_reply_sent_v0",
-                            payload_json=None,
-                            error=None,
-                        )
-                    )
-                    db_session.status = "closed"
-                    if db_session.closed_at is None:
-                        db_session.closed_at = final_now
-                    db.add(
-                        ProcessingEvents(
-                            session_id=session_uuid,
-                            at=final_now,
-                            event="session_processed_v0",
-                            payload_json=None,
-                            error=None,
-                        )
-                    )
-                    db.commit()
-                    return
+                        return
 
         # Inventory capability gate (runs AFTER db_engine routing)
         capability_ok, capability_reject_text = classify_capability(
@@ -1383,12 +1375,7 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
                 model = (
                     model_raw if isinstance(model_raw, str) else settings.openai_model
                 )
-                usage_obj = sum_data.get("usage")
-                total_cost_usd = (
-                    _safe_float(usage_obj.get("cost"))
-                    if isinstance(usage_obj, dict)
-                    else None
-                )
+                total_cost_usd = _extract_cost_from_usage(sum_data)
                 llm_call_id = record_llm_call(
                     db=db,
                     session_id=session_uuid,

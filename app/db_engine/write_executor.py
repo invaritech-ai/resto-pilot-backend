@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import datetime as dt
+import secrets
+import string
 import uuid
 from typing import Any
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.db.models.invite_codes import InviteCodes
@@ -60,14 +63,29 @@ def execute_confirmed_action(
 
 
 def _execute_create(*, session: Session, action: DBAction) -> dict[str, Any]:
+    values = action.values or {}
+    
+    # Check for duplicates before creating
+    duplicate_info = _check_duplicate(session=session, action=action, values=values)
+    if duplicate_info:
+        raise ValueError(f"duplicate_record: {duplicate_info}")
+    
     if action.table == "restaurant_users":
-        row = RestaurantUser(**(action.values or {}))
+        row = RestaurantUser(**(values))
     elif action.table == "invite_codes":
-        row = InviteCodes(**(action.values or {}))
+        # Auto-generate invite code if not provided
+        if "code" not in values or not values["code"]:
+            values["code"] = _generate_invite_code(session=session, code_length=10)
+        
+        # Set default expires_at to 30 days from now if not provided
+        if "expires_at" not in values or not values["expires_at"]:
+            values["expires_at"] = dt.datetime.now(dt.UTC) + dt.timedelta(days=30)
+        
+        row = InviteCodes(**(values))
     elif action.table == "restaurants":
-        row = Restaurant(**(action.values or {}))
+        row = Restaurant(**(values))
     elif action.table == "users":
-        row = User(**(action.values or {}))
+        row = User(**(values))
     else:
         raise ValueError("unsupported_table")
 
@@ -75,6 +93,94 @@ def _execute_create(*, session: Session, action: DBAction) -> dict[str, Any]:
     session.commit()
     session.refresh(row)
     return {"status": "created", "id": getattr(row, "id")}
+
+
+def _check_duplicate(
+    *, session: Session, action: DBAction, values: dict[str, Any]
+) -> str | None:
+    """
+    Check for existing records that would conflict with the create operation.
+    Returns error message if duplicate found, None otherwise.
+    """
+    if action.table == "restaurants":
+        # Check by restaurant_code (unique constraint)
+        if "restaurant_code" in values:
+            existing = session.scalar(
+                select(Restaurant).where(Restaurant.restaurant_code == values["restaurant_code"])
+            )
+            if existing:
+                return f"Restaurant with code '{values['restaurant_code']}' already exists"
+        
+        # Check by name + owner_user_id (business logic - same owner can't have duplicate names)
+        if "name" in values and "owner_user_id" in values:
+            existing = session.scalar(
+                select(Restaurant).where(
+                    Restaurant.name == values["name"],
+                    Restaurant.owner_user_id == values["owner_user_id"],
+                )
+            )
+            if existing:
+                return f"Restaurant '{values['name']}' already exists for this owner"
+    
+    elif action.table == "restaurant_users":
+        # Check by restaurant_id + user_id (unique constraint)
+        if "restaurant_id" in values and "user_id" in values:
+            existing = session.scalar(
+                select(RestaurantUser).where(
+                    RestaurantUser.restaurant_id == values["restaurant_id"],
+                    RestaurantUser.user_id == values["user_id"],
+                )
+            )
+            if existing:
+                return f"User is already a member of this restaurant"
+    
+    elif action.table == "invite_codes":
+        # Check by code (unique constraint)
+        if "code" in values:
+            existing = session.scalar(
+                select(InviteCodes).where(InviteCodes.code == values["code"])
+            )
+            if existing:
+                return f"Invite code '{values['code']}' already exists"
+    
+    elif action.table == "users":
+        # Check by telegram_id (unique constraint)
+        if "telegram_id" in values:
+            existing = session.scalar(
+                select(User).where(User.telegram_id == values["telegram_id"])
+            )
+            if existing:
+                return f"User with telegram_id '{values['telegram_id']}' already exists"
+    
+    return None
+
+
+def _generate_invite_code(*, session: Session, code_length: int = 10) -> str:
+    """
+    Generate a unique invite code.
+    
+    Args:
+        session: Database session
+        code_length: Length of the code (default 10)
+    
+    Returns:
+        Unique invite code string
+    """
+    if code_length < 8 or code_length > 10:
+        code_length = 10
+    
+    alphabet = string.ascii_uppercase + string.digits
+    for _ in range(20):  # Try up to 20 times
+        code = "".join(secrets.choice(alphabet) for _ in range(code_length))
+        
+        # Check if code already exists
+        existing = session.scalar(
+            select(InviteCodes).where(InviteCodes.code == code)
+        )
+        if existing is None:
+            return code
+    
+    raise RuntimeError("Failed to generate a unique invite code")
 
 
 def _execute_update(*, session: Session, action: DBAction) -> dict[str, Any]:
