@@ -59,7 +59,8 @@ class Settings(BaseSettings):
 
     # Comma-separated enabled capabilities for the main processing bot.
     # db_engine allows natural language database queries with role-based access control.
-    enabled_capabilities_csv: str = "inventory,db_engine"
+    # Note: inventory capability is not yet implemented, only db_engine tables are available.
+    enabled_capabilities_csv: str = "db_engine"
 
     model_config = SettingsConfigDict(env_file=".env", env_prefix="APP_", extra="ignore")
 
