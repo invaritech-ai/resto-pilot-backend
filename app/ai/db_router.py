@@ -141,7 +141,8 @@ def classify_db_intent(
     conf_float = float(confidence) if isinstance(confidence, (int, float)) else None
     reason_str = reason if isinstance(reason, str) else None
 
-    if is_db_action_bool and isinstance(conf_float, float) and conf_float >= 0.7:
+    # Lower threshold to 0.5 to be more permissive - if LLM recognizes DB intent, trust it
+    if is_db_action_bool and isinstance(conf_float, float) and conf_float >= 0.5:
         return DBIntentResult(
             True, reason_str, conf_float, data, headers, latency_ms, False
         )

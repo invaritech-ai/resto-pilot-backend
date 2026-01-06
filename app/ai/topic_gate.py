@@ -4,6 +4,7 @@ import json
 import re
 from typing import Any
 
+from app.ai.capability_gate import is_db_engine_enabled
 from app.ai.model_config import get_gate_model
 from app.ai.openai_client import create_chat_completion_text_allow_empty_with_http_info
 from app.core.config import Settings
@@ -26,7 +27,11 @@ def classify_on_topic(
 
     Returns (on_topic, reason, response_json, response_headers, latency_ms).
     """
-    if hint_command and hint_command.strip() and hint_command not in {"/help", "/start"}:
+    if (
+        hint_command
+        and hint_command.strip()
+        and hint_command not in {"/help", "/start"}
+    ):
         return True, "hint_command", {}, {}, 0
 
     if not messages:
@@ -132,13 +137,15 @@ def classify_on_topic(
     user_prompt_parts.append(f"Current user message:\n{user_text}")
     user_prompt = "\n\n".join(user_prompt_parts)
 
-    text, data, headers, latency_ms = create_chat_completion_text_allow_empty_with_http_info(
-        settings=gate_settings,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0.0,
+    text, data, headers, latency_ms = (
+        create_chat_completion_text_allow_empty_with_http_info(
+            settings=gate_settings,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.0,
+        )
     )
 
     if text is None:
@@ -159,8 +166,19 @@ def classify_on_topic(
     except Exception:
         return True, "unparseable", data, headers, latency_ms
 
-    if verdict == "off_topic" and isinstance(confidence, float) and confidence >= 0.85:
+    # If DB engine is enabled, be more lenient - DB operations are valid even if they seem off-topic
+    # Also be more lenient if there's conversation context (user responding to bot's question)
+    db_engine_enabled = is_db_engine_enabled(settings=settings)
+    has_context = bool(history_messages) or bool(memory_summary)
+
+    # Higher threshold when DB engine is enabled or context exists
+    off_topic_threshold = 0.95 if (db_engine_enabled or has_context) else 0.85
+
+    if (
+        verdict == "off_topic"
+        and isinstance(confidence, float)
+        and confidence >= off_topic_threshold
+    ):
         return False, reason or "off_topic", data, headers, latency_ms
 
     return True, reason or (verdict or "on_topic"), data, headers, latency_ms
-
