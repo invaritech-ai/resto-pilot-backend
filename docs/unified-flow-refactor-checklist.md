@@ -57,7 +57,7 @@ Files:
 
 - [ ] `/start` flow:
   - [x] Registers/updates the user deterministically.
-  - [ ] Accepts `/start <code>` invites (membership upsert) deterministically.
+  - [x] Accepts `/start <code>` invites (membership upsert) deterministically.
   - [x] If phone missing: sets `users.state="COLLECT_PHONE"` and prompts immediately.
 - [ ] Instant stateful (phone intake):
   - [x] When `users.state=="COLLECT_PHONE"`, parse phone deterministically and store it (no verification).
@@ -65,6 +65,7 @@ Files:
   - [x] Immediate user-facing response (no batching delay).
 - [ ] `/respond` + `/done` force flush behavior:
   - [ ] Ensure there is only one “canonical” force-flush implementation path in batching-enabled mode (webhook vs handler), and remove/avoid drift.
+  - [x] Add `/confirm` and `/cancel` as instant commands for DB pending action resolution.
 
 ## 5) Session processing pipeline (session-level only)
 

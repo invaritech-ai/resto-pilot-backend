@@ -53,6 +53,8 @@ Some commands bypass batching:
 - `/done` and `/respond`:
   - Force-flush flow: the webhook seals the latest open session (`open -> processing`) and enqueues `send_session_ack` + `process_session`.
   - If there is **no open session**, the update is still accepted but no work is enqueued.
+- `/confirm` and `/cancel`:
+  - Instant resolution of pending DB actions (deterministic apply/cancel) without waiting for batching.
 
 ## Background tasks (Celery)
 Defined in `app/workers/tasks.py`:
