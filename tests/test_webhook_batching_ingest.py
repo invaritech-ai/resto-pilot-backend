@@ -127,9 +127,7 @@ def test_batching_webhook_persists_messages_and_seals_on_done(
         assert sealed.closed_at is not None
 
         messages = list(
-            db.scalars(
-                select(TelegramMessages).where(TelegramMessages.session_id == session_id)
-            )
+            db.scalars(select(TelegramMessages).where(TelegramMessages.session_id == session_id))
         )
         assert len(messages) == 2
 
@@ -150,3 +148,73 @@ def test_batching_webhook_persists_messages_and_seals_on_done(
         )
         assert len(open_sessions) == 1
         assert open_sessions[0].id != session_id
+
+
+def test_batching_webhook_sets_session_hint_from_caption_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = create_engine(
+        "sqlite+pysqlite:///:memory:",
+        future=True,
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+
+    settings = Settings(
+        telegram_webhook_secret_token="secret",
+        telegram_batching_enabled=True,
+        celery_broker_url="redis://localhost",
+        telegram_bot_token="test-token",
+    )
+
+    def _get_db_override() -> Generator[Session, None, None]:
+        with Session(engine) as session:
+            yield session
+
+    app = create_app(settings=settings)
+    app.dependency_overrides[get_settings_dep] = lambda: settings
+    app.dependency_overrides[get_db_dep] = _get_db_override
+    client = TestClient(app)
+
+    with Session(engine) as db:
+        db.add(User(telegram_id=1, chat_id=10))
+        db.commit()
+
+    from app.workers import tasks as worker_tasks
+
+    monkeypatch.setattr(worker_tasks.flush_session, "apply_async", lambda *a, **k: object())
+    monkeypatch.setattr(worker_tasks.send_message_backchannel, "apply_async", lambda *a, **k: object())
+
+    update = {
+        "update_id": 1,
+        "message": {
+            "message_id": 1,
+            "date": int(dt.datetime(2025, 1, 1, tzinfo=dt.UTC).timestamp()),
+            "chat": {"id": 10},
+            "from": {"id": 1, "first_name": "A"},
+            "caption": "/inventory",
+            "document": {
+                "file_id": "x",
+                "file_unique_id": "ux",
+                "file_name": "a.txt",
+            },
+        },
+    }
+
+    resp = client.post(
+        "/api/v1/telegram",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json=update,
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ok"}
+
+    with Session(engine) as db:
+        session_row = db.scalar(
+            select(TelegramSessions).where(
+                TelegramSessions.chat_id == 10, TelegramSessions.status == "open"
+            )
+        )
+        assert session_row is not None
+        assert session_row.hint_command == "/inventory"
