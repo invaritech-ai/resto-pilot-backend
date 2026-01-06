@@ -365,6 +365,53 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
             )
         )
 
+        # Always log the topic gate LLM call for telemetry
+        gate_llm_call_id = None
+        if gate_data:
+            usage = extract_openrouter_usage(gate_data)
+            generation_id = extract_openrouter_generation_id(
+                headers=gate_headers, data=gate_data
+            )
+            model_raw = gate_data.get("model")
+            model = model_raw if isinstance(model_raw, str) else settings.openai_model
+            upstream_id_raw = gate_data.get("id")
+            upstream_id = upstream_id_raw if isinstance(upstream_id_raw, str) else None
+            provider_name_raw = gate_data.get("provider")
+            provider_name = (
+                provider_name_raw if isinstance(provider_name_raw, str) else None
+            )
+            total_cost_usd = _extract_cost_from_usage(gate_data)
+
+            gate_llm_call_id = record_llm_call(
+                db=db,
+                session_id=session_uuid,
+                chat_id=db_session.chat_id,
+                purpose="gate",
+                model=model,
+                openrouter_generation_id=generation_id,
+                upstream_id=upstream_id,
+                provider_name=provider_name,
+                usage=usage,
+                latency_ms=gate_latency_ms,
+                total_cost_usd=total_cost_usd,
+                error=None,
+            )
+            db.commit()
+
+            if generation_id is not None:
+                try:
+                    schedule_openrouter_cost_backfill(
+                        llm_call_id=gate_llm_call_id, delay_seconds=120
+                    )
+                except Exception:
+                    logger.exception(
+                        "process_session_gate_cost_backfill_schedule_failed",
+                        extra={
+                            "llm_call_id": str(gate_llm_call_id),
+                            "session_id": session_id,
+                        },
+                    )
+
         if not on_topic:
             chat_state = get_or_create_chat_state(db=db, chat_id=db_session.chat_id)
             if chat_state.off_topic_mode:
@@ -412,70 +459,20 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
                 gate_reason,
             )
 
-            llm_call_id = None
-            if gate_data:
-                usage = extract_openrouter_usage(gate_data)
-                generation_id = extract_openrouter_generation_id(
-                    headers=gate_headers, data=gate_data
-                )
-
-                model_raw = gate_data.get("model")
-                model = (
-                    model_raw if isinstance(model_raw, str) else settings.openai_model
-                )
-
-                upstream_id_raw = gate_data.get("id")
-                upstream_id = (
-                    upstream_id_raw if isinstance(upstream_id_raw, str) else None
-                )
-
-                provider_name_raw = gate_data.get("provider")
-                provider_name = (
-                    provider_name_raw if isinstance(provider_name_raw, str) else None
-                )
-
-                total_cost_usd = _extract_cost_from_usage(gate_data)
-
-                llm_call_id = record_llm_call(
-                    db=db,
-                    session_id=session_uuid,
-                    chat_id=db_session.chat_id,
-                    purpose="gate",
-                    model=model,
-                    openrouter_generation_id=generation_id,
-                    upstream_id=upstream_id,
-                    provider_name=provider_name,
-                    usage=usage,
-                    latency_ms=gate_latency_ms,
-                    total_cost_usd=total_cost_usd,
-                    error=None,
-                )
-
             telegram_message_id = send_message(
                 chat_id=db_session.chat_id,
                 text=OFF_TOPIC_REDIRECT_TEXT,
                 settings=settings,
             )
-            if llm_call_id is not None:
-                record_outgoing_message(
-                    db=db,
-                    session_id=session_uuid,
-                    chat_id=db_session.chat_id,
-                    kind="redirect",
-                    text=OFF_TOPIC_REDIRECT_TEXT,
-                    telegram_message_id=telegram_message_id,
-                    llm_call_id=llm_call_id,
-                )
-            else:
-                record_outgoing_message(
-                    db=db,
-                    session_id=session_uuid,
-                    chat_id=db_session.chat_id,
-                    kind="redirect",
-                    text=OFF_TOPIC_REDIRECT_TEXT,
-                    telegram_message_id=telegram_message_id,
-                    llm_call_id=None,
-                )
+            record_outgoing_message(
+                db=db,
+                session_id=session_uuid,
+                chat_id=db_session.chat_id,
+                kind="redirect",
+                text=OFF_TOPIC_REDIRECT_TEXT,
+                telegram_message_id=telegram_message_id,
+                llm_call_id=gate_llm_call_id,
+            )
 
             set_chat_off_topic(db=db, chat_id=db_session.chat_id)
 
@@ -504,20 +501,7 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
                 )
             )
             db.commit()
-
-            if llm_call_id is not None:
-                try:
-                    schedule_openrouter_cost_backfill(
-                        llm_call_id=llm_call_id, delay_seconds=120
-                    )
-                except Exception:
-                    logger.exception(
-                        "process_session_cost_backfill_schedule_failed",
-                        extra={
-                            "llm_call_id": str(llm_call_id),
-                            "session_id": session_id,
-                        },
-                    )
+            # Cost backfill already scheduled above with gate_llm_call_id
             return
 
         chat_state = get_or_create_chat_state(db=db, chat_id=db_session.chat_id)
