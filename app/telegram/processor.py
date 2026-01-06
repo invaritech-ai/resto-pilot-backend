@@ -38,7 +38,6 @@ def _send_message(*, chat_id: int, text: str) -> TelegramResponse:
 
 logger = logging.getLogger(__name__)
 
-COLLECT_PHONE_STATE = "COLLECT_PHONE"
 IDLE_STATE = "IDLE"
 
 
@@ -92,18 +91,18 @@ def process_update(
 
         code = _parse_start_code(text)
         if code is None:
-            if not (isinstance(db_user.phone, str) and db_user.phone.strip()):
-                db_user.state = COLLECT_PHONE_STATE
-                session.add(db_user)
-                session.commit()
-                return _send_message(
-                    chat_id=chat_id,
-                    text=_phone_prompt(full_name=db_user.full_name),
-                ).as_webhook_response()
+            # Always set state to IDLE - phone collection is optional and non-blocking
             if db_user.state != IDLE_STATE:
                 db_user.state = IDLE_STATE
                 session.add(db_user)
                 session.commit()
+            
+            if not (isinstance(db_user.phone, str) and db_user.phone.strip()):
+                # Prompt for phone but don't block - user can provide it later
+                return _send_message(
+                    chat_id=chat_id,
+                    text=_phone_prompt(full_name=db_user.full_name),
+                ).as_webhook_response()
             return _send_message(
                 chat_id=chat_id,
                 text=(
@@ -160,18 +159,19 @@ def process_update(
 
         restaurant_name = restaurant.name if restaurant is not None else "the restaurant"
         joined_text = f"You're now added to {restaurant_name} as {membership.role}."
-        if not (isinstance(db_user.phone, str) and db_user.phone.strip()):
-            db_user.state = COLLECT_PHONE_STATE
-            session.add(db_user)
-            session.commit()
-            return _send_message(
-                chat_id=chat_id,
-                text=joined_text + "\n" + _phone_prompt(full_name=db_user.full_name),
-            ).as_webhook_response()
+        
+        # Always set state to IDLE - phone collection is optional and non-blocking
         if db_user.state != IDLE_STATE:
             db_user.state = IDLE_STATE
             session.add(db_user)
             session.commit()
+        
+        if not (isinstance(db_user.phone, str) and db_user.phone.strip()):
+            # Prompt for phone but don't block - user can provide it later
+            return _send_message(
+                chat_id=chat_id,
+                text=joined_text + "\n" + _phone_prompt(full_name=db_user.full_name),
+            ).as_webhook_response()
         return _send_message(
             chat_id=chat_id,
             text=joined_text,
