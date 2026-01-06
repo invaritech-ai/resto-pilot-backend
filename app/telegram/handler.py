@@ -311,6 +311,20 @@ def handle_update(update: dict, db: Session, settings: Settings) -> None:
 
             return
 
+        if user is None and command != "/start":
+            try:
+                send_message(
+                    chat_id=parsed.chat_id,
+                    text="Welcome! Please send /start to register, then try again.",
+                    settings=settings,
+                )
+            except Exception as exc:
+                logger.exception(
+                    "telegram_unregistered_user_prompt_failed",
+                    extra={"error": repr(exc), "chat_id": parsed.chat_id},
+                )
+            return
+
     if command in FORCE_FLUSH_COMMANDS:
         message = update.get("message") or update.get("edited_message")
         if not isinstance(message, dict):
