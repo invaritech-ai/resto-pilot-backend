@@ -32,10 +32,10 @@ File: `app/telegram/ingest.py`
   - [x] Requires registered user exists; otherwise deterministic behavior is chosen (drop vs route-to-start UX).
   - [ ] Creates/reuses an open `telegram_sessions` row and inserts `telegram_messages`.
   - [ ] Schedules `flush_session` debounce.
-- [ ] Confirm per-message ack behavior:
-  - [ ] Cheap LLM backchannel is attempted after successful message ingest.
-  - [ ] Drop rate ~40% (send ~60%).
-  - [ ] Ensure this is the primary “instant feedback” mechanism for normal messages (not flush-time).
+- [x] Confirm per-message ack behavior:
+  - [x] Cheap LLM backchannel is attempted after successful message ingest.
+  - [x] Drop rate ~40% (send ~60%).
+  - [x] Ensure this is the primary “instant feedback” mechanism for normal messages (not flush-time).
 
 ## 3) Flush (debounce seal + optional static ack)
 
@@ -88,11 +88,11 @@ Files:
 - [ ] Webhook routing tests (batching enabled):
   - [ ] Normal message routes to `ingest_update`.
   - [x] `/start` routes to `handle_telegram_update`.
-  - [ ] `/respond` `/done` force-flush and enqueue `process_session`.
+  - [x] `/respond` `/done` force-flush and enqueue `process_session`.
   - [x] Instant stateful (e.g., `COLLECT_PHONE`) routes to `handle_telegram_update`.
 - [ ] Phone intake end-to-end (batching enabled):
-  - [ ] `/start` sets `COLLECT_PHONE`.
-  - [ ] Next message with phone is handled immediately (no debounce wait) and persists `users.phone`.
+  - [x] `/start` sets `COLLECT_PHONE`.
+  - [x] Next message with phone is handled immediately (no debounce wait) and persists `users.phone`.
 
 ## 7) Follow-on (after flow is stable)
 
