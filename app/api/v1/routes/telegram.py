@@ -121,6 +121,25 @@ async def telegram_webhook(
             )
             return JSONResponse({"status": "ok"})
 
+        if command in {"/confirm", "/cancel"}:
+            parsed = parse_update(update)
+            if parsed is not None:
+                if db.scalar(
+                    select(TelegramMessages.id).where(
+                        TelegramMessages.update_id == parsed.update_id
+                    )
+                ) is not None:
+                    return JSONResponse({"status": "ok"})
+            async_result = cast(CeleryDelayable, handle_telegram_update).delay(update)
+            logger.info(
+                "telegram_webhook_enqueued_confirm_cancel task_id=%s update_id=%s chat_id=%s command=%s",
+                getattr(async_result, "id", None),
+                update_id,
+                chat_id,
+                command,
+            )
+            return JSONResponse({"status": "ok"})
+
         if command in FORCE_FLUSH_COMMANDS:
             parsed = parse_update(update)
             if parsed is None:

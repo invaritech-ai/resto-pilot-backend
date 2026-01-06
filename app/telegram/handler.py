@@ -21,6 +21,8 @@ from app.db.models.processing_events import ProcessingEvents
 from app.db.models.telegram_messages import TelegramMessages
 from app.db.models.telegram_session import TelegramSessions
 from app.db.models.user import User
+from app.db_engine.write_executor import execute_confirmed_action
+from app.domain.services.db_pending_action_service import DBPendingActionService
 from app.domain.services.user_service import UserService
 from app.schemas.user import TelegramUserCreate
 from app.telegram.bot_api import send_message
@@ -40,6 +42,8 @@ INSTANT_COMMANDS: frozenset[str] = frozenset({
     "/start",
     "/respond",
     "/done",
+    "/confirm",
+    "/cancel",
 })
 
 FORCE_FLUSH_COMMANDS: frozenset[str] = frozenset({
@@ -329,6 +333,150 @@ def handle_update(update: dict, db: Session, settings: Settings) -> None:
                     extra={"error": repr(exc), "chat_id": parsed.chat_id},
                 )
             return
+
+    # Handle confirm/cancel commands for pending DB actions
+    if command in {"/confirm", "/cancel"}:
+        parsed = parse_update(update) if isinstance(update, dict) else None
+        if parsed is None:
+            return
+
+        user = db.scalar(select(User).where(User.telegram_id == parsed.telegram_id))
+        if user is None:
+            try:
+                send_message(
+                    chat_id=parsed.chat_id,
+                    text="Please send /start to register first.",
+                    settings=settings,
+                )
+            except Exception as exc:
+                logger.exception(
+                    "telegram_confirm_cancel_unregistered_failed",
+                    extra={"error": repr(exc), "chat_id": parsed.chat_id},
+                )
+            return
+
+        pending_service = DBPendingActionService(db)
+        pending_action = pending_service.get_latest_pending(user_id=user.id)
+        if pending_action is None:
+            try:
+                send_message(
+                    chat_id=parsed.chat_id,
+                    text="No pending action to confirm or cancel.",
+                    settings=settings,
+                )
+            except Exception as exc:
+                logger.exception(
+                    "telegram_confirm_cancel_no_pending_failed",
+                    extra={"error": repr(exc), "chat_id": parsed.chat_id},
+                )
+            return
+
+        now = dt.datetime.now(dt.UTC)
+        if pending_action.expires_at <= now:
+            try:
+                pending_service.cancel(pending=pending_action, cancelled_at=now)
+                send_message(
+                    chat_id=parsed.chat_id,
+                    text="That action has expired. Please start over.",
+                    settings=settings,
+                )
+            except Exception as exc:
+                logger.exception(
+                    "telegram_confirm_cancel_expired_failed",
+                    extra={"error": repr(exc), "chat_id": parsed.chat_id},
+                )
+            return
+
+        if command == "/confirm":
+            try:
+                pending_service.confirm(pending=pending_action, confirmed_at=now)
+                result = execute_confirmed_action(
+                    session=db, pending_action=pending_action, now=now
+                )
+                success_msg = f"Done! {result.get('status', 'Action completed')}."
+                send_message(chat_id=parsed.chat_id, text=success_msg, settings=settings)
+                logger.info(
+                    "telegram_action_confirmed_and_executed update_id=%s chat_id=%s pending_id=%s",
+                    update_id,
+                    parsed.chat_id,
+                    str(pending_action.id),
+                )
+            except ValueError as exc:
+                error_msg = str(exc)
+                if "not_confirmed" in error_msg:
+                    error_msg = "That action couldn't be confirmed. Please try again."
+                elif "expired" in error_msg:
+                    error_msg = "That action has expired. Please start over."
+                else:
+                    error_msg = "Failed to execute that action. Please try again."
+                try:
+                    send_message(chat_id=parsed.chat_id, text=error_msg, settings=settings)
+                except Exception as send_exc:
+                    logger.exception(
+                        "telegram_confirm_error_send_failed",
+                        extra={"error": repr(send_exc), "chat_id": parsed.chat_id},
+                    )
+                logger.exception(
+                    "telegram_action_confirm_failed",
+                    extra={"error": repr(exc), "chat_id": parsed.chat_id, "pending_id": str(pending_action.id)},
+                )
+            except Exception as exc:
+                try:
+                    send_message(
+                        chat_id=parsed.chat_id,
+                        text="Failed to execute that action. Please try again.",
+                        settings=settings,
+                    )
+                except Exception as send_exc:
+                    logger.exception(
+                        "telegram_confirm_error_send_failed",
+                        extra={"error": repr(send_exc), "chat_id": parsed.chat_id},
+                    )
+                logger.exception(
+                    "telegram_action_confirm_failed",
+                    extra={"error": repr(exc), "chat_id": parsed.chat_id, "pending_id": str(pending_action.id)},
+                )
+        elif command == "/cancel":
+            try:
+                pending_service.cancel(pending=pending_action, cancelled_at=now)
+                send_message(
+                    chat_id=parsed.chat_id,
+                    text="Action cancelled.",
+                    settings=settings,
+                )
+                logger.info(
+                    "telegram_action_cancelled update_id=%s chat_id=%s pending_id=%s",
+                    update_id,
+                    parsed.chat_id,
+                    str(pending_action.id),
+                )
+            except Exception as exc:
+                logger.exception(
+                    "telegram_action_cancel_failed",
+                    extra={"error": repr(exc), "chat_id": parsed.chat_id, "pending_id": str(pending_action.id)},
+                )
+                try:
+                    send_message(
+                        chat_id=parsed.chat_id,
+                        text="Failed to cancel that action.",
+                        settings=settings,
+                    )
+                except Exception as send_exc:
+                    logger.exception(
+                        "telegram_cancel_error_send_failed",
+                        extra={"error": repr(send_exc), "chat_id": parsed.chat_id},
+                    )
+
+        try:
+            _persist_update_to_closed_session(update=update, db=db, user=user)
+        except Exception as exc:
+            logger.exception(
+                "telegram_confirm_cancel_persist_failed",
+                extra={"error": repr(exc), "chat_id": parsed.chat_id},
+            )
+            db.rollback()
+
+        return
 
     if command in FORCE_FLUSH_COMMANDS:
         message = update.get("message") or update.get("edited_message")
