@@ -250,6 +250,11 @@ def handle_update(update: dict, db: Session, settings: Settings) -> None:
     Reserved commands (/start, /respond, /done) always bypass batching and are
     processed immediately, even when telegram_batching_enabled=True.
 
+    When batching is enabled, the FastAPI webhook route is the single source
+    of truth for ingesting non-instant messages into sessions. This handler
+    should only be invoked for instant routes (e.g., /start) and instant
+    stateful flows (e.g., phone intake).
+
     The webhook endpoint should always return quickly; any responses to users
     are sent via the Telegram Bot API from background workers.
 
@@ -390,14 +395,12 @@ def handle_update(update: dict, db: Session, settings: Settings) -> None:
             str(session_id) if session_id is not None else None,
         )
 
-    # Instant commands always bypass batching
     if settings.telegram_batching_enabled and not _is_instant_command(update):
-        session_id = ingest_update(update=update, session=db, settings=settings)
-        logger.info(
-            "telegram_batched_message_ingested update_id=%s chat_id=%s session_id=%s",
+        logger.warning(
+            "telegram_batched_message_routed_to_worker update_id=%s chat_id=%s command=%s",
             update_id,
             chat_id,
-            str(session_id) if session_id is not None else None,
+            command,
         )
         return
 

@@ -30,8 +30,8 @@ File: `app/telegram/ingest.py`
 
 - [ ] Confirm ingest behavior:
   - [x] Requires registered user exists; otherwise deterministic behavior is chosen (drop vs route-to-start UX).
-  - [ ] Creates/reuses an open `telegram_sessions` row and inserts `telegram_messages`.
-  - [ ] Schedules `flush_session` debounce.
+  - [x] Creates/reuses an open `telegram_sessions` row and inserts `telegram_messages`.
+  - [x] Schedules `flush_session` debounce.
 - [x] Confirm per-message ack behavior:
   - [x] Cheap LLM backchannel is attempted after successful message ingest.
   - [x] Drop rate ~40% (send ~60%).
@@ -56,13 +56,13 @@ Files:
 - `app/telegram/processor.py` (`process_update`)
 
 - [ ] `/start` flow:
-  - [ ] Registers/updates the user deterministically.
+  - [x] Registers/updates the user deterministically.
   - [ ] Accepts `/start <code>` invites (membership upsert) deterministically.
-  - [ ] If phone missing: sets `users.state="COLLECT_PHONE"` and prompts immediately.
+  - [x] If phone missing: sets `users.state="COLLECT_PHONE"` and prompts immediately.
 - [ ] Instant stateful (phone intake):
-  - [ ] When `users.state=="COLLECT_PHONE"`, parse phone deterministically and store it (no verification).
-  - [ ] Reset `users.state="IDLE"` after storing phone.
-  - [ ] Immediate user-facing response (no batching delay).
+  - [x] When `users.state=="COLLECT_PHONE"`, parse phone deterministically and store it (no verification).
+  - [x] Reset `users.state="IDLE"` after storing phone.
+  - [x] Immediate user-facing response (no batching delay).
 - [ ] `/respond` + `/done` force flush behavior:
   - [ ] Ensure there is only one “canonical” force-flush implementation path in batching-enabled mode (webhook vs handler), and remove/avoid drift.
 
@@ -86,7 +86,7 @@ Files:
 ## 6) Tests (add as you refactor)
 
 - [ ] Webhook routing tests (batching enabled):
-  - [ ] Normal message routes to `ingest_update`.
+  - [x] Normal message routes to `ingest_update`.
   - [x] `/start` routes to `handle_telegram_update`.
   - [x] `/respond` `/done` force-flush and enqueue `process_session`.
   - [x] Instant stateful (e.g., `COLLECT_PHONE`) routes to `handle_telegram_update`.
