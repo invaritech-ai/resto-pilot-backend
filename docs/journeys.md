@@ -13,12 +13,18 @@ This doc defines the **happy-path user journeys** we want to support in v1.
 
 Current architecture:
 
--   The bot uses a general-purpose agent loop with tool-calling (`app/ai/agent.py`)
--   Access control is enforced via role/scope-based policies (`app/policies/db_policy.py`)
+-   The bot uses a general-purpose agent loop with tool-calling (`app/ai/agent.py`, up to 8 rounds)
+-   Database tools are organized in `app/ai/db_tools/` (modular package: profile, restaurants, staff, invites)
+-   Access control uses two-layer system:
+    - Direct checks (`is_restaurant_owner()`, `has_restaurant_access()`) for simple operations
+    - Policy checks (`check_policy_permission()`) for complex tables with centralized management
 -   The bot can handle diverse requests autonomously, using tools to interact with the database
 -   If a user lacks permission for an operation, the agent returns an error explaining the restriction
 
-Reference: `docs/capabilities.md` (deprecated), `docs/resto-pilot-codebase-summary.md` (current)
+Reference: 
+- `docs/capabilities.md` (deprecated)
+- `docs/resto-pilot-codebase-summary.md` (current architecture)
+- `docs/db-tools-patterns.md` (tool architecture, permission patterns, adding new tools)
 
 ## Journey format
 

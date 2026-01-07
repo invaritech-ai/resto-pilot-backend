@@ -23,8 +23,10 @@ The following components were removed:
 The following components were added:
 
 -   `app/ai/agent.py` - general-purpose agent loop with tool-calling
--   `app/ai/db_tools.py` - database tools for the agent
+-   `app/ai/db_tools/` - modular database tools package (profile, restaurants, staff, invites)
 -   `app/ai/tools.py` - base tool infrastructure
+
+See `docs/db-tools-patterns.md` for architecture and patterns.
 
 ## Access Control
 
@@ -34,7 +36,9 @@ Access control is now enforced at the tool level:
 -   **Scope-based**: Operations are scoped to restaurants the user owns/manages
 -   **Policy enforcement**: `app/policies/db_policy.py` validates all database actions before execution
 
-See `app/policies/db_allowlist.py` for the current allowlist configuration.
+See:
+- `app/policies/db_allowlist.py` for the current allowlist configuration
+- `docs/db-tools-patterns.md` for tool architecture, permission patterns, and how to add new tools
 
 ---
 

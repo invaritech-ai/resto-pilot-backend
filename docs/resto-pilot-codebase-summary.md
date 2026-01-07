@@ -70,15 +70,26 @@ Defined in `app/workers/tasks.py`:
   - Runs a general-purpose agent loop (`app/ai/agent.py`) with tool-calling support:
     - Agent can autonomously decide which tools to use (database operations, restaurant lookups, etc.)
     - Each LLM call in the agent loop is recorded individually in `llm_calls` for accurate cost tracking
-    - Tools are defined in `app/ai/db_tools.py` and enforce role/scope-based access controls
+    - Tools are defined in `app/ai/db_tools/` (modular package: profile, restaurants, staff, invites)
+    - Tools enforce role/scope-based access controls via direct checks or policy checks
   - Generates assistant reply and persists telemetry (`llm_calls`) and outbound messages (`telegram_outgoing_messages`).
 
 ## Agent architecture
 The bot uses a general-purpose agent loop (`app/ai/agent.py`) that supports autonomous tool-calling:
-- **Tool-calling loop**: The agent can make multiple LLM calls in a conversation, using tools to interact with the database and services.
-- **Database tools** (`app/ai/db_tools.py`): Tools for listing available tables, reading restaurants, creating/updating restaurants, etc.
-- **Access control**: All database operations enforce role-based and scope-based access controls via `app/policies/db_policy.py`.
+- **Tool-calling loop**: The agent can make multiple LLM calls in a conversation (up to 8 rounds), using tools to interact with the database and services.
+- **Database tools** (`app/ai/db_tools/`): Modular package with tools organized by domain:
+  - `profile.py` - User profile management
+  - `restaurants.py` - Restaurant/outlet operations
+  - `staff.py` - Staff management
+  - `invites.py` - Invite code management
+  - `base.py` - Shared utilities and policy checker
+- **Permission system**: Two-layer approach:
+  - **Direct checks**: Simple permission checks (`is_restaurant_owner()`, `has_restaurant_access()`)
+  - **Policy checks**: Centralized policy management via `check_policy_permission()` for complex tables
+- **Access control**: All database operations enforce role-based and scope-based access controls. Tools can use direct checks or cross-reference with `app/policies/db_allowlist.py`.
 - **Telemetry**: Each LLM call in the agent loop is recorded individually in `llm_calls` with `openrouter_generation_id` for cost attribution and backfill.
+
+See `docs/db-tools-patterns.md` for detailed architecture, patterns, and how to add new tools.
 
 ## Processing timeline (processing_events)
 For a typical session you'll see events like:
