@@ -53,6 +53,11 @@ class Settings(BaseSettings):
     openrouter_http_referer: str = ""
     openrouter_title: str = ""
 
+    # Vision model configuration for file processing
+    vision_model: str = ""  # Model name, e.g., "gpt-4-vision-preview"
+    vision_api_key: str = ""  # Optional, defaults to openai_api_key if empty
+    vision_base_url: str = ""  # Optional, defaults to openai_base_url if empty
+
     # JSON mapping of model -> {input_per_million, output_per_million}
     # Used for local cost estimation from token usage.
     model_prices_json: str = ""
@@ -62,7 +67,9 @@ class Settings(BaseSettings):
     # Note: inventory capability is not yet implemented, only db_engine tables are available.
     enabled_capabilities_csv: str = "db_engine"
 
-    model_config = SettingsConfigDict(env_file=".env", env_prefix="APP_", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=".env", env_prefix="APP_", extra="ignore"
+    )
 
 
 @lru_cache

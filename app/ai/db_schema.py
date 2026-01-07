@@ -6,6 +6,20 @@ from app.db.models.invite_codes import InviteCodes
 from app.db.models.restaurant import Restaurant
 from app.db.models.restaurant_user import RestaurantUser
 from app.db.models.user import User
+from app.db.models.products import Products
+from app.db.models.product_aliases import ProductAliases
+from app.db.models.suppliers import Suppliers
+from app.db.models.supplier_items import SupplierItems
+from app.db.models.supplier_prices import SupplierPrices
+from app.db.models.documents import Documents
+from app.db.models.inventory_locations import InventoryLocations
+from app.db.models.inventory_batches import InventoryBatches
+from app.db.models.invoices import Invoices
+from app.db.models.invoice_line_items import InvoiceLineItems
+from app.db.models.price_comparisons import PriceComparisons
+from app.db.models.inventory_movements import InventoryMovements
+from app.db.models.supplier_disputes import SupplierDisputes
+from app.db.models.file_processing_staging import FileProcessingStaging
 from app.policies.db_allowlist import (
     DB_ALLOWLIST,
     SCOPE_OWNED_RESTAURANT,
@@ -20,6 +34,20 @@ _TABLE_MODELS = {
     "restaurants": Restaurant,
     "restaurant_users": RestaurantUser,
     "invite_codes": InviteCodes,
+    "products": Products,
+    "product_aliases": ProductAliases,
+    "suppliers": Suppliers,
+    "supplier_items": SupplierItems,
+    "supplier_prices": SupplierPrices,
+    "documents": Documents,
+    "inventory_locations": InventoryLocations,
+    "inventory_batches": InventoryBatches,
+    "invoices": Invoices,
+    "invoice_line_items": InvoiceLineItems,
+    "price_comparisons": PriceComparisons,
+    "inventory_movements": InventoryMovements,
+    "supplier_disputes": SupplierDisputes,
+    "file_processing_staging": FileProcessingStaging,
 }
 
 
