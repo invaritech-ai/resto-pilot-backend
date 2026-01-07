@@ -16,7 +16,9 @@ from app.db.models.user import User
 from app.workers.tasks import process_session
 
 
-def test_process_session_generates_and_sends_reply(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_process_session_generates_and_sends_reply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     engine = create_engine(
         "sqlite+pysqlite://",
         future=True,
@@ -114,6 +116,7 @@ def test_process_session_generates_and_sends_reply(monkeypatch: pytest.MonkeyPat
     from app.ai.agent import AgentResult
 
     import uuid as _uuid
+
     fake_llm_call_id = _uuid.uuid4()
 
     def _fake_run_agent_loop(**_kwargs):
@@ -132,6 +135,7 @@ def test_process_session_generates_and_sends_reply(monkeypatch: pytest.MonkeyPat
             },
             tool_calls_made=[],
             llm_call_ids=[fake_llm_call_id],
+            final_llm_call_id=fake_llm_call_id,
         )
 
     def _fake_send_message(*, chat_id: int, text: str, settings: Settings) -> int:
@@ -155,7 +159,9 @@ def test_process_session_generates_and_sends_reply(monkeypatch: pytest.MonkeyPat
     assert isinstance(called["text"], str)
 
     with Session(engine) as db:
-        sealed = db.scalar(select(TelegramSessions).where(TelegramSessions.id == session_row.id))
+        sealed = db.scalar(
+            select(TelegramSessions).where(TelegramSessions.id == session_row.id)
+        )
         assert sealed is not None
         assert sealed.status == "closed"
 

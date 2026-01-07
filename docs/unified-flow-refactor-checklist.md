@@ -1,5 +1,7 @@
 # Unified flow refactor checklist (batching enabled)
 
+**Note**: This checklist references some outdated components. The capability gating system has been replaced with a general-purpose agent with tool-calling. See `docs/capabilities.md` for migration notes.
+
 Use this as a step-by-step checklist to align the code with `docs/unified-message-flow.md`, updating **one function at a time**.
 
 ## 0) Decisions (do first)
@@ -72,15 +74,14 @@ Files:
 Files:
 - `app/processing/session_processor.py`
 - `app/ai/topic_gate.py`
-- `app/ai/capability_gate.py`
-- `app/ai/session_reply.py`
-- `app/ai/reply_guard.py`
+- `app/ai/agent.py` (general-purpose agent with tool-calling)
+- `app/ai/db_tools.py` (database tools)
 
-- [ ] Keep `process_session` focused on session-level processing:
-  - [ ] Topic gate (cheap model) → redirect/ghost if off-topic.
-  - [ ] Capability gate → reject/ghost if unsupported.
-  - [ ] Generate reply (main model) + reply guard enforcement.
-  - [ ] Persist outgoing message and update chat memory summary.
+- [x] Keep `process_session` focused on session-level processing:
+  - [x] Topic gate (cheap model) → redirect/ghost if off-topic.
+  - [x] Run general-purpose agent loop with tool-calling support.
+  - [x] Persist outgoing message and update chat memory summary.
+  - [x] Record each LLM call individually in `llm_calls` for cost tracking.
 - [ ] Name hint support (optional):
   - [ ] Confirm the prompt only uses first name sparingly and doesn’t force name usage in every reply.
 
@@ -97,6 +98,8 @@ Files:
 
 ## 7) Follow-on (after flow is stable)
 
-- [ ] Add CRUD routing layer (cheap model) that only emits allowlisted table/column operations.
-- [ ] Add deterministic confirmation + deterministic DB write path for CUD operations.
-- [ ] Add capability slug(s) (e.g., `user_updates`) and wire them into `app/ai/capability_gate.py`.
+- [x] General-purpose agent with tool-calling implemented (`app/ai/agent.py`).
+- [x] Database tools with role/scope-based access control (`app/ai/db_tools.py`).
+- [x] All LLM calls recorded individually for cost tracking.
+- [ ] Add more database tools as needed (e.g., supplier management, inventory operations).
+- [ ] Add deterministic confirmation + deterministic DB write path for CUD operations (if needed).
