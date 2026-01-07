@@ -159,13 +159,15 @@ def create_db_tools(
         return json.dumps(matches, indent=2)
 
     def create_restaurant(args: dict[str, Any]) -> str:
-        """Create a new restaurant."""
+        """Create a new restaurant. Users with no restaurants can create their first one."""
         name = args.get("name", "").strip()
         if not name:
             return "Error: name is required"
 
-        if actor_role != ROLE_OWNER:
-            return "Error: Only owners can create restaurants."
+        # Allow users with no restaurants to create their first one
+        # They will automatically become owner when the restaurant is created
+        if actor_role != ROLE_OWNER and restaurant_roles:
+            return "Error: Only restaurant owners can create additional restaurants. If you're a staff member, ask your restaurant owner to create it."
 
         # Check if restaurant with this name already exists
         service = RestaurantService(db)
