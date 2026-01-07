@@ -11,6 +11,9 @@ ROLE_STAFF: Final[str] = "staff"
 SCOPE_SELF: Final[str] = "self"
 SCOPE_OWNED_RESTAURANT: Final[str] = "owned_restaurant"
 SCOPE_RESTAURANT_OWNER: Final[str] = "restaurant_owner"
+SCOPE_RESTAURANT_MEMBER: Final[str] = (
+    "restaurant_member"  # For staff viewing staff in restaurants they're members of
+)
 
 # Tables that are never exposed via the DB engine.
 BUSINESS_TABLES_DENYLIST: Final[set[str]] = {
@@ -99,7 +102,13 @@ DB_ALLOWLIST: Final[dict[str, dict[str, dict[str, dict[str, object]]]]] = {
                 "scope": SCOPE_RESTAURANT_OWNER,
             },
             "create": {
-                "columns": ["code", "restaurant_id", "role", "expires_at", "created_by"],
+                "columns": [
+                    "code",
+                    "restaurant_id",
+                    "role",
+                    "expires_at",
+                    "created_by",
+                ],
                 "scope": SCOPE_RESTAURANT_OWNER,
             },
             "update": {
@@ -121,6 +130,18 @@ DB_ALLOWLIST: Final[dict[str, dict[str, dict[str, dict[str, object]]]]] = {
             "update": {
                 "columns": ["full_name", "username", "phone"],
                 "scope": SCOPE_SELF,
+            },
+        },
+        "restaurant_users": {
+            "read": {
+                "columns": [
+                    "restaurant_id",
+                    "user_id",
+                    "role",
+                    "status",
+                    "joined_at",
+                ],
+                "scope": SCOPE_RESTAURANT_MEMBER,
             },
         },
     },
