@@ -19,28 +19,82 @@ from app.schemas.db_action import DBAction
 logger = logging.getLogger(__name__)
 
 
-def _format_capabilities(actor_role: str) -> str:
-    """Format capabilities as a readable string."""
-    schema = get_allowed_tables_for_role(role=actor_role)
-    lines = [f"You have '{actor_role}' role. Available operations:"]
-    for table_name, table_info in schema.items():
-        permissions = table_info.get("permissions", {})
-        if permissions:
-            crud_ops = list(permissions.keys())
-            lines.append(f"- {table_name}: {', '.join(crud_ops)}")
-    return "\n".join(lines)
+def _format_capabilities(
+    actor_role: str, restaurant_roles: dict[str, str] | None = None
+) -> str:
+    """
+    Format capabilities as a readable string.
+
+    If restaurant_roles is provided, shows union of capabilities across all restaurants.
+    Otherwise shows capabilities for the highest role only.
+    """
+    # Get capabilities for all roles the user has
+    roles_seen = {actor_role}
+    if restaurant_roles:
+        roles_seen.update(restaurant_roles.values())
+
+    # Build union of capabilities across all roles
+    all_capabilities: dict[str, set[str]] = {}  # table_name -> set of operations
+
+    for role in roles_seen:
+        schema = get_allowed_tables_for_role(role=role)
+        for table_name, table_info in schema.items():
+            permissions = table_info.get("permissions", {})
+            if permissions:
+                if table_name not in all_capabilities:
+                    all_capabilities[table_name] = set()
+                all_capabilities[table_name].update(permissions.keys())
+
+    # Build user-friendly descriptions
+    table_descriptions = {
+        "users": "view and update user profiles",
+        "restaurants": "view and update restaurant/outlet information",
+        "restaurant_users": "manage restaurant memberships and staff",
+        "invite_codes": "view and manage invite codes",
+    }
+
+    capabilities = []
+    for table_name, crud_ops in sorted(all_capabilities.items()):
+        desc = table_descriptions.get(table_name, f"access {table_name} data")
+        crud_list = sorted(crud_ops)
+
+        if "read" in crud_list and "update" in crud_list:
+            capabilities.append(f"- {desc}")
+        elif "read" in crud_list:
+            capabilities.append(
+                f"- view {desc.replace('view ', '').replace('manage ', '').replace('access ', '')}"
+            )
+        elif "create" in crud_list:
+            capabilities.append(
+                f"- create {desc.replace('view and ', '').replace('manage ', '').replace('access ', '')}"
+            )
+
+    if not capabilities:
+        return (
+            f"You have '{actor_role}' role, but no specific capabilities are available."
+        )
+
+    # Show role context if user has multiple roles
+    role_context = actor_role
+    if restaurant_roles and len(set(restaurant_roles.values())) > 1:
+        unique_roles = sorted(set(restaurant_roles.values()))
+        role_context = f"{actor_role} (varies by restaurant: {', '.join(unique_roles)})"
+
+    return f"You have '{role_context}' role. You can:\n" + "\n".join(capabilities)
 
 
 def _format_restaurants(restaurants: list[tuple]) -> str:
     """Format restaurant list as JSON."""
     result = []
     for restaurant, membership in restaurants:
-        result.append({
-            "id": str(restaurant.id),
-            "name": restaurant.name,
-            "restaurant_code": restaurant.restaurant_code,
-            "role": membership.role,
-        })
+        result.append(
+            {
+                "id": str(restaurant.id),
+                "name": restaurant.name,
+                "restaurant_code": restaurant.restaurant_code,
+                "role": membership.role,
+            }
+        )
     return json.dumps(result, indent=2) if result else "No restaurants found."
 
 
@@ -66,7 +120,7 @@ def create_db_tools(
 
     def get_my_capabilities(args: dict[str, Any]) -> str:
         """List all tables and CRUD operations available to the user."""
-        return _format_capabilities(actor_role)
+        return _format_capabilities(actor_role, restaurant_roles)
 
     def list_my_restaurants(args: dict[str, Any]) -> str:
         """List all restaurants the user has access to."""
@@ -87,13 +141,18 @@ def create_db_tools(
         matches = []
         name_lower = name.lower()
         for restaurant, membership in rows:
-            if name_lower in restaurant.name.lower() or restaurant.name.lower() in name_lower:
-                matches.append({
-                    "id": str(restaurant.id),
-                    "name": restaurant.name,
-                    "restaurant_code": restaurant.restaurant_code,
-                    "role": membership.role,
-                })
+            if (
+                name_lower in restaurant.name.lower()
+                or restaurant.name.lower() in name_lower
+            ):
+                matches.append(
+                    {
+                        "id": str(restaurant.id),
+                        "name": restaurant.name,
+                        "restaurant_code": restaurant.restaurant_code,
+                        "role": membership.role,
+                    }
+                )
 
         if not matches:
             return f"No restaurant found matching '{name}'. Use create_restaurant to create a new one."
@@ -120,12 +179,14 @@ def create_db_tools(
                 owner_user_id=user_id,
                 name=name,
             )
-            return json.dumps({
-                "status": "created",
-                "id": str(restaurant.id),
-                "name": restaurant.name,
-                "restaurant_code": restaurant.restaurant_code,
-            })
+            return json.dumps(
+                {
+                    "status": "created",
+                    "id": str(restaurant.id),
+                    "name": restaurant.name,
+                    "restaurant_code": restaurant.restaurant_code,
+                }
+            )
         except Exception as e:
             logger.exception("create_restaurant_failed", extra={"name": name})
             return f"Error creating restaurant: {str(e)}"
@@ -179,7 +240,9 @@ def create_db_tools(
             return f"Error: {', '.join(validation_result.reasons)}"
 
         try:
-            results = execute_read_action(session=db, action=normalized_result.normalized)
+            results = execute_read_action(
+                session=db, action=normalized_result.normalized
+            )
             if not results:
                 return "No records found."
             # Convert UUIDs and datetimes to strings for JSON serialization
@@ -252,14 +315,18 @@ def create_db_tools(
                 session_id=None,  # Will be set by caller if needed
             )
             db.commit()
-            return json.dumps({
-                "status": "staged",
-                "pending_action_id": str(pending.id),
-                "message": "Action staged. User must reply /confirm to proceed or /cancel to abort.",
-            })
+            return json.dumps(
+                {
+                    "status": "staged",
+                    "pending_action_id": str(pending.id),
+                    "message": "Action staged. User must reply /confirm to proceed or /cancel to abort.",
+                }
+            )
         except Exception as e:
             db.rollback()
-            logger.exception("stage_write_action_failed", extra={"crud": crud, "table": table})
+            logger.exception(
+                "stage_write_action_failed", extra={"crud": crud, "table": table}
+            )
             return f"Error staging action: {str(e)}"
 
     # Build and return tools dictionary
@@ -325,7 +392,12 @@ def create_db_tools(
                     "table": {
                         "type": "string",
                         "description": "Table name: users, restaurants, restaurant_users, or invite_codes.",
-                        "enum": ["users", "restaurants", "restaurant_users", "invite_codes"],
+                        "enum": [
+                            "users",
+                            "restaurants",
+                            "restaurant_users",
+                            "invite_codes",
+                        ],
                     },
                     "columns": {
                         "type": "array",
@@ -356,7 +428,12 @@ def create_db_tools(
                     "table": {
                         "type": "string",
                         "description": "Table name: users, restaurants, restaurant_users, or invite_codes.",
-                        "enum": ["users", "restaurants", "restaurant_users", "invite_codes"],
+                        "enum": [
+                            "users",
+                            "restaurants",
+                            "restaurant_users",
+                            "invite_codes",
+                        ],
                     },
                     "values": {
                         "type": "object",
@@ -373,4 +450,3 @@ def create_db_tools(
             handler=stage_write_action,
         ),
     }
-
