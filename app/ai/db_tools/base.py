@@ -31,8 +31,6 @@ from app.policies.db_allowlist import (
     SCOPE_RESTAURANT_OWNER,
 )
 
-from . import invites, profile, restaurants, staff
-
 
 def format_date(dt_value: dt.datetime | None) -> str | None:
     """Format a datetime as a readable date string (e.g., 'Jan 7, 2026')."""
@@ -155,7 +153,9 @@ def create_db_tools(
     Tools can use check_policy_permission() to cross-reference with the policy allowlist
     for centralized permission management, especially useful for complex tables.
     """
-    # Import tool factories from each module
+    # Import tool factories from each module (inside function to avoid circular imports)
+    from . import invites, profile, restaurants, staff
+
     # Pass actor_role and restaurant_roles so tools can use policy checks if needed
     profile_tools = profile.create_profile_tools(
         db=db, user_id=user_id, actor_role=actor_role, restaurant_roles=restaurant_roles
