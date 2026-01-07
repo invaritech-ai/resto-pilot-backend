@@ -47,8 +47,9 @@ BEHAVIOR:
 
 PERMISSIONS:
 - Permission checks are enforced by tools/policies, not by you.
-- Only restaurant owners can: update restaurant details, manage staff, create/view invites.
-- Staff members can view restaurant info and their profile.
+- Only restaurant owners can: update restaurant details, manage staff (revoke access), create/view/delete invites.
+- Staff members can: view restaurant info, view staff members (list staff), and manage their own profile.
+- Staff members cannot: update restaurant details, revoke staff access, or manage invites.
 - Do not preemptively deny requests - let tools/policies return errors if permissions are insufficient.
 
 OUTPUT FORMAT:
