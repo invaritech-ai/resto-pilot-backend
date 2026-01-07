@@ -108,45 +108,44 @@ def test_process_session_generates_and_sends_reply(monkeypatch: pytest.MonkeyPat
         "classify_on_topic",
         lambda **_kwargs: (True, "test", {}, {}, 0),
     )
-    monkeypatch.setattr(
-        session_processor,
-        "classify_capability",
-        lambda **_kwargs: (True, ""),
-    )
 
-    called: dict[str, object] = {"generated": 0, "sent": 0}
+    called: dict[str, object] = {"agent_called": 0, "sent": 0}
 
-    class _Reply:
-        text = "Hello! I can help with invoices, inventory, and questions."
-        model = "gpt-5-mini"
+    from app.ai.agent import AgentResult
 
-    def _fake_generate_session_reply_with_metrics(*, messages, hint_command, settings, **_kwargs):
-        called["generated"] = int(called["generated"]) + 1
-        return _Reply(), {
-            "call_count": 1,
-            "latency_ms_total": 0,
-            "prompt_tokens_total": 0,
-            "completion_tokens_total": 0,
-            "total_tokens_total": 0,
-            "cost_usd_total": 0.0,
-            "openrouter_generation_ids": [],
-        }
+    def _fake_run_agent_loop(**_kwargs):
+        called["agent_called"] = int(called["agent_called"]) + 1
+        return AgentResult(
+            text="Hello! I can help with restaurant operations.",
+            model="gpt-5-mini",
+            metrics={
+                "call_count": 1,
+                "latency_ms_total": 0,
+                "prompt_tokens_total": 0,
+                "completion_tokens_total": 0,
+                "total_tokens_total": 0,
+                "cost_usd_total": 0.0,
+                "openrouter_generation_ids": [],
+            },
+            tool_calls_made=[],
+        )
 
-    def _fake_send_message(*, chat_id: int, text: str, settings: Settings) -> None:
+    def _fake_send_message(*, chat_id: int, text: str, settings: Settings) -> int:
         called["sent"] = int(called["sent"]) + 1
         called["chat_id"] = chat_id
         called["text"] = text
+        return 12345  # Return a fake telegram_message_id
 
     monkeypatch.setattr(
         session_processor,
-        "generate_session_reply_with_metrics",
-        _fake_generate_session_reply_with_metrics,
+        "run_agent_loop",
+        _fake_run_agent_loop,
     )
     monkeypatch.setattr(session_processor, "send_message", _fake_send_message)
 
     process_session(session_id=session_id)
 
-    assert called["generated"] == 1
+    assert called["agent_called"] == 1
     assert called["sent"] == 1
     assert called["chat_id"] == 10
     assert isinstance(called["text"], str)
@@ -170,5 +169,5 @@ def test_process_session_generates_and_sends_reply(monkeypatch: pytest.MonkeyPat
 
     # Second run should no-op (reply already sent).
     process_session(session_id=session_id)
-    assert called["generated"] == 1
+    assert called["agent_called"] == 1
     assert called["sent"] == 1

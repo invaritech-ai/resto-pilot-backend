@@ -89,19 +89,14 @@ def test_process_session_schedules_retry_on_openai_error(
         "classify_on_topic",
         lambda **_kwargs: (True, "test", {}, {}, 0),
     )
-    monkeypatch.setattr(
-        session_processor,
-        "classify_capability",
-        lambda **_kwargs: (True, ""),
-    )
 
-    def _fail_generate_session_reply_with_metrics(*, messages, hint_command, settings, **_kwargs):
+    def _fail_run_agent_loop(**_kwargs):
         raise OpenAIError("transient")
 
     monkeypatch.setattr(
         session_processor,
-        "generate_session_reply_with_metrics",
-        _fail_generate_session_reply_with_metrics,
+        "run_agent_loop",
+        _fail_run_agent_loop,
     )
 
     scheduled: dict[str, object] = {}

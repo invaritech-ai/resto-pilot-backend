@@ -4,7 +4,6 @@ import json
 import re
 from typing import Any
 
-from app.ai.capability_gate import is_db_engine_enabled
 from app.ai.model_config import get_gate_model
 from app.ai.openai_client import create_chat_completion_text_allow_empty_with_http_info
 from app.core.config import Settings
@@ -80,6 +79,16 @@ def classify_on_topic(
         "cogs",
         "wastage",
         "waste",
+        "user",
+        "invite",
+        "code",
+        "staff",
+        "owner",
+        "what can you do",
+        "help",
+        "capabilities",
+        "hi",
+        "hello",
     )
     if any(k in normalized for k in on_topic_keywords):
         return True, "keyword", {}, {}, 0
@@ -113,16 +122,24 @@ def classify_on_topic(
 
     system_prompt = (
         "You are a strict topic classifier for a restaurant/outlet operations assistant.\n"
+        "This assistant helps with:\n"
+        "- Restaurant/outlet operations and management\n"
+        "- Database queries and management (users, restaurants, invite codes)\n"
+        "- General questions about capabilities\n"
+        "- Any business-related queries\n"
+        "\n"
         "Classify the user's message as:\n"
-        "- on_topic: clearly about restaurant/outlet operations OR responding to bot's question\n"
+        "- on_topic: clearly about restaurant/business operations OR responding to bot's question\n"
         "- off_topic: clearly unrelated AND not a response to any bot question\n"
         "- unsure: ambiguous\n"
         "\n"
         "CRITICAL RULES:\n"
         "1. If the bot asked a question and the user is responding to it, that's ON TOPIC.\n"
         "2. Phone numbers, names, confirmations given in response to bot questions are ON TOPIC.\n"
-        "3. Be conservative. If unsure, choose 'unsure'.\n"
-        "4. Consider the conversation context when classifying.\n"
+        "3. Questions about capabilities or 'what can you do' are ON TOPIC.\n"
+        "4. Greetings like 'hi' or 'hello' are ON TOPIC.\n"
+        "5. Be conservative. If unsure, choose 'unsure'.\n"
+        "6. Consider the conversation context when classifying.\n"
         "\n"
         "Output ONLY valid JSON in this exact schema:\n"
         '{"verdict":"on_topic|off_topic|unsure","confidence":0.0,"reason":"short"}\n'
@@ -166,13 +183,11 @@ def classify_on_topic(
     except Exception:
         return True, "unparseable", data, headers, latency_ms
 
-    # If DB engine is enabled, be more lenient - DB operations are valid even if they seem off-topic
-    # Also be more lenient if there's conversation context (user responding to bot's question)
-    db_engine_enabled = is_db_engine_enabled(settings=settings)
+    # Be lenient - especially if there's conversation context (user responding to bot's question)
     has_context = bool(history_messages) or bool(memory_summary)
 
-    # Higher threshold when DB engine is enabled or context exists
-    off_topic_threshold = 0.95 if (db_engine_enabled or has_context) else 0.85
+    # Higher threshold when context exists - we want to be conservative about rejecting
+    off_topic_threshold = 0.95 if has_context else 0.90
 
     if (
         verdict == "off_topic"
