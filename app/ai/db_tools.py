@@ -9,8 +9,10 @@ from sqlalchemy.orm import Session
 
 from app.ai.db_schema import get_allowed_tables_for_role
 from app.ai.tools import Tool
+from app.core.config import get_settings
 from app.db_engine.read_executor import execute_read_action
 from app.db_engine.write_executor import stage_cud_action
+from app.domain.services.invite_service import InviteCodeService
 from app.domain.services.restaurant_service import RestaurantService
 from app.policies.db_allowlist import ROLE_OWNER, SCOPE_OWNED_RESTAURANT
 from app.policies.db_policy import normalize_db_action, validate_db_action
@@ -254,6 +256,28 @@ def create_db_tools(
                         row[k] = str(v)
                     elif hasattr(v, "isoformat"):
                         row[k] = v.isoformat()
+            # Format results naturally - don't return raw JSON
+            if len(results) == 1:
+                result = results[0]
+                # For user profile reads, format naturally
+                if table == "users":
+                    parts = []
+                    if "full_name" in result and result["full_name"]:
+                        parts.append(f"Name: {result['full_name']}")
+                    if "phone" in result:
+                        if result["phone"]:
+                            parts.append(f"Phone: {result['phone']}")
+                        else:
+                            parts.append("Phone: Not set")
+                    if "username" in result and result["username"]:
+                        parts.append(f"Username: {result['username']}")
+                    if not parts:
+                        return (
+                            "Your profile is mostly empty. You can update it if needed."
+                        )
+                    return "\n".join(parts)
+
+            # For other tables or multiple results, return structured but readable format
             return json.dumps(results, indent=2)
         except Exception as e:
             logger.exception("read_records_failed", extra={"table": table})
@@ -331,6 +355,101 @@ def create_db_tools(
             )
             return f"Error staging action: {str(e)}"
 
+    def create_invite_code(args: dict[str, Any]) -> str:
+        """Create an invite code/link for adding staff to your restaurant."""
+        restaurant_id_str = args.get("restaurant_id", "").strip()
+        target_role = args.get("role", "staff").strip().lower()
+        expires_in_days = args.get("expires_in_days", 30)
+
+        if not restaurant_id_str:
+            return "Error: restaurant_id is required"
+
+        try:
+            restaurant_id = uuid.UUID(restaurant_id_str)
+        except ValueError:
+            return "Error: invalid restaurant_id format"
+
+        if target_role not in {"owner", "staff"}:
+            return "Error: role must be 'owner' or 'staff'"
+
+        # Check if user is owner of this restaurant
+        if restaurant_id_str not in restaurant_roles:
+            return f"Error: You don't have access to restaurant {restaurant_id_str}"
+        if restaurant_roles[restaurant_id_str] != ROLE_OWNER:
+            return "Error: Only restaurant owners can create invite codes"
+
+        try:
+            settings = get_settings()
+            expires_at = None
+            if expires_in_days:
+                import datetime as dt
+
+                expires_at = dt.datetime.now(dt.UTC) + dt.timedelta(
+                    days=int(expires_in_days)
+                )
+
+            # Check if user is superuser (simplified - would need telegram_id lookup in practice)
+            created_by_is_superuser = False
+            invite = InviteCodeService(db).create_invite_code(
+                restaurant_id=restaurant_id,
+                target_role=target_role,
+                created_by_user_id=user_id,
+                created_by_is_superuser=created_by_is_superuser,
+                expires_at=expires_at,
+            )
+
+            deep_link = InviteCodeService.deep_link(
+                bot_username=settings.telegram_bot_username, code=invite.code
+            )
+
+            return json.dumps(
+                {
+                    "status": "created",
+                    "code": invite.code,
+                    "role": invite.role,
+                    "deep_link": deep_link,
+                    "expires_at": invite.expires_at.isoformat()
+                    if invite.expires_at
+                    else None,
+                    "message": f"Invite code created! Share this link: {deep_link}",
+                },
+                indent=2,
+            )
+        except Exception as e:
+            logger.exception(
+                "create_invite_code_failed", extra={"restaurant_id": restaurant_id_str}
+            )
+            return f"Error creating invite code: {str(e)}"
+
+    def revoke_staff_access(args: dict[str, Any]) -> str:
+        """Revoke a user's access to your restaurant (remove them from staff)."""
+        restaurant_id_str = args.get("restaurant_id", "").strip()
+        user_id_str = args.get("user_id", "").strip()
+
+        if not restaurant_id_str:
+            return "Error: restaurant_id is required"
+        if not user_id_str:
+            return "Error: user_id is required"
+
+        # Check if user is owner of this restaurant
+        if restaurant_id_str not in restaurant_roles:
+            return f"Error: You don't have access to restaurant {restaurant_id_str}"
+        if restaurant_roles[restaurant_id_str] != ROLE_OWNER:
+            return "Error: Only restaurant owners can revoke access"
+
+        # Use stage_write_action to update restaurant_users status to "removed"
+        return stage_write_action(
+            {
+                "crud": "update",
+                "table": "restaurant_users",
+                "values": {"status": "removed"},
+                "filters": {
+                    "by_restaurant_id": restaurant_id_str,
+                    "by_user_id": user_id_str,
+                },
+            }
+        )
+
     # Build and return tools dictionary
     return {
         "get_my_capabilities": Tool(
@@ -371,7 +490,7 @@ def create_db_tools(
         ),
         "create_restaurant": Tool(
             name="create_restaurant",
-            description="Create a new restaurant/outlet. Only owners can create restaurants.",
+            description="Create a new restaurant/outlet. Users with no restaurants can create their first one. Owners can create additional restaurants.",
             parameters={
                 "type": "object",
                 "properties": {
@@ -418,7 +537,7 @@ def create_db_tools(
         ),
         "stage_write_action": Tool(
             name="stage_write_action",
-            description="Stage a create/update/delete action for user confirmation. The user must reply /confirm or /cancel.",
+            description="Stage a create/update/delete action for user confirmation. Use for general database operations. For invite codes, prefer create_invite_code. For removing staff, prefer revoke_staff_access. The user must reply /confirm or /cancel.",
             parameters={
                 "type": "object",
                 "properties": {
