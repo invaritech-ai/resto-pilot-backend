@@ -84,23 +84,23 @@ Worker task: `flush_session(session_id, expected_last_activity_at)`:
 
 Important: flush ack is not required and should not replace per-message feedback.
 
-### E) Session processing pipeline (where routing LLM lives)
+### E) Session processing pipeline (general-purpose agent with tool-calling)
 
 Worker task: `process_session(session_id)` runs the main pipeline:
 1) Load session messages + attachments + history context.
 2) Convert attachments to text (future work):
    - files -> text (OCR/parse)
    - audio -> text (ASR)
-3) Cheap routing LLM (gate model) returns strict JSON:
-   - on-topic/off-topic,
-   - whether the user is attempting **CRUD against DB tables**,
-   - which allowlisted table/operation/fields apply.
-4) Enforce:
-   - off-topic redirect + ghosting (if applicable),
-   - capability gating (must include user updates / DB CRUD paths as enabled capabilities).
-5) Execute deterministically:
-   - **Read**: query DB and present results (LLM can phrase the final response using deterministic results).
-   - **Write**: propose change + ask for confirmation; only apply write on explicit confirmation in an **instant stateful** path.
+3) Cheap topic gate (gate model) returns strict JSON:
+   - on-topic/off-topic classification
+   - If off-topic: send redirect, set ghosting mode, exit
+4) Run general-purpose agent loop (`app/ai/agent.py`):
+   - Agent has access to tools (database operations, restaurant lookups, etc.)
+   - Agent autonomously decides which tools to call based on user request
+   - Multi-round conversations: agent can make multiple LLM calls, using tools between rounds
+   - Each LLM call is recorded individually in `llm_calls` for cost tracking
+   - Tools enforce role/scope-based access controls (`app/policies/db_policy.py`)
+5) Generate final response from agent result and send to user.
 
 ---
 

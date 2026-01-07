@@ -67,13 +67,26 @@ Defined in `app/workers/tasks.py`:
 - `process_session(session_id)`:
   - Loads all messages for the session from the DB.
   - Runs a cheap on-topic gate: if off-topic, sends one redirect then ghosts until on-topic again.
-  - Generates a single assistant reply and persists telemetry (`llm_calls`) and outbound messages (`telegram_outgoing_messages`).
+  - Runs a general-purpose agent loop (`app/ai/agent.py`) with tool-calling support:
+    - Agent can autonomously decide which tools to use (database operations, restaurant lookups, etc.)
+    - Each LLM call in the agent loop is recorded individually in `llm_calls` for accurate cost tracking
+    - Tools are defined in `app/ai/db_tools.py` and enforce role/scope-based access controls
+  - Generates assistant reply and persists telemetry (`llm_calls`) and outbound messages (`telegram_outgoing_messages`).
+
+## Agent architecture
+The bot uses a general-purpose agent loop (`app/ai/agent.py`) that supports autonomous tool-calling:
+- **Tool-calling loop**: The agent can make multiple LLM calls in a conversation, using tools to interact with the database and services.
+- **Database tools** (`app/ai/db_tools.py`): Tools for listing available tables, reading restaurants, creating/updating restaurants, etc.
+- **Access control**: All database operations enforce role-based and scope-based access controls via `app/policies/db_policy.py`.
+- **Telemetry**: Each LLM call in the agent loop is recorded individually in `llm_calls` with `openrouter_generation_id` for cost attribution and backfill.
 
 ## Processing timeline (processing_events)
-For a typical session you’ll see events like:
+For a typical session you'll see events like:
 - `ingested_update` (one per message/update ingested)
 - `session_flushed` (auto flush) or `session_sealed_by_command` (force flush)
 - `router_plan_v0`
+- `assistant_reply_generated_v0` (includes tool calls made)
+- `assistant_reply_sent_v0`
 - `session_processed_v0`
 
 ## REST API endpoints
