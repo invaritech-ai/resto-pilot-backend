@@ -1,147 +1,179 @@
+"""
+Intent-based database tools for the AI agent.
+
+Each tool maps directly to a user action and handles its own permission checks.
+No complex policy layers - just clear, focused operations.
+"""
+
 from __future__ import annotations
 
+import datetime as dt
 import json
 import logging
 import uuid
 from typing import Any
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.ai.db_schema import get_allowed_tables_for_role
 from app.ai.tools import Tool
 from app.core.config import get_settings
-from app.db_engine.read_executor import execute_read_action
-from app.db_engine.write_executor import stage_cud_action
+from app.db.models.invite_codes import InviteCodes
+from app.db.models.restaurant import Restaurant
+from app.db.models.restaurant_user import RestaurantUser
+from app.db.models.user import User
 from app.domain.services.invite_service import InviteCodeService
 from app.domain.services.restaurant_service import RestaurantService
-from app.policies.db_allowlist import ROLE_OWNER, SCOPE_OWNED_RESTAURANT
-from app.policies.db_policy import normalize_db_action, validate_db_action
-from app.schemas.db_action import DBAction
 
 logger = logging.getLogger(__name__)
 
 
-def _format_capabilities(
-    actor_role: str, restaurant_roles: dict[str, str] | None = None
-) -> str:
-    """
-    Format capabilities as a readable string.
-
-    If restaurant_roles is provided, shows union of capabilities across all restaurants.
-    Otherwise shows capabilities for the highest role only.
-    """
-    # Get capabilities for all roles the user has
-    roles_seen = {actor_role}
-    if restaurant_roles:
-        roles_seen.update(restaurant_roles.values())
-
-    # Build union of capabilities across all roles
-    all_capabilities: dict[str, set[str]] = {}  # table_name -> set of operations
-
-    for role in roles_seen:
-        schema = get_allowed_tables_for_role(role=role)
-        for table_name, table_info in schema.items():
-            permissions = table_info.get("permissions", {})
-            if permissions:
-                if table_name not in all_capabilities:
-                    all_capabilities[table_name] = set()
-                all_capabilities[table_name].update(permissions.keys())
-
-    # Build user-friendly descriptions
-    table_descriptions = {
-        "users": "view and update user profiles",
-        "restaurants": "view and update restaurant/outlet information",
-        "restaurant_users": "manage restaurant memberships and staff",
-        "invite_codes": "view and manage invite codes",
-    }
-
-    capabilities = []
-    for table_name, crud_ops in sorted(all_capabilities.items()):
-        desc = table_descriptions.get(table_name, f"access {table_name} data")
-        crud_list = sorted(crud_ops)
-
-        if "read" in crud_list and "update" in crud_list:
-            capabilities.append(f"- {desc}")
-        elif "read" in crud_list:
-            capabilities.append(
-                f"- view {desc.replace('view ', '').replace('manage ', '').replace('access ', '')}"
-            )
-        elif "create" in crud_list:
-            capabilities.append(
-                f"- create {desc.replace('view and ', '').replace('manage ', '').replace('access ', '')}"
-            )
-
-    if not capabilities:
-        return (
-            f"You have '{actor_role}' role, but no specific capabilities are available."
+def _is_restaurant_owner(
+    db: Session, user_id: uuid.UUID, restaurant_id: uuid.UUID
+) -> bool:
+    """Check if user is owner of a specific restaurant."""
+    membership = db.scalar(
+        select(RestaurantUser).where(
+            RestaurantUser.restaurant_id == restaurant_id,
+            RestaurantUser.user_id == user_id,
+            RestaurantUser.role == "owner",
+            RestaurantUser.status == "active",
         )
-
-    # Show role context if user has multiple roles
-    role_context = actor_role
-    if restaurant_roles and len(set(restaurant_roles.values())) > 1:
-        unique_roles = sorted(set(restaurant_roles.values()))
-        role_context = f"{actor_role} (varies by restaurant: {', '.join(unique_roles)})"
-
-    return f"You have '{role_context}' role. You can:\n" + "\n".join(capabilities)
+    )
+    return membership is not None
 
 
-def _format_restaurants(restaurants: list[tuple]) -> str:
-    """Format restaurant list as JSON."""
-    result = []
-    for restaurant, membership in restaurants:
-        result.append(
-            {
-                "id": str(restaurant.id),
-                "name": restaurant.name,
-                "restaurant_code": restaurant.restaurant_code,
-                "role": membership.role,
-            }
+def _has_restaurant_access(
+    db: Session, user_id: uuid.UUID, restaurant_id: uuid.UUID
+) -> bool:
+    """Check if user has any access to a restaurant."""
+    membership = db.scalar(
+        select(RestaurantUser).where(
+            RestaurantUser.restaurant_id == restaurant_id,
+            RestaurantUser.user_id == user_id,
+            RestaurantUser.status != "removed",
         )
-    return json.dumps(result, indent=2) if result else "No restaurants found."
+    )
+    return membership is not None
 
 
 def create_db_tools(
     *,
     db: Session,
     user_id: uuid.UUID,
-    actor_role: str,
-    restaurant_roles: dict[str, str],
+    actor_role: str,  # kept for compatibility, but not used for blocking
+    restaurant_roles: dict[str, str],  # kept for compatibility
 ) -> dict[str, Tool]:
     """
-    Create DB tools with user context injected via closures.
+    Create intent-based database tools with user context.
 
-    Args:
-        db: Database session
-        user_id: Current user's ID
-        actor_role: User's highest role (owner or staff)
-        restaurant_roles: Map of restaurant_id -> role for per-restaurant checks
-
-    Returns:
-        Dictionary of tool name -> Tool
+    Each tool is named after user intent, not database operations.
+    Permission checks happen inside each tool.
     """
 
-    def get_my_capabilities(args: dict[str, Any]) -> str:
-        """List all tables and CRUD operations available to the user."""
-        return _format_capabilities(actor_role, restaurant_roles)
+    # =========================================================================
+    # PROFILE TOOLS
+    # =========================================================================
+
+    def get_my_profile(args: dict[str, Any]) -> str:
+        """Get the current user's profile information."""
+        user = db.get(User, user_id)
+        if not user:
+            return "Error: User not found."
+
+        parts = []
+        if user.full_name:
+            parts.append(f"Name: {user.full_name}")
+        else:
+            parts.append("Name: Not set")
+
+        if user.phone:
+            verified = " (verified)" if user.is_phone_verified else " (not verified)"
+            parts.append(f"Phone: {user.phone}{verified}")
+        else:
+            parts.append("Phone: Not set")
+
+        if user.username:
+            parts.append(f"Username: @{user.username}")
+
+        return "\n".join(parts) if parts else "Your profile is empty."
+
+    def update_my_profile(args: dict[str, Any]) -> str:
+        """Update the current user's profile fields."""
+        user = db.get(User, user_id)
+        if not user:
+            return "Error: User not found."
+
+        full_name = args.get("full_name")
+        phone = args.get("phone")
+        username = args.get("username")
+
+        if full_name is None and phone is None and username is None:
+            return "Error: Provide at least one field to update (full_name, phone, or username)."
+
+        updates = []
+        if full_name is not None:
+            user.full_name = full_name.strip() if full_name else None
+            updates.append(f"Name: {user.full_name or 'cleared'}")
+
+        if phone is not None:
+            user.phone = phone.strip() if phone else None
+            user.is_phone_verified = False  # Reset verification on phone change
+            updates.append(f"Phone: {user.phone or 'cleared'}")
+
+        if username is not None:
+            user.username = username.strip().lstrip("@") if username else None
+            updates.append(
+                f"Username: @{user.username}" if user.username else "Username: cleared"
+            )
+
+        try:
+            db.commit()
+            return "Profile updated:\n" + "\n".join(updates)
+        except Exception as e:
+            db.rollback()
+            logger.exception("update_my_profile_failed")
+            return f"Error updating profile: {str(e)}"
+
+    # =========================================================================
+    # RESTAURANT TOOLS
+    # =========================================================================
 
     def list_my_restaurants(args: dict[str, Any]) -> str:
-        """List all restaurants the user has access to."""
+        """List all restaurants the user owns or has access to."""
         service = RestaurantService(db)
         rows = service.list_for_user(user_id=user_id)
-        return _format_restaurants(rows)
+
+        if not rows:
+            return "You don't have any restaurants yet. Use create_restaurant to create one."
+
+        result = []
+        for restaurant, membership in rows:
+            result.append(
+                {
+                    "id": str(restaurant.id),
+                    "name": restaurant.name,
+                    "code": restaurant.restaurant_code,
+                    "your_role": membership.role,
+                }
+            )
+
+        return json.dumps(result, indent=2)
 
     def find_restaurant_by_name(args: dict[str, Any]) -> str:
-        """Search for a restaurant by name."""
+        """Search for a restaurant by name among user's restaurants."""
         name = args.get("name", "").strip()
         if not name:
-            return "Error: name is required"
+            return "Error: name is required."
 
         service = RestaurantService(db)
         rows = service.list_for_user(user_id=user_id)
 
-        # Fuzzy match on name
-        matches = []
+        if not rows:
+            return f"You don't have any restaurants. Create one with create_restaurant."
+
         name_lower = name.lower()
+        matches = []
         for restaurant, membership in rows:
             if (
                 name_lower in restaurant.name.lower()
@@ -151,32 +183,34 @@ def create_db_tools(
                     {
                         "id": str(restaurant.id),
                         "name": restaurant.name,
-                        "restaurant_code": restaurant.restaurant_code,
-                        "role": membership.role,
+                        "code": restaurant.restaurant_code,
+                        "your_role": membership.role,
                     }
                 )
 
         if not matches:
-            return f"No restaurant found matching '{name}'. Use create_restaurant to create a new one."
+            return f"No restaurant found matching '{name}'. Use list_my_restaurants to see all your restaurants."
+
         return json.dumps(matches, indent=2)
 
     def create_restaurant(args: dict[str, Any]) -> str:
-        """Create a new restaurant. Users with no restaurants can create their first one."""
+        """Create a new restaurant. Any user can create restaurants."""
         name = args.get("name", "").strip()
         if not name:
-            return "Error: name is required"
+            return "Error: name is required."
 
-        # Allow users with no restaurants to create their first one
-        # They will automatically become owner when the restaurant is created
-        if actor_role != ROLE_OWNER and restaurant_roles:
-            return "Error: Only restaurant owners can create additional restaurants. If you're a staff member, ask your restaurant owner to create it."
+        if len(name) < 2:
+            return "Error: Restaurant name must be at least 2 characters."
 
-        # Check if restaurant with this name already exists
+        if len(name) > 100:
+            return "Error: Restaurant name must be under 100 characters."
+
+        # Check for duplicate names (case-insensitive)
         service = RestaurantService(db)
         rows = service.list_for_user(user_id=user_id)
         for restaurant, _ in rows:
             if name.lower() == restaurant.name.lower():
-                return f"Restaurant '{restaurant.name}' already exists (ID: {restaurant.id})."
+                return f"You already have a restaurant named '{restaurant.name}' (ID: {restaurant.id})."
 
         try:
             restaurant = service.create_restaurant(
@@ -188,218 +222,231 @@ def create_db_tools(
                     "status": "created",
                     "id": str(restaurant.id),
                     "name": restaurant.name,
-                    "restaurant_code": restaurant.restaurant_code,
-                }
+                    "code": restaurant.restaurant_code,
+                    "message": f"Restaurant '{restaurant.name}' created! You are the owner.",
+                },
+                indent=2,
             )
         except Exception as e:
             logger.exception("create_restaurant_failed", extra={"name": name})
             return f"Error creating restaurant: {str(e)}"
 
-    def read_records(args: dict[str, Any]) -> str:
-        """Read records from a table with policy enforcement."""
-        table = args.get("table", "").strip()
-        columns = args.get("columns", [])
-        restaurant_id = args.get("restaurant_id")
-
-        if not table:
-            return "Error: table is required"
-        if not columns:
-            return "Error: columns is required (list of column names to read)"
-
-        # Build filters based on scope
-        filters: dict[str, Any] = {}
-        if restaurant_id:
-            filters["by_restaurant_id"] = restaurant_id
-
-        action = DBAction(
-            action_id=str(uuid.uuid4()),
-            intent=f"Read {table}",
-            crud="read",
-            table=table,
-            role=actor_role,
-            scope=SCOPE_OWNED_RESTAURANT,
-            columns=columns,
-            filters=filters if filters else None,
-        )
-
-        # Normalize and validate
-        normalized_result = normalize_db_action(
-            action=action,
-            actor_user_id=str(user_id),
-            actor_role=actor_role,
-            restaurant_roles=restaurant_roles,
-        )
-
-        if normalized_result.normalized is None:
-            return f"Error: {', '.join(normalized_result.reasons)}"
-
-        validation_result = validate_db_action(
-            action=normalized_result.normalized,
-            actor_user_id=str(user_id),
-            actor_role=actor_role,
-            restaurant_roles=restaurant_roles,
-        )
-
-        if not validation_result.allowed:
-            return f"Error: {', '.join(validation_result.reasons)}"
+    def get_restaurant(args: dict[str, Any]) -> str:
+        """Get details of a specific restaurant."""
+        restaurant_id_str = args.get("restaurant_id", "").strip()
+        if not restaurant_id_str:
+            return "Error: restaurant_id is required."
 
         try:
-            results = execute_read_action(
-                session=db, action=normalized_result.normalized
+            restaurant_id = uuid.UUID(restaurant_id_str)
+        except ValueError:
+            return "Error: Invalid restaurant_id format."
+
+        if not _has_restaurant_access(db, user_id, restaurant_id):
+            return "Error: You don't have access to this restaurant."
+
+        restaurant = db.get(Restaurant, restaurant_id)
+        if not restaurant:
+            return "Error: Restaurant not found."
+
+        membership = db.scalar(
+            select(RestaurantUser).where(
+                RestaurantUser.restaurant_id == restaurant_id,
+                RestaurantUser.user_id == user_id,
+                RestaurantUser.status != "removed",
             )
-            if not results:
-                return "No records found."
-            # Convert UUIDs and datetimes to strings for JSON serialization
-            for row in results:
-                for k, v in row.items():
-                    if isinstance(v, uuid.UUID):
-                        row[k] = str(v)
-                    elif hasattr(v, "isoformat"):
-                        row[k] = v.isoformat()
-            # Format results naturally - don't return raw JSON
-            if len(results) == 1:
-                result = results[0]
-                # For user profile reads, format naturally
-                if table == "users":
-                    parts = []
-                    if "full_name" in result and result["full_name"]:
-                        parts.append(f"Name: {result['full_name']}")
-                    if "phone" in result:
-                        if result["phone"]:
-                            parts.append(f"Phone: {result['phone']}")
-                        else:
-                            parts.append("Phone: Not set")
-                    if "username" in result and result["username"]:
-                        parts.append(f"Username: {result['username']}")
-                    if not parts:
-                        return (
-                            "Your profile is mostly empty. You can update it if needed."
-                        )
-                    return "\n".join(parts)
-
-            # For other tables or multiple results, return structured but readable format
-            return json.dumps(results, indent=2)
-        except Exception as e:
-            logger.exception("read_records_failed", extra={"table": table})
-            return f"Error reading records: {str(e)}"
-
-    def stage_write_action(args: dict[str, Any]) -> str:
-        """Stage a create/update/delete action for user confirmation."""
-        crud = args.get("crud", "").strip()
-        table = args.get("table", "").strip()
-        values = args.get("values", {})
-        filters = args.get("filters", {})
-
-        if not crud or crud not in {"create", "update", "delete"}:
-            return "Error: crud must be one of: create, update, delete"
-        if not table:
-            return "Error: table is required"
-        if crud in {"create", "update"} and not values:
-            return "Error: values is required for create/update"
-        if crud in {"update", "delete"} and not filters:
-            return "Error: filters is required for update/delete"
-
-        action = DBAction(
-            action_id=str(uuid.uuid4()),
-            intent=f"{crud} {table}",
-            crud=crud,
-            table=table,
-            role=actor_role,
-            scope=SCOPE_OWNED_RESTAURANT,
-            values=values if values else None,
-            filters=filters if filters else None,
-            needs_confirmation=True,
         )
 
-        # Normalize and validate
-        normalized_result = normalize_db_action(
-            action=action,
-            actor_user_id=str(user_id),
-            actor_role=actor_role,
-            restaurant_roles=restaurant_roles,
+        return json.dumps(
+            {
+                "id": str(restaurant.id),
+                "name": restaurant.name,
+                "code": restaurant.restaurant_code,
+                "your_role": membership.role if membership else "none",
+                "created_at": restaurant.created_at.isoformat()
+                if restaurant.created_at
+                else None,
+            },
+            indent=2,
         )
 
-        if normalized_result.normalized is None:
-            return f"Error: {', '.join(normalized_result.reasons)}"
-
-        validation_result = validate_db_action(
-            action=normalized_result.normalized,
-            actor_user_id=str(user_id),
-            actor_role=actor_role,
-            restaurant_roles=restaurant_roles,
-        )
-
-        if not validation_result.allowed:
-            return f"Error: {', '.join(validation_result.reasons)}"
+    def update_restaurant(args: dict[str, Any]) -> str:
+        """Update restaurant details. Only owners can update."""
+        restaurant_id_str = args.get("restaurant_id", "").strip()
+        if not restaurant_id_str:
+            return "Error: restaurant_id is required."
 
         try:
-            pending = stage_cud_action(
-                session=db,
-                user_id=user_id,
-                action=normalized_result.normalized,
-                chat_id=None,  # Will be set by caller if needed
-                session_id=None,  # Will be set by caller if needed
-            )
+            restaurant_id = uuid.UUID(restaurant_id_str)
+        except ValueError:
+            return "Error: Invalid restaurant_id format."
+
+        if not _is_restaurant_owner(db, user_id, restaurant_id):
+            return "Error: Only restaurant owners can update restaurant details."
+
+        restaurant = db.get(Restaurant, restaurant_id)
+        if not restaurant:
+            return "Error: Restaurant not found."
+
+        name = args.get("name")
+        if name is None:
+            return "Error: Provide a field to update (name)."
+
+        updates = []
+        if name is not None:
+            name = name.strip()
+            if len(name) < 2:
+                return "Error: Restaurant name must be at least 2 characters."
+            if len(name) > 100:
+                return "Error: Restaurant name must be under 100 characters."
+            restaurant.name = name
+            updates.append(f"Name: {name}")
+
+        try:
             db.commit()
-            return json.dumps(
-                {
-                    "status": "staged",
-                    "pending_action_id": str(pending.id),
-                    "message": "Action staged. User must reply /confirm to proceed or /cancel to abort.",
-                }
-            )
+            return "Restaurant updated:\n" + "\n".join(updates)
         except Exception as e:
             db.rollback()
-            logger.exception(
-                "stage_write_action_failed", extra={"crud": crud, "table": table}
+            logger.exception("update_restaurant_failed")
+            return f"Error updating restaurant: {str(e)}"
+
+    # =========================================================================
+    # STAFF MANAGEMENT TOOLS
+    # =========================================================================
+
+    def list_staff(args: dict[str, Any]) -> str:
+        """List all staff members of a restaurant."""
+        restaurant_id_str = args.get("restaurant_id", "").strip()
+        if not restaurant_id_str:
+            return "Error: restaurant_id is required."
+
+        try:
+            restaurant_id = uuid.UUID(restaurant_id_str)
+        except ValueError:
+            return "Error: Invalid restaurant_id format."
+
+        if not _has_restaurant_access(db, user_id, restaurant_id):
+            return "Error: You don't have access to this restaurant."
+
+        service = RestaurantService(db)
+        members = service.list_members(restaurant_id=restaurant_id)
+
+        if not members:
+            return "No staff members found."
+
+        result = []
+        for user_obj, membership in members:
+            result.append(
+                {
+                    "user_id": str(user_obj.id),
+                    "name": user_obj.full_name or "Unknown",
+                    "username": f"@{user_obj.username}" if user_obj.username else None,
+                    "role": membership.role,
+                    "status": membership.status,
+                    "joined_at": membership.joined_at.isoformat()
+                    if membership.joined_at
+                    else None,
+                }
             )
-            return f"Error staging action: {str(e)}"
+
+        return json.dumps(result, indent=2)
+
+    def revoke_staff_access(args: dict[str, Any]) -> str:
+        """Remove a user from restaurant staff. Only owners can do this."""
+        restaurant_id_str = args.get("restaurant_id", "").strip()
+        target_user_id_str = args.get("user_id", "").strip()
+
+        if not restaurant_id_str:
+            return "Error: restaurant_id is required."
+        if not target_user_id_str:
+            return "Error: user_id is required."
+
+        try:
+            restaurant_id = uuid.UUID(restaurant_id_str)
+        except ValueError:
+            return "Error: Invalid restaurant_id format."
+
+        try:
+            target_user_id = uuid.UUID(target_user_id_str)
+        except ValueError:
+            return "Error: Invalid user_id format."
+
+        if not _is_restaurant_owner(db, user_id, restaurant_id):
+            return "Error: Only restaurant owners can revoke staff access."
+
+        if target_user_id == user_id:
+            return "Error: You cannot remove yourself. Transfer ownership first or delete the restaurant."
+
+        membership = db.scalar(
+            select(RestaurantUser).where(
+                RestaurantUser.restaurant_id == restaurant_id,
+                RestaurantUser.user_id == target_user_id,
+                RestaurantUser.status != "removed",
+            )
+        )
+
+        if not membership:
+            return "Error: User is not a member of this restaurant."
+
+        try:
+            membership.status = "removed"
+            db.commit()
+
+            target_user = db.get(User, target_user_id)
+            name = target_user.full_name if target_user else "User"
+            return f"Access revoked for {name}."
+        except Exception as e:
+            db.rollback()
+            logger.exception("revoke_staff_access_failed")
+            return f"Error revoking access: {str(e)}"
+
+    # =========================================================================
+    # INVITE CODE TOOLS
+    # =========================================================================
 
     def create_invite_code(args: dict[str, Any]) -> str:
-        """Create an invite code/link for adding staff to your restaurant."""
+        """Create an invite code/link for adding staff to a restaurant. Only owners can create invites."""
         restaurant_id_str = args.get("restaurant_id", "").strip()
         target_role = args.get("role", "staff").strip().lower()
         expires_in_days = args.get("expires_in_days", 30)
 
         if not restaurant_id_str:
-            return "Error: restaurant_id is required"
+            return "Error: restaurant_id is required."
 
         try:
             restaurant_id = uuid.UUID(restaurant_id_str)
         except ValueError:
-            return "Error: invalid restaurant_id format"
+            return "Error: Invalid restaurant_id format."
 
         if target_role not in {"owner", "staff"}:
-            return "Error: role must be 'owner' or 'staff'"
+            return "Error: role must be 'owner' or 'staff'."
 
-        # Check if user is owner of this restaurant
-        if restaurant_id_str not in restaurant_roles:
-            return f"Error: You don't have access to restaurant {restaurant_id_str}"
-        if restaurant_roles[restaurant_id_str] != ROLE_OWNER:
-            return "Error: Only restaurant owners can create invite codes"
+        if not _is_restaurant_owner(db, user_id, restaurant_id):
+            return "Error: Only restaurant owners can create invite codes."
+
+        restaurant = db.get(Restaurant, restaurant_id)
+        if not restaurant:
+            return "Error: Restaurant not found."
 
         try:
             settings = get_settings()
             expires_at = None
             if expires_in_days:
-                import datetime as dt
-
                 expires_at = dt.datetime.now(dt.UTC) + dt.timedelta(
                     days=int(expires_in_days)
                 )
 
-            # Check if user is superuser (simplified - would need telegram_id lookup in practice)
-            created_by_is_superuser = False
             invite = InviteCodeService(db).create_invite_code(
                 restaurant_id=restaurant_id,
                 target_role=target_role,
                 created_by_user_id=user_id,
-                created_by_is_superuser=created_by_is_superuser,
+                created_by_is_superuser=False,
                 expires_at=expires_at,
             )
 
             deep_link = InviteCodeService.deep_link(
-                bot_username=settings.telegram_bot_username, code=invite.code
+                bot_username=settings.telegram_bot_username,
+                code=invite.code,
             )
 
             return json.dumps(
@@ -407,64 +454,140 @@ def create_db_tools(
                     "status": "created",
                     "code": invite.code,
                     "role": invite.role,
+                    "restaurant": restaurant.name,
                     "deep_link": deep_link,
                     "expires_at": invite.expires_at.isoformat()
                     if invite.expires_at
                     else None,
-                    "message": f"Invite code created! Share this link: {deep_link}",
+                    "message": f"Share this link to invite {target_role}: {deep_link}",
                 },
                 indent=2,
             )
         except Exception as e:
-            logger.exception(
-                "create_invite_code_failed", extra={"restaurant_id": restaurant_id_str}
-            )
+            logger.exception("create_invite_code_failed")
             return f"Error creating invite code: {str(e)}"
 
-    def revoke_staff_access(args: dict[str, Any]) -> str:
-        """Revoke a user's access to your restaurant (remove them from staff)."""
+    def list_invite_codes(args: dict[str, Any]) -> str:
+        """List active invite codes for a restaurant. Only owners can view."""
         restaurant_id_str = args.get("restaurant_id", "").strip()
-        user_id_str = args.get("user_id", "").strip()
-
         if not restaurant_id_str:
-            return "Error: restaurant_id is required"
-        if not user_id_str:
-            return "Error: user_id is required"
+            return "Error: restaurant_id is required."
 
-        # Check if user is owner of this restaurant
-        if restaurant_id_str not in restaurant_roles:
-            return f"Error: You don't have access to restaurant {restaurant_id_str}"
-        if restaurant_roles[restaurant_id_str] != ROLE_OWNER:
-            return "Error: Only restaurant owners can revoke access"
+        try:
+            restaurant_id = uuid.UUID(restaurant_id_str)
+        except ValueError:
+            return "Error: Invalid restaurant_id format."
 
-        # Use stage_write_action to update restaurant_users status to "removed"
-        return stage_write_action(
-            {
-                "crud": "update",
-                "table": "restaurant_users",
-                "values": {"status": "removed"},
-                "filters": {
-                    "by_restaurant_id": restaurant_id_str,
-                    "by_user_id": user_id_str,
-                },
-            }
-        )
+        if not _is_restaurant_owner(db, user_id, restaurant_id):
+            return "Error: Only restaurant owners can view invite codes."
 
-    # Build and return tools dictionary
+        now = dt.datetime.now(dt.UTC)
+        invites = db.scalars(
+            select(InviteCodes).where(
+                InviteCodes.restaurant_id == restaurant_id,
+                InviteCodes.used_at.is_(None),
+            )
+        ).all()
+
+        # Filter out expired codes
+        active_invites = []
+        for invite in invites:
+            if invite.expires_at is None or invite.expires_at > now:
+                settings = get_settings()
+                deep_link = InviteCodeService.deep_link(
+                    bot_username=settings.telegram_bot_username,
+                    code=invite.code,
+                )
+                active_invites.append(
+                    {
+                        "code": invite.code,
+                        "role": invite.role,
+                        "deep_link": deep_link,
+                        "expires_at": invite.expires_at.isoformat()
+                        if invite.expires_at
+                        else "Never",
+                        "created_at": invite.created_at.isoformat()
+                        if invite.created_at
+                        else None,
+                    }
+                )
+
+        if not active_invites:
+            return "No active invite codes. Use create_invite_code to create one."
+
+        return json.dumps(active_invites, indent=2)
+
+    def delete_invite_code(args: dict[str, Any]) -> str:
+        """Delete/revoke an invite code. Only owners can delete."""
+        code = args.get("code", "").strip().upper()
+        if not code:
+            return "Error: code is required."
+
+        invite = db.scalar(select(InviteCodes).where(InviteCodes.code == code))
+
+        if not invite:
+            return "Error: Invite code not found."
+
+        if not _is_restaurant_owner(db, user_id, invite.restaurant_id):
+            return "Error: Only restaurant owners can delete invite codes."
+
+        if invite.used_at:
+            return (
+                "Error: This invite code has already been used and cannot be deleted."
+            )
+
+        try:
+            db.delete(invite)
+            db.commit()
+            return f"Invite code {code} has been deleted."
+        except Exception as e:
+            db.rollback()
+            logger.exception("delete_invite_code_failed")
+            return f"Error deleting invite code: {str(e)}"
+
+    # =========================================================================
+    # RETURN ALL TOOLS
+    # =========================================================================
+
     return {
-        "get_my_capabilities": Tool(
-            name="get_my_capabilities",
-            description="List all database tables and CRUD operations available to the current user based on their role.",
+        # Profile tools
+        "get_my_profile": Tool(
+            name="get_my_profile",
+            description="Get your profile information (name, phone, username).",
             parameters={
                 "type": "object",
                 "properties": {},
                 "additionalProperties": False,
             },
-            handler=get_my_capabilities,
+            handler=get_my_profile,
         ),
+        "update_my_profile": Tool(
+            name="update_my_profile",
+            description="Update your profile information. You can update name, phone, or username.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "full_name": {
+                        "type": "string",
+                        "description": "Your full name. Pass empty string to clear.",
+                    },
+                    "phone": {
+                        "type": "string",
+                        "description": "Your phone number. Pass empty string to clear.",
+                    },
+                    "username": {
+                        "type": "string",
+                        "description": "Your username (without @). Pass empty string to clear.",
+                    },
+                },
+                "additionalProperties": False,
+            },
+            handler=update_my_profile,
+        ),
+        # Restaurant tools
         "list_my_restaurants": Tool(
             name="list_my_restaurants",
-            description="List all restaurants/outlets the user owns or has access to.",
+            description="List all restaurants/outlets you own or have access to.",
             parameters={
                 "type": "object",
                 "properties": {},
@@ -474,14 +597,14 @@ def create_db_tools(
         ),
         "find_restaurant_by_name": Tool(
             name="find_restaurant_by_name",
-            description="Search for a restaurant/outlet by name. Use this when the user mentions an outlet name to check if it exists.",
+            description="Search for a restaurant by name. Use this when user mentions a restaurant name.",
             parameters={
                 "type": "object",
                 "properties": {
                     "name": {
                         "type": "string",
-                        "description": "The restaurant/outlet name to search for.",
-                    }
+                        "description": "The restaurant name to search for.",
+                    },
                 },
                 "required": ["name"],
                 "additionalProperties": False,
@@ -490,84 +613,149 @@ def create_db_tools(
         ),
         "create_restaurant": Tool(
             name="create_restaurant",
-            description="Create a new restaurant/outlet. Users with no restaurants can create their first one. Owners can create additional restaurants.",
+            description="Create a new restaurant/outlet. You will become the owner.",
             parameters={
                 "type": "object",
                 "properties": {
                     "name": {
                         "type": "string",
-                        "description": "The name for the new restaurant/outlet.",
-                    }
+                        "description": "Name for the new restaurant.",
+                    },
                 },
                 "required": ["name"],
                 "additionalProperties": False,
             },
             handler=create_restaurant,
         ),
-        "read_records": Tool(
-            name="read_records",
-            description="Read records from a database table. Specify the table name and columns to read. Optionally filter by restaurant_id.",
+        "get_restaurant": Tool(
+            name="get_restaurant",
+            description="Get details of a specific restaurant by ID.",
             parameters={
                 "type": "object",
                 "properties": {
-                    "table": {
-                        "type": "string",
-                        "description": "Table name: users, restaurants, restaurant_users, or invite_codes.",
-                        "enum": [
-                            "users",
-                            "restaurants",
-                            "restaurant_users",
-                            "invite_codes",
-                        ],
-                    },
-                    "columns": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "List of column names to read.",
-                    },
                     "restaurant_id": {
                         "type": "string",
-                        "description": "Optional: filter by restaurant ID.",
+                        "description": "The restaurant's UUID.",
                     },
                 },
-                "required": ["table", "columns"],
+                "required": ["restaurant_id"],
                 "additionalProperties": False,
             },
-            handler=read_records,
+            handler=get_restaurant,
         ),
-        "stage_write_action": Tool(
-            name="stage_write_action",
-            description="Stage a create/update/delete action for user confirmation. Use for general database operations. For invite codes, prefer create_invite_code. For removing staff, prefer revoke_staff_access. The user must reply /confirm or /cancel.",
+        "update_restaurant": Tool(
+            name="update_restaurant",
+            description="Update restaurant details. Only owners can update.",
             parameters={
                 "type": "object",
                 "properties": {
-                    "crud": {
+                    "restaurant_id": {
                         "type": "string",
-                        "description": "The operation type.",
-                        "enum": ["create", "update", "delete"],
+                        "description": "The restaurant's UUID.",
                     },
-                    "table": {
+                    "name": {
                         "type": "string",
-                        "description": "Table name: users, restaurants, restaurant_users, or invite_codes.",
-                        "enum": [
-                            "users",
-                            "restaurants",
-                            "restaurant_users",
-                            "invite_codes",
-                        ],
-                    },
-                    "values": {
-                        "type": "object",
-                        "description": "For create/update: the column values to set.",
-                    },
-                    "filters": {
-                        "type": "object",
-                        "description": "For update/delete: filters to identify records (e.g., by_restaurant_id, by_user_id).",
+                        "description": "New name for the restaurant.",
                     },
                 },
-                "required": ["crud", "table"],
+                "required": ["restaurant_id", "name"],
                 "additionalProperties": False,
             },
-            handler=stage_write_action,
+            handler=update_restaurant,
+        ),
+        # Staff management tools
+        "list_staff": Tool(
+            name="list_staff",
+            description="List all staff members of a restaurant.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "restaurant_id": {
+                        "type": "string",
+                        "description": "The restaurant's UUID.",
+                    },
+                },
+                "required": ["restaurant_id"],
+                "additionalProperties": False,
+            },
+            handler=list_staff,
+        ),
+        "revoke_staff_access": Tool(
+            name="revoke_staff_access",
+            description="Remove a user from restaurant staff. Only owners can do this.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "restaurant_id": {
+                        "type": "string",
+                        "description": "The restaurant's UUID.",
+                    },
+                    "user_id": {
+                        "type": "string",
+                        "description": "The user's UUID to remove.",
+                    },
+                },
+                "required": ["restaurant_id", "user_id"],
+                "additionalProperties": False,
+            },
+            handler=revoke_staff_access,
+        ),
+        # Invite code tools
+        "create_invite_code": Tool(
+            name="create_invite_code",
+            description="Create an invite link to add staff to your restaurant. Only owners can create invites.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "restaurant_id": {
+                        "type": "string",
+                        "description": "The restaurant's UUID.",
+                    },
+                    "role": {
+                        "type": "string",
+                        "description": "Role for the invitee: 'staff' or 'owner'. Defaults to 'staff'.",
+                        "enum": ["staff", "owner"],
+                    },
+                    "expires_in_days": {
+                        "type": "integer",
+                        "description": "Days until the invite expires. Defaults to 30.",
+                    },
+                },
+                "required": ["restaurant_id"],
+                "additionalProperties": False,
+            },
+            handler=create_invite_code,
+        ),
+        "list_invite_codes": Tool(
+            name="list_invite_codes",
+            description="List active invite codes for a restaurant. Only owners can view.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "restaurant_id": {
+                        "type": "string",
+                        "description": "The restaurant's UUID.",
+                    },
+                },
+                "required": ["restaurant_id"],
+                "additionalProperties": False,
+            },
+            handler=list_invite_codes,
+        ),
+        "delete_invite_code": Tool(
+            name="delete_invite_code",
+            description="Delete/revoke an unused invite code. Only owners can delete.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "description": "The invite code to delete.",
+                    },
+                },
+                "required": ["code"],
+                "additionalProperties": False,
+            },
+            handler=delete_invite_code,
         ),
     }
