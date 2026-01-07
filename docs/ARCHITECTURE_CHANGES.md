@@ -15,8 +15,13 @@ The bot architecture was refactored from a capability-gated system to a general-
 
 ### Added Components
 
--   `app/ai/agent.py` - General-purpose agent loop with tool-calling
--   `app/ai/db_tools.py` - Database tools for the agent
+-   `app/ai/agent.py` - General-purpose agent loop with tool-calling (up to 8 rounds)
+-   `app/ai/db_tools/` - Modular database tools package:
+    - `base.py` - Shared utilities, permission helpers, and tool factory
+    - `profile.py` - User profile management tools
+    - `restaurants.py` - Restaurant/outlet operations
+    - `staff.py` - Staff management tools
+    - `invites.py` - Invite code management tools
 -   `app/ai/tools.py` - Base tool infrastructure
 
 ### Updated Components
@@ -49,20 +54,28 @@ Each call with an `openrouter_generation_id` automatically schedules cost backfi
 
 For developers working with the codebase:
 
-1. **Access Control**: Use `app/policies/db_policy.py` to enforce permissions, not capability gates
-2. **Adding Functionality**: Add new tools to `app/ai/db_tools.py` or create new tool files
+1. **Access Control**: Tools enforce permissions via:
+   - Direct checks (`is_restaurant_owner()`, `has_restaurant_access()`) for simple operations
+   - Policy checks (`check_policy_permission()`) for complex tables with centralized management
+   - See `docs/db-tools-patterns.md` for patterns and when to use which
+2. **Adding Functionality**: 
+   - Create new module in `app/ai/db_tools/` (e.g., `inventory.py`, `suppliers.py`)
+   - Add factory function (e.g., `create_inventory_tools()`)
+   - Register in `base.py`'s `create_db_tools()`
+   - See `docs/db-tools-patterns.md` for step-by-step guide
 3. **Cost Tracking**: All LLM calls are automatically tracked - ensure `session_id` and `chat_id` are passed to `run_agent_loop()`
 
 ## Documentation Updates
 
 -   `README.md` - Removed capability references, updated LLM description
--   `docs/capabilities.md` - Marked as deprecated with migration notes
--   `docs/resto-pilot-codebase-summary.md` - Added agent architecture section
+-   `docs/capabilities.md` - Marked as deprecated with migration notes, references new structure
+-   `docs/resto-pilot-codebase-summary.md` - Updated agent architecture section with modular tools
 -   `docs/bot-conversation-paths.md` - Updated to reflect general-purpose agent
 -   `docs/unified-message-flow.md` - Updated processing pipeline description
 -   `docs/journeys.md` - Updated platform constraints section
 -   `docs/unified-flow-refactor-checklist.md` - Marked capability sections as completed/replaced
 -   `docs/llm-ack-gating-worklist.md` - Added deprecation notes
+-   `docs/db-tools-patterns.md` - **NEW**: Comprehensive guide to tool architecture, permission patterns, and adding new tools
 
 ## Date
 

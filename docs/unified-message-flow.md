@@ -94,12 +94,15 @@ Worker task: `process_session(session_id)` runs the main pipeline:
 3) Cheap topic gate (gate model) returns strict JSON:
    - on-topic/off-topic classification
    - If off-topic: send redirect, set ghosting mode, exit
-4) Run general-purpose agent loop (`app/ai/agent.py`):
-   - Agent has access to tools (database operations, restaurant lookups, etc.)
+4) Run general-purpose agent loop (`app/ai/agent.py`, up to 8 rounds):
+   - Agent has access to modular database tools (`app/ai/db_tools/`: profile, restaurants, staff, invites)
    - Agent autonomously decides which tools to call based on user request
    - Multi-round conversations: agent can make multiple LLM calls, using tools between rounds
    - Each LLM call is recorded individually in `llm_calls` for cost tracking
-   - Tools enforce role/scope-based access controls (`app/policies/db_policy.py`)
+   - Tools enforce role/scope-based access controls via:
+     - Direct checks (`is_restaurant_owner()`, `has_restaurant_access()`) for simple operations
+     - Policy checks (`check_policy_permission()`) for complex tables with centralized management
+   - See `docs/db-tools-patterns.md` for architecture and patterns
 5) Generate final response from agent result and send to user.
 
 ---

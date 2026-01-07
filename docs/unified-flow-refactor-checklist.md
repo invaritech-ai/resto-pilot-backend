@@ -74,8 +74,8 @@ Files:
 Files:
 - `app/processing/session_processor.py`
 - `app/ai/topic_gate.py`
-- `app/ai/agent.py` (general-purpose agent with tool-calling)
-- `app/ai/db_tools.py` (database tools)
+- `app/ai/agent.py` (general-purpose agent with tool-calling, up to 8 rounds)
+- `app/ai/db_tools/` (modular database tools package)
 
 - [x] Keep `process_session` focused on session-level processing:
   - [x] Topic gate (cheap model) → redirect/ghost if off-topic.
@@ -99,7 +99,9 @@ Files:
 ## 7) Follow-on (after flow is stable)
 
 - [x] General-purpose agent with tool-calling implemented (`app/ai/agent.py`).
-- [x] Database tools with role/scope-based access control (`app/ai/db_tools.py`).
+- [x] Modular database tools with role/scope-based access control (`app/ai/db_tools/`).
+- [x] Two-layer permission system: direct checks for simple operations, policy checks for complex tables.
 - [x] All LLM calls recorded individually for cost tracking.
-- [ ] Add more database tools as needed (e.g., supplier management, inventory operations).
+- [x] Documentation: `docs/db-tools-patterns.md` with architecture, patterns, and guide for adding new tools.
+- [ ] Add more database tools as needed (e.g., supplier management, inventory operations) - follow patterns in `docs/db-tools-patterns.md`.
 - [ ] Add deterministic confirmation + deterministic DB write path for CUD operations (if needed).
