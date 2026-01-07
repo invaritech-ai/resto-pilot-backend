@@ -170,7 +170,7 @@ def create_db_tools(
         rows = service.list_for_user(user_id=user_id)
 
         if not rows:
-            return f"You don't have any restaurants. Create one with create_restaurant."
+            return "You don't have any restaurants. Create one with create_restaurant."
 
         name_lower = name.lower()
         matches = []
@@ -336,6 +336,10 @@ def create_db_tools(
 
         result = []
         for user_obj, membership in members:
+            joined_at_str = None
+            if membership.joined_at:
+                # Format as readable date: "Jan 7, 2026"
+                joined_at_str = membership.joined_at.strftime("%b %d, %Y")
             result.append(
                 {
                     "user_id": str(user_obj.id),
@@ -343,9 +347,7 @@ def create_db_tools(
                     "username": f"@{user_obj.username}" if user_obj.username else None,
                     "role": membership.role,
                     "status": membership.status,
-                    "joined_at": membership.joined_at.isoformat()
-                    if membership.joined_at
-                    else None,
+                    "joined_at": joined_at_str,
                 }
             )
 
