@@ -555,7 +555,7 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
         db.commit()
 
         # Run the agent loop with tool-calling support
-        reply_llm_call_id: uuid.UUID | None = None
+        # Agent loop records each LLM call individually for accurate cost tracking
         try:
             agent_result = run_agent_loop(
                 messages=messages,
@@ -566,6 +566,8 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
                 actor_role=actor_role,
                 restaurant_roles=restaurant_roles,
                 settings=settings,
+                session_id=session_uuid,
+                chat_id=db_session.chat_id,
                 history_messages=history_messages,
                 memory_summary=memory_summary,
                 user_first_name=user_first_name,
@@ -587,39 +589,13 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
         reply_model = agent_result.model
         metrics = agent_result.metrics
 
-        # Record telemetry
-        generation_ids = metrics.get("openrouter_generation_ids") or []
-        generation_id = (
-            generation_ids[0]
-            if isinstance(generation_ids, list) and len(generation_ids) == 1
-            else None
-        )
-        usage = {
-            "prompt_tokens": int(metrics.get("prompt_tokens_total") or 0),
-            "completion_tokens": int(metrics.get("completion_tokens_total") or 0),
-            "total_tokens": int(metrics.get("total_tokens_total") or 0),
-        }
-        total_cost_usd = _safe_float(metrics.get("cost_usd_total"))
-        latency_ms_total = metrics.get("latency_ms_total")
-        latency_ms_total = (
-            int(latency_ms_total) if isinstance(latency_ms_total, int) else None
+        # LLM calls are already recorded per-call in agent loop
+        # Use last call ID for outgoing message attribution
+        reply_llm_call_id = (
+            agent_result.llm_call_ids[-1] if agent_result.llm_call_ids else None
         )
 
-        llm_call_id = record_llm_call(
-            db=db,
-            session_id=session_uuid,
-            chat_id=db_session.chat_id,
-            purpose="agent_reply",
-            model=reply_model,
-            openrouter_generation_id=generation_id,
-            upstream_id=None,
-            provider_name=None,
-            usage=usage,
-            latency_ms=latency_ms_total,
-            total_cost_usd=total_cost_usd,
-            error=None,
-        )
-        reply_llm_call_id = llm_call_id
+        # Record the reply event with aggregated metrics for easy querying
         db.add(
             ProcessingEvents(
                 session_id=session_uuid,
@@ -630,6 +606,10 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
                         "text": reply_text,
                         "model": reply_model,
                         "tool_calls": agent_result.tool_calls_made,
+                        "llm_call_ids": [str(cid) for cid in agent_result.llm_call_ids],
+                        "call_count": metrics.get("call_count", 0),
+                        "total_tokens": metrics.get("total_tokens_total", 0),
+                        "cost_usd_total": metrics.get("cost_usd_total", 0.0),
                     },
                     ensure_ascii=False,
                 ),
@@ -637,20 +617,6 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
             )
         )
         db.commit()
-
-        if generation_id is not None:
-            try:
-                schedule_openrouter_cost_backfill(
-                    llm_call_id=llm_call_id, delay_seconds=120
-                )
-            except Exception:
-                logger.exception(
-                    "process_session_cost_backfill_schedule_failed",
-                    extra={
-                        "llm_call_id": str(llm_call_id),
-                        "session_id": session_id,
-                    },
-                )
 
         # Send reply
         try:
