@@ -113,6 +113,9 @@ def test_process_session_generates_and_sends_reply(monkeypatch: pytest.MonkeyPat
 
     from app.ai.agent import AgentResult
 
+    import uuid as _uuid
+    fake_llm_call_id = _uuid.uuid4()
+
     def _fake_run_agent_loop(**_kwargs):
         called["agent_called"] = int(called["agent_called"]) + 1
         return AgentResult(
@@ -128,6 +131,7 @@ def test_process_session_generates_and_sends_reply(monkeypatch: pytest.MonkeyPat
                 "openrouter_generation_ids": [],
             },
             tool_calls_made=[],
+            llm_call_ids=[fake_llm_call_id],
         )
 
     def _fake_send_message(*, chat_id: int, text: str, settings: Settings) -> int:

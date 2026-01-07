@@ -15,6 +15,7 @@ from app.ai.openrouter_usage import extract_openrouter_usage
 from app.ai.tools import Tool, tools_to_openai_schema
 from app.core.config import Settings
 from app.db.models.telegram_messages import TelegramMessages
+from app.workers.telemetry import record_llm_call, schedule_openrouter_cost_backfill
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,7 @@ class AgentResult:
     model: str
     metrics: dict[str, Any] = field(default_factory=dict)
     tool_calls_made: list[str] = field(default_factory=list)
+    llm_call_ids: list[uuid.UUID] = field(default_factory=list)
 
 
 def _combined_user_text(messages: list[TelegramMessages]) -> str:
@@ -69,6 +71,8 @@ def run_agent_loop(
     actor_role: str,
     restaurant_roles: dict[str, str],
     settings: Settings,
+    session_id: uuid.UUID,
+    chat_id: int,
     history_messages: list[dict[str, Any]] | None = None,
     memory_summary: str | None = None,
     user_first_name: str | None = None,
@@ -77,6 +81,8 @@ def run_agent_loop(
     """
     Run the agent loop with tool-calling support.
 
+    Each LLM call is recorded individually for accurate cost tracking.
+
     Args:
         messages: Current session's Telegram messages
         db: Database session
@@ -84,13 +90,15 @@ def run_agent_loop(
         actor_role: User's highest role (owner or staff)
         restaurant_roles: Map of restaurant_id -> role
         settings: Application settings
+        session_id: Session UUID for telemetry attribution
+        chat_id: Chat ID for telemetry attribution
         history_messages: Previous conversation messages
         memory_summary: Summary of past conversations
         user_first_name: User's first name for personalization
         max_rounds: Maximum tool-calling rounds
 
     Returns:
-        AgentResult with final text response and metrics
+        AgentResult with final text response, metrics, and llm_call_ids
     """
     # Build tools with user context
     db_tools = create_db_tools(
@@ -135,6 +143,7 @@ def run_agent_loop(
         "openrouter_generation_ids": [],
     }
     tool_calls_made: list[str] = []
+    llm_call_ids: list[uuid.UUID] = []
     last_model: str = settings.openai_model
 
     for round_num in range(max_rounds):
@@ -155,27 +164,80 @@ def run_agent_loop(
         except Exception as exc:
             raise OpenAIError(f"Agent loop LLM call failed: {exc}") from exc
 
-        # Update metrics
-        metrics["call_count"] += 1
-        metrics["latency_ms_total"] += int(latency_ms)
-
+        # Extract usage and cost info
         usage = extract_openrouter_usage(data)
-        if usage:
-            metrics["prompt_tokens_total"] += int(usage.get("prompt_tokens", 0))
-            metrics["completion_tokens_total"] += int(usage.get("completion_tokens", 0))
-            metrics["total_tokens_total"] += int(usage.get("total_tokens", 0))
+        prompt_tokens = int(usage.get("prompt_tokens", 0)) if usage else 0
+        completion_tokens = int(usage.get("completion_tokens", 0)) if usage else 0
+        total_tokens = int(usage.get("total_tokens", 0)) if usage else 0
 
         usage_obj = data.get("usage")
+        call_cost_usd: float | None = None
         if isinstance(usage_obj, dict) and isinstance(usage_obj.get("cost"), (int, float)):
-            metrics["cost_usd_total"] += float(usage_obj["cost"])
+            call_cost_usd = float(usage_obj["cost"])
 
         generation_id = extract_openrouter_generation_id(headers=headers, data=data)
-        if generation_id:
-            metrics["openrouter_generation_ids"].append(generation_id)
 
         model_raw = data.get("model")
-        if isinstance(model_raw, str):
-            last_model = model_raw
+        call_model = model_raw if isinstance(model_raw, str) else settings.openai_model
+        last_model = call_model
+
+        # Determine purpose based on round
+        has_tool_calls = bool(data.get("choices", [{}])[0].get("message", {}).get("tool_calls"))
+        purpose = f"agent_round_{round_num + 1}" + ("_tool" if has_tool_calls else "_final")
+
+        # RECORD EACH LLM CALL INDIVIDUALLY - critical for cost tracking
+        llm_call_id = record_llm_call(
+            db=db,
+            session_id=session_id,
+            chat_id=chat_id,
+            purpose=purpose,
+            model=call_model,
+            openrouter_generation_id=generation_id,
+            upstream_id=data.get("id") if isinstance(data.get("id"), str) else None,
+            provider_name=data.get("provider") if isinstance(data.get("provider"), str) else None,
+            usage={
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": total_tokens,
+            },
+            latency_ms=int(latency_ms),
+            total_cost_usd=call_cost_usd,
+            error=None,
+        )
+        llm_call_ids.append(llm_call_id)
+        db.commit()
+
+        # Schedule cost backfill for THIS call if it has a generation ID
+        if generation_id:
+            try:
+                schedule_openrouter_cost_backfill(llm_call_id=llm_call_id, delay_seconds=120)
+                logger.info(
+                    "agent_cost_backfill_scheduled",
+                    extra={
+                        "llm_call_id": str(llm_call_id),
+                        "generation_id": generation_id,
+                        "round": round_num + 1,
+                    },
+                )
+            except Exception:
+                logger.exception(
+                    "agent_cost_backfill_schedule_failed",
+                    extra={
+                        "llm_call_id": str(llm_call_id),
+                        "generation_id": generation_id,
+                    },
+                )
+
+        # Update aggregated metrics
+        metrics["call_count"] += 1
+        metrics["latency_ms_total"] += int(latency_ms)
+        metrics["prompt_tokens_total"] += prompt_tokens
+        metrics["completion_tokens_total"] += completion_tokens
+        metrics["total_tokens_total"] += total_tokens
+        if call_cost_usd is not None:
+            metrics["cost_usd_total"] += call_cost_usd
+        if generation_id:
+            metrics["openrouter_generation_ids"].append(generation_id)
 
         # Parse response
         choices = data.get("choices")
@@ -251,6 +313,7 @@ def run_agent_loop(
                 model=last_model,
                 metrics=metrics,
                 tool_calls_made=tool_calls_made,
+                llm_call_ids=llm_call_ids,
             )
 
         # If we got here with stop but no content, something is wrong
@@ -267,5 +330,6 @@ def run_agent_loop(
         model=last_model,
         metrics=metrics,
         tool_calls_made=tool_calls_made,
+        llm_call_ids=llm_call_ids,
     )
 
