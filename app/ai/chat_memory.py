@@ -122,7 +122,8 @@ def update_chat_memory_summary(
         "Write a compact, factual memory of the conversation that will help future turns.\n"
         "Rules:\n"
         f"- Output MUST be <= {int(max_chars)} characters.\n"
-        "- Include stable facts: outlet names, user preferences, ongoing tasks, constraints.\n"
+        "- Include stable facts: outlet names, roles/memberships, user preferences, ongoing tasks.\n"
+        "- Exclude system capabilities, permission limits, refusals, or policy statements.\n"
         "- Exclude chit-chat and acknowledgements.\n"
         "- Do NOT provide advice or plans.\n"
         "- Output plain text only."
@@ -153,4 +154,3 @@ def update_chat_memory_summary(
     if len(cleaned) > max_chars:
         cleaned = cleaned[:max_chars].rstrip()
     return cleaned, data, headers, latency_ms
-
