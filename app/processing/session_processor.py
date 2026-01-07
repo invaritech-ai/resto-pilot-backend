@@ -26,7 +26,7 @@ from app.db.models.telegram_session import TelegramSessions
 from app.db.models.user import User
 from app.domain.services.db_pending_action_service import DBPendingActionService
 from app.domain.services.restaurant_service import RestaurantService
-from app.policies.db_allowlist import ROLE_OWNER, ROLE_STAFF
+from app.policies.db_allowlist import ROLE_OWNER
 from app.telegram.bot_api import send_message
 from app.workers.telemetry import (
     get_or_create_chat_state,
@@ -172,24 +172,22 @@ def _get_user_role_and_restaurants(
     Get user's role and restaurant IDs.
 
     Returns:
-        (highest_role, restaurant_roles) where:
-        - highest_role is "owner" or "staff" (highest role if multiple restaurants)
-        - restaurant_roles is a map of restaurant_id -> role for per-restaurant checks
+        (actor_role, restaurant_roles) where:
+        - actor_role is always "owner" for platform-level capabilities (everyone can create restaurants)
+        - restaurant_roles is a map of restaurant_id -> role for per-restaurant permission checks
     """
     rows = RestaurantService(db).list_for_user(user_id=user_id)
     if not rows:
-        return ROLE_STAFF, {}
+        # Users with no restaurants still get "owner" role so they can create restaurants
+        return ROLE_OWNER, {}
 
     restaurant_roles: dict[str, str] = {}
-    has_owner = False
     for _restaurant, membership in rows:
         rid = str(membership.restaurant_id)
         restaurant_roles[rid] = membership.role
-        if membership.role == ROLE_OWNER:
-            has_owner = True
 
-    highest_role = ROLE_OWNER if has_owner else ROLE_STAFF
-    return highest_role, restaurant_roles
+    # Always return "owner" as actor_role - per-restaurant checks use restaurant_roles
+    return ROLE_OWNER, restaurant_roles
 
 
 def process_session(*, session_id: str, task_id: str | None = None) -> None:
@@ -536,7 +534,7 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
         actor_role, restaurant_roles = (
             _get_user_role_and_restaurants(db=db, user_id=user.id)
             if user
-            else (ROLE_STAFF, {})
+            else (ROLE_OWNER, {})  # Even users without profile get owner capabilities
         )
 
         if chat_state.off_topic_mode:
