@@ -30,3 +30,5 @@ class Restaurant(Base):
     last_active_at: Mapped[dt.datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    address: Mapped[str | None] = mapped_column(String, nullable=True)
+    internal_name: Mapped[str | None] = mapped_column(String, nullable=True)

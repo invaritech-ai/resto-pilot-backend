@@ -1,0 +1,569 @@
+"""
+File processing tools for invoices, price lists, and inventory photos.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import uuid
+from typing import Any, cast
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from app.ai.tools import Tool
+from app.core.config import Settings, get_settings
+from app.db.models.file_processing_staging import FileProcessingStaging
+from app.db.models.restaurant_user import RestaurantUser
+from app.workers.celery_types import CeleryApplyAsync
+
+from .base import has_restaurant_access, is_restaurant_owner
+
+logger = logging.getLogger(__name__)
+
+
+def create_file_processing_tools(
+    *,
+    db: Session,
+    user_id: Any,
+    actor_role: str | None = None,
+    restaurant_roles: dict[str, str] | None = None,
+    chat_id: int | None = None,
+    session_id: uuid.UUID | None = None,
+) -> dict[str, Tool]:
+    """Create file processing tools."""
+
+    def process_invoice_file(args: dict[str, Any]) -> str:
+        """Enqueue invoice file processing. The file will be processed and you'll get a preview to review."""
+        restaurant_id_str = args.get("restaurant_id", "").strip()
+        if not restaurant_id_str:
+            return "Error: restaurant_id is required."
+
+        try:
+            restaurant_id = uuid.UUID(restaurant_id_str)
+        except ValueError:
+            return "Error: Invalid restaurant_id format."
+
+        if not has_restaurant_access(db, user_id, restaurant_id):
+            return "Error: You don't have access to this restaurant."
+
+        file_id = args.get("file_id", "").strip()
+        if not file_id:
+            return "Error: file_id is required."
+
+        supplier_id_str = args.get("supplier_id", "").strip()
+        supplier_id = uuid.UUID(supplier_id_str) if supplier_id_str else None
+
+        if not chat_id:
+            return "Error: chat_id is required for file processing."
+
+        # Enqueue async task
+        from app.workers.tasks import process_invoice_file_task  # imported lazily
+
+        cast(CeleryApplyAsync, process_invoice_file_task).apply_async(
+            kwargs={
+                "restaurant_id": str(restaurant_id),
+                "file_id": file_id,
+                "supplier_id": str(supplier_id) if supplier_id else None,
+                "chat_id": chat_id,
+                "user_id": str(user_id),
+                "session_id": str(session_id) if session_id else None,
+            },
+            countdown=0.0,
+        )
+
+        return "I'm processing your invoice. I'll show you what I found for review."
+
+    def process_price_list_file(args: dict[str, Any]) -> str:
+        """Enqueue price list file processing. The file will be processed and you'll get a preview to review."""
+        restaurant_id_str = args.get("restaurant_id", "").strip()
+        if not restaurant_id_str:
+            return "Error: restaurant_id is required."
+
+        try:
+            restaurant_id = uuid.UUID(restaurant_id_str)
+        except ValueError:
+            return "Error: Invalid restaurant_id format."
+
+        if not has_restaurant_access(db, user_id, restaurant_id):
+            return "Error: You don't have access to this restaurant."
+
+        file_id = args.get("file_id", "").strip()
+        if not file_id:
+            return "Error: file_id is required."
+
+        supplier_id_str = args.get("supplier_id", "").strip()
+        supplier_id = uuid.UUID(supplier_id_str) if supplier_id_str else None
+
+        if not chat_id:
+            return "Error: chat_id is required for file processing."
+
+        # Enqueue async task
+        from app.workers.tasks import process_price_list_file_task  # imported lazily
+
+        cast(CeleryApplyAsync, process_price_list_file_task).apply_async(
+            kwargs={
+                "restaurant_id": str(restaurant_id),
+                "file_id": file_id,
+                "supplier_id": str(supplier_id) if supplier_id else None,
+                "chat_id": chat_id,
+                "user_id": str(user_id),
+                "session_id": str(session_id) if session_id else None,
+            },
+            countdown=0.0,
+        )
+
+        return "I'm processing your price list. I'll show you what I found for review."
+
+    def process_inventory_photo(args: dict[str, Any]) -> str:
+        """Enqueue inventory photo processing. The photo will be analyzed and you'll get a preview to review."""
+        restaurant_id_str = args.get("restaurant_id", "").strip()
+        if not restaurant_id_str:
+            return "Error: restaurant_id is required."
+
+        try:
+            restaurant_id = uuid.UUID(restaurant_id_str)
+        except ValueError:
+            return "Error: Invalid restaurant_id format."
+
+        if not has_restaurant_access(db, user_id, restaurant_id):
+            return "Error: You don't have access to this restaurant."
+
+        file_id = args.get("file_id", "").strip()
+        if not file_id:
+            return "Error: file_id is required."
+
+        if not chat_id:
+            return "Error: chat_id is required for file processing."
+
+        # Enqueue async task
+        from app.workers.tasks import process_inventory_photo_task  # imported lazily
+
+        cast(CeleryApplyAsync, process_inventory_photo_task).apply_async(
+            kwargs={
+                "restaurant_id": str(restaurant_id),
+                "file_id": file_id,
+                "chat_id": chat_id,
+                "user_id": str(user_id),
+                "session_id": str(session_id) if session_id else None,
+            },
+            countdown=0.0,
+        )
+
+        return "I'm analyzing your inventory photo. I'll show you what I found for review."
+
+    def review_file_processing(args: dict[str, Any]) -> str:
+        """Show extracted data from file processing for review."""
+        staging_id_str = args.get("staging_id", "").strip()
+        if not staging_id_str:
+            return "Error: staging_id is required."
+
+        try:
+            staging_id = uuid.UUID(staging_id_str)
+        except ValueError:
+            return "Error: Invalid staging_id format."
+
+        staging = db.get(FileProcessingStaging, staging_id)
+        if not staging:
+            return "Error: File processing record not found."
+
+        if not has_restaurant_access(db, user_id, staging.restaurant_id):
+            return "Error: You don't have access to this file processing record."
+
+        if staging.status != "pending_review":
+            return f"Error: This record is already {staging.status}. Cannot review."
+
+        # Format the extracted data nicely
+        extracted_data = staging.extracted_data_json
+        processing_type = staging.processing_type
+
+        if processing_type == "invoice":
+            lines = ["📄 Invoice Preview:\n"]
+            lines.append(f"Supplier: {extracted_data.get('supplier_name', 'N/A')}")
+            lines.append(f"Invoice Number: {extracted_data.get('invoice_number', 'N/A')}")
+            lines.append(f"Date: {extracted_data.get('invoice_date', 'N/A')}")
+            lines.append(f"Currency: {extracted_data.get('currency', 'N/A')}")
+            lines.append(f"Total: {extracted_data.get('total', 'N/A')}")
+            lines.append("\nLine Items:")
+            for i, item in enumerate(extracted_data.get("line_items", []), 1):
+                lines.append(
+                    f"  {i}. {item.get('description', 'N/A')} - "
+                    f"{item.get('quantity', 'N/A')} {item.get('unit', '')} @ "
+                    f"{item.get('unit_price', 'N/A')} = {item.get('line_total', 'N/A')}"
+                )
+        elif processing_type == "price_list":
+            lines = ["📋 Price List Preview:\n"]
+            lines.append(f"Supplier: {extracted_data.get('supplier_name', 'N/A')}")
+            lines.append(f"Currency: {extracted_data.get('currency', 'N/A')}")
+            lines.append(f"Items: {len(extracted_data.get('items', []))}")
+            lines.append("\nItems:")
+            for i, item in enumerate(extracted_data.get("items", []), 1):
+                lines.append(
+                    f"  {i}. {item.get('name', 'N/A')} - "
+                    f"{item.get('price', 'N/A')} {item.get('currency', '')} per {item.get('unit', '')}"
+                )
+        elif processing_type == "inventory":
+            lines = ["📸 Inventory Photo Preview:\n"]
+            lines.append(f"Items Detected: {len(extracted_data.get('items', []))}")
+            lines.append("\nItems:")
+            for i, item in enumerate(extracted_data.get("items", []), 1):
+                lines.append(
+                    f"  {i}. {item.get('product_name', 'N/A')} - "
+                    f"{item.get('quantity', 'N/A')} {item.get('unit', '')}"
+                )
+        else:
+            lines = [f"Preview for {processing_type}:\n"]
+            lines.append(json.dumps(extracted_data, indent=2))
+
+        lines.append("\n\nReview the data above. Tell me if anything needs changing, or say /confirm to save.")
+        return "\n".join(lines)
+
+    def update_file_processing_data(args: dict[str, Any]) -> str:
+        """Update a specific field in the extracted data before confirming."""
+        staging_id_str = args.get("staging_id", "").strip()
+        if not staging_id_str:
+            return "Error: staging_id is required."
+
+        try:
+            staging_id = uuid.UUID(staging_id_str)
+        except ValueError:
+            return "Error: Invalid staging_id format."
+
+        staging = db.get(FileProcessingStaging, staging_id)
+        if not staging:
+            return "Error: File processing record not found."
+
+        if not has_restaurant_access(db, user_id, staging.restaurant_id):
+            return "Error: You don't have access to this file processing record."
+
+        if staging.status != "pending_review":
+            return f"Error: This record is already {staging.status}. Cannot update."
+
+        field_path = args.get("field_path", "").strip()
+        new_value = args.get("new_value")
+
+        if not field_path:
+            return "Error: field_path is required (e.g., 'supplier_name', 'line_items.0.quantity')."
+
+        # Update nested field in JSON
+        extracted_data = staging.extracted_data_json.copy()
+        path_parts = field_path.split(".")
+        current = extracted_data
+
+        # Navigate to the parent of the target field
+        for part in path_parts[:-1]:
+            if isinstance(part, str) and part.isdigit():
+                part = int(part)
+            if not isinstance(current, (dict, list)):
+                return f"Error: Invalid path '{field_path}' - '{part}' is not a dict/list."
+            if isinstance(current, list):
+                if not isinstance(part, int) or part >= len(current):
+                    return f"Error: Invalid path '{field_path}' - index {part} out of range."
+                current = current[part]
+            else:
+                if part not in current:
+                    return f"Error: Invalid path '{field_path}' - '{part}' not found."
+                current = current[part]
+
+        # Update the target field
+        final_key = path_parts[-1]
+        if isinstance(current, list):
+            if not final_key.isdigit():
+                return f"Error: Invalid path '{field_path}' - final part must be an index for lists."
+            idx = int(final_key)
+            if idx >= len(current):
+                return f"Error: Invalid path '{field_path}' - index {idx} out of range."
+            current[idx] = new_value
+        else:
+            current[final_key] = new_value
+
+        staging.extracted_data_json = extracted_data
+        try:
+            db.commit()
+            return f"Updated {field_path} to {new_value}. Use review_file_processing to see the updated data."
+        except Exception as e:
+            db.rollback()
+            logger.exception("update_file_processing_data_failed")
+            return f"Error updating data: {str(e)}"
+
+    def confirm_file_processing(args: dict[str, Any]) -> str:
+        """Confirm and write extracted data to final tables. Only restaurant owners can confirm."""
+        staging_id_str = args.get("staging_id", "").strip()
+        if not staging_id_str:
+            return "Error: staging_id is required."
+
+        try:
+            staging_id = uuid.UUID(staging_id_str)
+        except ValueError:
+            return "Error: Invalid staging_id format."
+
+        staging = db.get(FileProcessingStaging, staging_id)
+        if not staging:
+            return "Error: File processing record not found."
+
+        if not is_restaurant_owner(db, user_id, staging.restaurant_id):
+            return "Error: Only restaurant owners can confirm file processing."
+
+        if staging.status != "pending_review":
+            return f"Error: This record is already {staging.status}. Cannot confirm."
+
+        # Write to final tables based on processing type
+        import datetime as dt
+
+        extracted_data = staging.extracted_data_json
+        processing_type = staging.processing_type
+
+        # Helper function to parse dates
+        def parse_date(date_str: str | None) -> dt.datetime | None:
+            if not date_str:
+                return None
+            try:
+                # Try ISO format first
+                date_str_clean = date_str.replace("Z", "+00:00")
+                return dt.datetime.fromisoformat(date_str_clean)
+            except (ValueError, AttributeError):
+                # Try simple date formats
+                try:
+                    # Try YYYY-MM-DD format
+                    if len(date_str) >= 10:
+                        date_part = date_str[:10]
+                        return dt.datetime.strptime(date_part, "%Y-%m-%d").replace(tzinfo=dt.UTC)
+                except ValueError:
+                    pass
+                return None
+
+        try:
+            if processing_type == "invoice":
+                from app.db.models.documents import Documents
+                from app.db.models.invoices import Invoices
+                from app.db.models.invoice_line_items import InvoiceLineItems
+                from app.db.models.suppliers import Suppliers
+
+                # Get document (should already exist from processing task)
+                document = None
+                if staging.document_id:
+                    document = db.get(Documents, staging.document_id)
+
+                if not document:
+                    return "Error: Document record not found. The file processing may not have completed correctly."
+
+                # Find or create supplier by name
+                supplier_name = extracted_data.get("supplier_name", "").strip()
+                if not supplier_name:
+                    return "Error: Supplier name is required for invoice processing."
+
+                supplier = db.scalar(
+                    select(Suppliers).where(
+                        Suppliers.restaurant_id == staging.restaurant_id,
+                        Suppliers.name.ilike(supplier_name),
+                        Suppliers.is_active == True,
+                    )
+                )
+
+                if not supplier:
+                    # Create new supplier
+                    supplier = Suppliers(
+                        restaurant_id=staging.restaurant_id,
+                        name=supplier_name,
+                        currency=extracted_data.get("currency", "USD"),
+                        is_active=True,
+                    )
+                    db.add(supplier)
+                    db.flush()
+
+                supplier_id = supplier.id
+
+                # Update document with supplier_id
+                document.supplier_id = supplier_id
+
+                invoice_date = parse_date(extracted_data.get("invoice_date")) or dt.datetime.now(
+                    dt.UTC
+                )
+                due_date = parse_date(extracted_data.get("due_date"))
+
+                # Create invoice
+                invoice = Invoices(
+                    restaurant_id=staging.restaurant_id,
+                    supplier_id=supplier_id,
+                    invoice_number=extracted_data.get("invoice_number", ""),
+                    invoice_date=invoice_date,
+                    due_date=due_date,
+                    currency=extracted_data.get("currency", "USD"),
+                    subtotal=float(extracted_data.get("subtotal", 0)),
+                    tax=float(extracted_data.get("tax", 0)),
+                    total=float(extracted_data.get("total", 0)),
+                    document_id=document.id,
+                    status="received",
+                    authorized_by_user_id=user_id,
+                )
+                db.add(invoice)
+                db.flush()
+
+                # Create line items
+                for item in extracted_data.get("line_items", []):
+                    line_item = InvoiceLineItems(
+                        invoice_id=invoice.id,
+                        supplier_id=supplier_id,
+                        description_raw=item.get("description", ""),
+                        quantity=float(item.get("quantity", 0)),
+                        unit=item.get("unit", ""),
+                        unit_price=float(item.get("unit_price", 0)),
+                        line_total=float(item.get("line_total", 0)),
+                        currency=extracted_data.get("currency", "USD"),
+                        tax_amount=float(item.get("tax_amount", 0)),
+                    )
+                    db.add(line_item)
+
+                summary = f"Invoice created: {invoice.invoice_number}, {len(extracted_data.get('line_items', []))} line items, Total: {invoice.total} {invoice.currency}"
+
+            elif processing_type == "price_list":
+                # TODO: Implement price list confirmation
+                summary = "Price list confirmation not yet implemented."
+
+            elif processing_type == "inventory":
+                # TODO: Implement inventory confirmation
+                summary = "Inventory confirmation not yet implemented."
+
+            else:
+                return f"Error: Unknown processing type: {processing_type}"
+
+            # Update staging record
+            staging.status = "confirmed"
+            staging.authorized_by_user_id = user_id
+            staging.confirmed_at = dt.datetime.now(dt.UTC)
+            db.commit()
+
+            return f"Confirmed! {summary}"
+
+        except Exception as e:
+            db.rollback()
+            logger.exception("confirm_file_processing_failed")
+            return f"Error confirming file processing: {str(e)}"
+
+    return {
+        "process_invoice_file": Tool(
+            name="process_invoice_file",
+            description="Process an invoice file. The file will be analyzed and you'll get a preview to review before saving.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "restaurant_id": {
+                        "type": "string",
+                        "description": "The restaurant's UUID.",
+                    },
+                    "file_id": {
+                        "type": "string",
+                        "description": "Telegram file_id of the invoice file.",
+                    },
+                    "supplier_id": {
+                        "type": "string",
+                        "description": "Supplier UUID (optional, will be inferred if not provided).",
+                    },
+                },
+                "required": ["restaurant_id", "file_id"],
+                "additionalProperties": False,
+            },
+            handler=process_invoice_file,
+        ),
+        "process_price_list_file": Tool(
+            name="process_price_list_file",
+            description="Process a price list file. The file will be analyzed and you'll get a preview to review before saving.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "restaurant_id": {
+                        "type": "string",
+                        "description": "The restaurant's UUID.",
+                    },
+                    "file_id": {
+                        "type": "string",
+                        "description": "Telegram file_id of the price list file.",
+                    },
+                    "supplier_id": {
+                        "type": "string",
+                        "description": "Supplier UUID (optional, will be inferred if not provided).",
+                    },
+                },
+                "required": ["restaurant_id", "file_id"],
+                "additionalProperties": False,
+            },
+            handler=process_price_list_file,
+        ),
+        "process_inventory_photo": Tool(
+            name="process_inventory_photo",
+            description="Process an inventory photo. The photo will be analyzed and you'll get a preview to review before saving.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "restaurant_id": {
+                        "type": "string",
+                        "description": "The restaurant's UUID.",
+                    },
+                    "file_id": {
+                        "type": "string",
+                        "description": "Telegram file_id of the inventory photo.",
+                    },
+                },
+                "required": ["restaurant_id", "file_id"],
+                "additionalProperties": False,
+            },
+            handler=process_inventory_photo,
+        ),
+        "review_file_processing": Tool(
+            name="review_file_processing",
+            description="Show extracted data from file processing for review.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "staging_id": {
+                        "type": "string",
+                        "description": "The file processing staging record UUID.",
+                    },
+                },
+                "required": ["staging_id"],
+                "additionalProperties": False,
+            },
+            handler=review_file_processing,
+        ),
+        "update_file_processing_data": Tool(
+            name="update_file_processing_data",
+            description="Update a specific field in the extracted data before confirming. Use dot notation for nested fields (e.g., 'supplier_name', 'line_items.0.quantity').",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "staging_id": {
+                        "type": "string",
+                        "description": "The file processing staging record UUID.",
+                    },
+                    "field_path": {
+                        "type": "string",
+                        "description": "Path to the field to update (e.g., 'supplier_name', 'line_items.0.quantity').",
+                    },
+                    "new_value": {
+                        "description": "New value for the field.",
+                    },
+                },
+                "required": ["staging_id", "field_path", "new_value"],
+                "additionalProperties": False,
+            },
+            handler=update_file_processing_data,
+        ),
+        "confirm_file_processing": Tool(
+            name="confirm_file_processing",
+            description="Confirm and write extracted data to final tables. Only restaurant owners can confirm.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "staging_id": {
+                        "type": "string",
+                        "description": "The file processing staging record UUID.",
+                    },
+                },
+                "required": ["staging_id"],
+                "additionalProperties": False,
+            },
+            handler=confirm_file_processing,
+        ),
+    }
+

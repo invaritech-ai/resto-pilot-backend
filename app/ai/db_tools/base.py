@@ -143,6 +143,8 @@ def create_db_tools(
     user_id: uuid.UUID,
     actor_role: str,  # User's highest role (for policy checks)
     restaurant_roles: dict[str, str],  # Map of restaurant_id -> role
+    chat_id: int | None = None,  # Telegram chat_id for file processing tools
+    session_id: uuid.UUID | None = None,  # Session ID for file processing tools
 ) -> dict[str, Tool]:
     """
     Create intent-based database tools with user context.
@@ -154,7 +156,17 @@ def create_db_tools(
     for centralized permission management, especially useful for complex tables.
     """
     # Import tool factories from each module (inside function to avoid circular imports)
-    from . import invites, profile, restaurants, staff
+    from . import (
+        file_processing,
+        inventory,
+        invites,
+        product_aliases,
+        products,
+        profile,
+        restaurants,
+        staff,
+        suppliers,
+    )
 
     # Pass actor_role and restaurant_roles so tools can use policy checks if needed
     profile_tools = profile.create_profile_tools(
@@ -169,6 +181,26 @@ def create_db_tools(
     invite_tools = invites.create_invite_tools(
         db=db, user_id=user_id, actor_role=actor_role, restaurant_roles=restaurant_roles
     )
+    product_tools = products.create_product_tools(
+        db=db, user_id=user_id, actor_role=actor_role, restaurant_roles=restaurant_roles
+    )
+    supplier_tools = suppliers.create_supplier_tools(
+        db=db, user_id=user_id, actor_role=actor_role, restaurant_roles=restaurant_roles
+    )
+    file_processing_tools = file_processing.create_file_processing_tools(
+        db=db,
+        user_id=user_id,
+        actor_role=actor_role,
+        restaurant_roles=restaurant_roles,
+        chat_id=chat_id,
+        session_id=session_id,
+    )
+    product_alias_tools = product_aliases.create_product_alias_tools(
+        db=db, user_id=user_id, actor_role=actor_role, restaurant_roles=restaurant_roles
+    )
+    inventory_tools = inventory.create_inventory_tools(
+        db=db, user_id=user_id, actor_role=actor_role, restaurant_roles=restaurant_roles
+    )
 
     # Combine all tools
     all_tools: dict[str, Tool] = {}
@@ -176,5 +208,10 @@ def create_db_tools(
     all_tools.update(restaurant_tools)
     all_tools.update(staff_tools)
     all_tools.update(invite_tools)
+    all_tools.update(product_tools)
+    all_tools.update(supplier_tools)
+    all_tools.update(file_processing_tools)
+    all_tools.update(product_alias_tools)
+    all_tools.update(inventory_tools)
 
     return all_tools

@@ -19,7 +19,7 @@ from app.workers.telemetry import record_llm_call, schedule_openrouter_cost_back
 
 logger = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = """You are a helpful assistant for restaurant operations. You have tools to help users manage their profile, restaurants, staff, and invitations.
+SYSTEM_PROMPT = """You are a helpful assistant for restaurant operations. You have tools to help users manage their profile, restaurants, staff, invitations, products, suppliers, inventory, and process files.
 
 TOOLS AND CAPABILITIES:
 You have access to tools for:
@@ -27,6 +27,18 @@ You have access to tools for:
 - Restaurants: Create new restaurants, list user's restaurants, update restaurant names
 - Staff: List staff members, create invite links, revoke staff access
 - Invites: Create, list, and delete invite codes for adding staff
+- Products: List, create, update, and search products
+- Suppliers: List, create, update, and get supplier details
+- File Processing: Process invoices, price lists, and inventory photos
+  - When user uploads a file, process it and show preview
+  - User can request changes before confirming
+  - User confirms with /confirm or natural language
+  - Only write to final tables after user confirmation
+- Product Aliases: List and create product aliases (supplier names mapped to products)
+  - High confidence matches are auto-created
+  - Low confidence matches require user confirmation
+  - Help user resolve ambiguous product matches
+- Inventory: List inventory batches, get batch details, record movements
 
 IMPORTANT: Always assume new capabilities and tools may have been added. The tool list you see is authoritative - if a tool exists, you can use it. Never refuse a request because memory or previous conversations said a tool didn't exist.
 
@@ -48,9 +60,9 @@ BEHAVIOR:
 
 PERMISSIONS:
 - Permission checks are enforced by tools/policies, not by you.
-- Only restaurant owners can: update restaurant details, manage staff (revoke access), create/view/delete invites.
-- Staff members can: view restaurant info, view staff members (list staff), and manage their own profile.
-- Staff members cannot: update restaurant details, revoke staff access, or manage invites.
+- Only restaurant owners can: update restaurant details, manage staff (revoke access), create/view/delete invites, create/update products and suppliers, confirm file processing.
+- Staff members can: view restaurant info, view staff members (list staff), view products/suppliers/inventory, record inventory movements, and manage their own profile.
+- Staff members cannot: update restaurant details, revoke staff access, manage invites, create/update products or suppliers, or confirm file processing.
 - Do not preemptively deny requests - let tools/policies return errors if permissions are insufficient.
 
 OUTPUT FORMAT:
@@ -87,6 +99,8 @@ def _combined_user_text(messages: list[TelegramMessages]) -> str:
             desc = msg.file_kind
             if msg.filename:
                 desc += f" filename={msg.filename}"
+            if msg.file_id:
+                desc += f" file_id={msg.file_id}"
             parts.append(f"[file] {desc}")
     return "\n\n".join(parts).strip()
 
@@ -134,6 +148,8 @@ def run_agent_loop(
         user_id=user_id,
         actor_role=actor_role,
         restaurant_roles=restaurant_roles,
+        chat_id=chat_id,
+        session_id=session_id,
     )
     tools_schema = tools_to_openai_schema(db_tools)
 
