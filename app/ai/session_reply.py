@@ -12,8 +12,6 @@ from app.ai.openai_client import (
 )
 from app.ai.openrouter_generation import extract_openrouter_generation_id
 from app.ai.openrouter_usage import extract_openrouter_usage
-from app.ai.capability_gate import inventory_outlet_list_refusal, is_outlet_list_request
-from app.ai.reply_guard import enforce_employee_reply
 from app.core.config import Settings
 from app.db.models.telegram_messages import TelegramMessages
 from app.telegram.bot_api import get_file_bytes
@@ -167,13 +165,7 @@ def generate_session_reply(
     if not isinstance(content_text, str) or not content_text.strip():
         raise OpenAIError("Model did not return a final message")
 
-    fallback = (
-        inventory_outlet_list_refusal()
-        if is_outlet_list_request(messages=messages)
-        else "What's the exact outlet name?"
-    )
-    guarded = enforce_employee_reply(text=content_text, fallback=fallback)
-    return SessionReply(text=guarded, model=last_model)
+    return SessionReply(text=content_text.strip(), model=last_model)
 
 
 def generate_session_reply_with_metrics(
@@ -311,10 +303,4 @@ def generate_session_reply_with_metrics(
     if text is None:
         raise OpenAIError("Model did not return a final message")
 
-    fallback = (
-        inventory_outlet_list_refusal()
-        if is_outlet_list_request(messages=messages)
-        else "What's the exact outlet name?"
-    )
-    guarded = enforce_employee_reply(text=text, fallback=fallback)
-    return SessionReply(text=guarded, model=last_model), metrics
+    return SessionReply(text=text, model=last_model), metrics

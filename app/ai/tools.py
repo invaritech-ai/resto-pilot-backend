@@ -47,3 +47,26 @@ def openai_tools_schema() -> list[dict[str, Any]]:
         for tool in TOOLS.values()
     ]
 
+
+def tools_to_openai_schema(tools: dict[str, Tool]) -> list[dict[str, Any]]:
+    """
+    Convert a dictionary of tools to OpenAI function calling schema.
+
+    Args:
+        tools: Dictionary mapping tool names to Tool objects
+
+    Returns:
+        List of tool definitions in OpenAI format
+    """
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.parameters,
+            },
+        }
+        for tool in tools.values()
+    ]
+
