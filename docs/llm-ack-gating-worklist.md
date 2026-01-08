@@ -1,6 +1,6 @@
 ## Worklist (granular "one function per task")
 
-**Note**: This is a historical worklist document. Some items reference components that have since been replaced (e.g., `session_reply.py`, `capability_gate.py`). The current architecture uses a general-purpose agent with tool-calling (`app/ai/agent.py`).
+**Note**: This is a historical worklist document. Some items reference components that have since been replaced (e.g., `session_reply.py`, `capability_gate.py`). The current architecture uses a general-purpose agent with tool-calling (`app/ai/agent.py`) and includes file-processing workflows (invoice/price list/inventory) that are not tracked in this checklist.
 
 ### A) DB schema (SQLAlchemy models + Alembic autogenerate)
 - [x] Add model `LLMCalls` in `app/db/models/llm_calls.py`

@@ -33,6 +33,12 @@ This project uses the Chat Completions endpoint and supports splitting "cheap" v
 
 **Telemetry & Cost Tracking**: Every LLM call is recorded in `llm_calls` with `openrouter_generation_id` for cost attribution. Cost backfill is scheduled automatically via Celery tasks to fetch actual costs from OpenRouter.
 
+## Vision model configuration (file processing)
+
+Invoice/price list/inventory photo processing uses a vision model:
+- `APP_VISION_MODEL`, `APP_VISION_API_KEY`, `APP_VISION_BASE_URL`
+- If unset, the vision client falls back to `APP_OPENAI_*` values.
+
 ## Package for AWS Lambda (FastAPI + Mangum)
 
 -   Handler entrypoint is `app.handler.handler` (see `app/handler.py`).

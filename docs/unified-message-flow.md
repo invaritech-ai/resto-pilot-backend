@@ -5,13 +5,15 @@ This doc defines the **target unified message flow** when `telegram_batching_ena
 Goals:
 - Immediate user feedback (best-effort) without waiting for the batching debounce window.
 - A single, consistent routing model that supports:
-- **instant commands** (`/start`, `/respond`, `/done`, `/confirm`, `/cancel`, and future standalone `/...` commands),
+  - **instant commands** (`/start`, `/respond`, `/done`, `/confirm`, `/cancel`, and future standalone `/...` commands),
   - **instant stateful routes** (multi-step flows like phone intake or DB-write confirmations),
   - **batched sessions** (normal conversational messages).
-- Deterministic database writes (especially for confirmations and CRUD), with LLM used for:
+- Deterministic database writes executed inside tools, with LLM used for:
   - cheap per-message backchannel ack (optional),
   - routing/classification (cheap model),
-  - phrasing user-facing confirmation messages (but not executing writes).
+  - selecting tool calls and phrasing user-facing replies.
+  - Confirmations are explicit for staged flows (file processing, pending DB actions).
+- File processing flows (invoice/price list/inventory photos) with staging + review before writing to final tables.
 
 ---
 
@@ -52,7 +54,7 @@ Responsibilities:
 - `/start` and `/start <code>`:
   - create/update the user,
   - accept invite codes (membership upsert),
-  - prompt for phone collection if missing (or other onboarding).
+  - prompt for phone collection if missing (optional and non-blocking).
 - `/respond` and `/done`:
   - deterministically seal the current open session (if any),
   - enqueue `process_session(session_id)` immediately.
@@ -88,15 +90,18 @@ Important: flush ack is not required and should not replace per-message feedback
 
 Worker task: `process_session(session_id)` runs the main pipeline:
 1) Load session messages + attachments + history context.
-2) Convert attachments to text (future work):
-   - files -> text (OCR/parse)
-   - audio -> text (ASR)
+2) If files are present, the agent can call file-processing tools to enqueue
+   invoice/price list/inventory photo extraction. Processing writes to
+   `file_processing_staging` and sends a preview for review/confirm.
 3) Cheap topic gate (gate model) returns strict JSON:
    - on-topic/off-topic classification
    - If off-topic: send redirect, set ghosting mode, exit
-4) Run general-purpose agent loop (`app/ai/agent.py`, up to 8 rounds):
-   - Agent has access to modular database tools (`app/ai/db_tools/`: profile, restaurants, staff, invites)
+4) Run general-purpose agent loop (`app/ai/agent.py`, up to 8 rounds by default):
+   - Agent has access to modular database tools (`app/ai/db_tools/`), including:
+     profile, restaurants, staff, invites, products, suppliers, inventory,
+     product_aliases, file_processing
    - Agent autonomously decides which tools to call based on user request
+   - Memory/history is context only; it should not block tool calls
    - Multi-round conversations: agent can make multiple LLM calls, using tools between rounds
    - Each LLM call is recorded individually in `llm_calls` for cost tracking
    - Tools enforce role/scope-based access controls via:

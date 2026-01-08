@@ -1,6 +1,6 @@
 # Unified flow refactor checklist (batching enabled)
 
-**Note**: This checklist references some outdated components. The capability gating system has been replaced with a general-purpose agent with tool-calling. See `docs/capabilities.md` for migration notes.
+**Note**: This checklist references some outdated components. The system is now tool-first with policy enforcement and includes file-processing workflows (invoice/price list/inventory) with staging + review. See `docs/capabilities.md` and `docs/db-tools-patterns.md`.
 
 Use this as a step-by-step checklist to align the code with `docs/unified-message-flow.md`, updating **one function at a time**.
 
@@ -60,11 +60,9 @@ Files:
 - [ ] `/start` flow:
   - [x] Registers/updates the user deterministically.
   - [x] Accepts `/start <code>` invites (membership upsert) deterministically.
-  - [x] If phone missing: sets `users.state="COLLECT_PHONE"` and prompts immediately.
-- [ ] Instant stateful (phone intake):
-  - [x] When `users.state=="COLLECT_PHONE"`, parse phone deterministically and store it (no verification).
-  - [x] Reset `users.state="IDLE"` after storing phone.
-  - [x] Immediate user-facing response (no batching delay).
+  - [x] If phone missing: prompts immediately (optional; non-blocking, no required state).
+- [ ] Instant stateful (phone intake) [optional]:
+  - [ ] If reintroduced, keep it deterministic and non-blocking.
 - [ ] `/respond` + `/done` force flush behavior:
   - [ ] Ensure there is only one “canonical” force-flush implementation path in batching-enabled mode (webhook vs handler), and remove/avoid drift.
   - [x] Add `/confirm` and `/cancel` as instant commands for DB pending action resolution.
@@ -74,7 +72,7 @@ Files:
 Files:
 - `app/processing/session_processor.py`
 - `app/ai/topic_gate.py`
-- `app/ai/agent.py` (general-purpose agent with tool-calling, up to 8 rounds)
+- `app/ai/agent.py` (general-purpose agent with tool-calling, up to 8 rounds by default)
 - `app/ai/db_tools/` (modular database tools package)
 
 - [x] Keep `process_session` focused on session-level processing:
@@ -103,5 +101,5 @@ Files:
 - [x] Two-layer permission system: direct checks for simple operations, policy checks for complex tables.
 - [x] All LLM calls recorded individually for cost tracking.
 - [x] Documentation: `docs/db-tools-patterns.md` with architecture, patterns, and guide for adding new tools.
-- [ ] Add more database tools as needed (e.g., supplier management, inventory operations) - follow patterns in `docs/db-tools-patterns.md`.
+- [x] Added operational tools (products, suppliers, inventory, file processing).
 - [ ] Add deterministic confirmation + deterministic DB write path for CUD operations (if needed).

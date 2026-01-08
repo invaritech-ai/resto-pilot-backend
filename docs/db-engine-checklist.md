@@ -1,5 +1,9 @@
 # DB engine checklist
 
+**Note**: The DBAction engine is legacy/optional. The primary user-facing path uses
+intent-based tools with policy enforcement. Use this checklist only when working
+on the DBAction path (pending actions or backward compatibility).
+
 - [x] Define the DB action payload schema (fields, enums, required vs optional).
 - [x] Implement payload parsing + validation (schema-level).
 - [x] Implement policy validator against `app/policies/db_allowlist.py` (role/table/CRUD/columns/scope).

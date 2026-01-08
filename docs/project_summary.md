@@ -17,9 +17,11 @@ Resto Pilot is an AI-powered assistant designed for restaurant management and op
 The codebase follows a modular structure within the `app` directory:
 
 - `app/api/`: REST API endpoints and routing.
+- `app/ai/`: Agent loop, tool definitions, and vision client.
 - `app/core/`: Centralized configuration, logging, and security.
 - `app/db/`: Database models, schemas, and session management.
 - `app/domain/`: Core business logic and services (e.g., restaurant management, user handling).
+- `app/processing/`: File processing pipeline (invoice, price list, inventory photo extraction).
 - `app/telegram/`: Logic for processing Telegram webhooks and AI interactions.
 - `app/workers/`: Celery task entry points and worker DB helpers.
 
@@ -31,10 +33,13 @@ See also:
 ## Key Features
 
 - **Telegram Bot Interface**: Users can interact with the Resto Pilot assistant via Telegram.
-- **Restaurant Management**: Systems for managing restaurant data, user permissions, and invite codes.
-- **AI Integration**: Processes incoming messages to provide intelligent assistance (implemented in `app/telegram`).
+- **Tool-first Agent**: The LLM acts as a tool caller; tools enforce policies and permissions.
+- **Restaurant Management**: Restaurant data, memberships, and invite codes.
+- **Operations Schema**: Products, suppliers, invoices, inventory, and disputes.
+- **File Processing**: Vision-based extraction for invoices/price lists/inventory photos with staging + review.
 - **Scalable Serverless Infrastructure**: Designed for cost-effective scaling on AWS Lambda.
-- **Robust Database Schema**: Managed models for Users, Restaurants, and Invite codes.
+- **Robust Database Schema**: User + restaurant core plus operational tables and staging.
+- **Memory as Context**: Conversation memory aids continuity but never blocks tool calls.
 
 Note: even if the HTTP API is deployed serverless (e.g. Lambda), Celery tasks require a separate worker process/service to consume queued work.
 

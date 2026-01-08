@@ -1,45 +1,60 @@
-# ⚠️ DEPRECATED: Capability System
+# Capabilities and tools (current)
 
-**This document is outdated.** The capability gating system has been removed in favor of a general-purpose agent with tool-calling.
+The bot uses a general-purpose agent loop (`app/ai/agent.py`) with tool-calling. The
+LLM acts as a function caller: it should attempt tools (or ask for missing info)
+before refusing, and refusals should come only from tool/policy checks.
 
-## Current Architecture
+## Memory and refusal behavior
 
-The bot now uses a **general-purpose agent loop** (`app/ai/agent.py`) that:
+- Conversation memory/history is **context only** (useful for disambiguation).
+- Never refuse a request based on memory; always attempt a relevant tool call first.
+- If the tool surface changes, the current tool list is authoritative.
 
--   Supports autonomous tool-calling for database operations
--   Enforces access control via role/scope-based policies (`app/policies/db_policy.py`)
--   Records every LLM call individually for cost tracking
--   Can handle diverse user requests without hardcoded capability restrictions
+## Tool surface (intent-based)
 
-## Migration Notes
+Tools are organized by domain in `app/ai/db_tools/`:
 
-The following components were removed:
+- `profile.py`: user profile read/update
+- `restaurants.py`: create/list/get/update restaurants
+- `staff.py`: list staff, revoke access (owner only)
+- `invites.py`: create/list/delete invite codes (owner only)
+- `products.py`: product catalog (owner write, member read)
+- `suppliers.py`: supplier directory (owner write, member read)
+- `inventory.py`: inventory batches and movements
+- `product_aliases.py`: alias management and match confirmation
+- `file_processing.py`: invoice/price list/inventory photo processing with review/confirm
 
--   `app/ai/capability_gate.py` - capability classification
--   `app/ai/reply_guard.py` - output validation guard
--   `app/ai/db_router.py` - database routing logic
--   `app/ai/session_reply.py` - old reply generation
+## Policies and access control
 
-The following components were added:
+Access control is enforced in tools via:
 
--   `app/ai/agent.py` - general-purpose agent loop with tool-calling
--   `app/ai/db_tools/` - modular database tools package (profile, restaurants, staff, invites)
--   `app/ai/tools.py` - base tool infrastructure
+- Direct checks for simple rules: `is_restaurant_owner()`, `has_restaurant_access()`
+- Allowlist checks for centralized policy control: `check_policy_permission()`
 
-See `docs/db-tools-patterns.md` for architecture and patterns.
+The allowlist lives in `app/policies/db_allowlist.py` and is scoped by:
 
-## Access Control
+- `self`
+- `owned_restaurant`
+- `restaurant_owner`
+- `restaurant_member`
 
-Access control is now enforced at the tool level:
+Roles are per-restaurant: the same user can be an owner of one restaurant and staff
+in another. Tools like `list_my_restaurants` return the role per restaurant.
 
--   **Role-based**: Users have roles (owner/staff) that determine which tables/operations they can access
--   **Scope-based**: Operations are scoped to restaurants the user owns/manages
--   **Policy enforcement**: `app/policies/db_policy.py` validates all database actions before execution
+## File processing pipeline
 
-See:
-- `app/policies/db_allowlist.py` for the current allowlist configuration
-- `docs/db-tools-patterns.md` for tool architecture, permission patterns, and how to add new tools
+File ingestion flows use a staging + review model:
 
----
+1. A tool queues processing (`process_invoice_file`, `process_price_list_file`,
+   `process_inventory_photo`).
+2. The worker extracts data with a vision model and writes
+   `file_processing_staging`.
+3. The user reviews (`review_file_processing`) and updates fields if needed.
+4. Owners confirm (`confirm_file_processing`) to write into final tables.
 
-**For historical reference only.** This document describes the old capability system that was removed.
+Vision model config lives in `.env.example` (`APP_VISION_*`).
+
+## Legacy/optional components
+
+The DBAction engine remains for legacy or deterministic flows (pending actions),
+but the primary product path uses intent tools + policy enforcement.

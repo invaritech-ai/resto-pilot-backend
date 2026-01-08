@@ -21,12 +21,13 @@ This project supports a “batched Telegram ingest” mode behind a feature flag
 - `flush_session` no-ops if the session has newer activity; otherwise marks the session `processing` and enqueues two tasks:
   - `send_session_ack(session_id)` (best-effort short backchannel ack; may be skipped for naturalness)
   - `process_session(session_id)`
-- `process_session` runs a cheap on-topic gate and then generates a single assistant reply.
+- `process_session` runs a cheap on-topic gate and then runs the tool-calling agent loop.
 
 ## Reserved commands
-Some commands bypass the normal 30s batching delay (currently: `/start`, `/respond`, `/done`).
+Some commands bypass the normal 30s batching delay (currently: `/start`, `/respond`, `/done`, `/confirm`, `/cancel`).
 - `/start` is delegated to Celery to handle registration/invites and to send responses.
 - `/respond` and `/done` seal the current open session (`status=open -> processing`) and enqueue `send_session_ack` + `process_session`.
+- `/confirm` and `/cancel` resolve pending actions immediately.
 
 ## Run locally (example)
 - Start Redis (local): `redis-server`

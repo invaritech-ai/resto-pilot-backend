@@ -9,16 +9,16 @@ This doc defines the **happy-path user journeys** we want to support in v1.
 
 ## Platform constraints (important)
 
-**Note**: This document was written for the old capability-based architecture. The bot now uses a general-purpose agent with tool-calling. Access control is enforced at the tool level via role/scope-based policies.
+**Note**: This document was written for the old capability-based architecture. The bot now uses a general-purpose agent with tool-calling and policy enforcement. Any references to "capability slugs" below are historical; interpret them as tool availability + role/scope policy checks.
 
 Current architecture:
 
--   The bot uses a general-purpose agent loop with tool-calling (`app/ai/agent.py`, up to 8 rounds)
--   Database tools are organized in `app/ai/db_tools/` (modular package: profile, restaurants, staff, invites)
+-   The bot uses a general-purpose agent loop with tool-calling (`app/ai/agent.py`, up to 8 rounds by default)
+-   Database tools are organized in `app/ai/db_tools/` (profile, restaurants, staff, invites, products, suppliers, inventory, file_processing)
 -   Access control uses two-layer system:
     - Direct checks (`is_restaurant_owner()`, `has_restaurant_access()`) for simple operations
     - Policy checks (`check_policy_permission()`) for complex tables with centralized management
--   The bot can handle diverse requests autonomously, using tools to interact with the database
+-   The bot can handle diverse requests autonomously, using tools to interact with the database and file-processing pipelines
 -   If a user lacks permission for an operation, the agent returns an error explaining the restriction
 
 Reference: 
@@ -79,7 +79,7 @@ Guardrails
 
 Access control requirements
 
--   This is a reserved Telegram command flow (bypasses normal session batching) and is not part of the “employee capability” set.
+-   This is a reserved Telegram command flow (bypasses normal session batching) and is handled deterministically outside the tool loop.
 -   Related concepts in DB: `users`, `restaurants`, `restaurant_users`, `invite_codes` (in v1, “outlet” maps to a `restaurants` row).
 
 ## J1: Restaurant setup & onboarding
@@ -111,12 +111,12 @@ Success criteria
 Guardrails
 
 -   Ask **one question at a time**; avoid offering menus/options.
--   If the owner asks for unrelated tasks, reject once (capability gate) then ghost.
+-   If the owner asks for unrelated tasks, redirect to supported operations and ask for missing info.
 -   Never claim “saved/updated in the system” unless persistence is implemented.
 
 Access control requirements
 
--   Likely capability slug(s): `onboarding` (or `outlet_profile`)
+-   Owner-only; restaurant-owner scope.
 
 ---
 
@@ -150,7 +150,7 @@ Guardrails
 
 Access control requirements
 
--   Likely capability slug(s): `menu_import`, `menu_qna`
+-   Owner-only; restaurant-owner scope.
 
 ---
 
@@ -183,7 +183,7 @@ Guardrails
 
 Access control requirements
 
--   Likely capability slug(s): `menu_qna`, `outlet_qna`
+-   Restaurant member read access.
 
 ---
 
@@ -222,7 +222,7 @@ Guardrails
 
 Access control requirements
 
--   Likely capability slug(s): `reservation_intake` (and later `reservation_create`)
+-   Restaurant member access (staff can intake; owners can update policy as needed).
 
 ---
 
@@ -257,4 +257,4 @@ Guardrails
 
 Access control requirements
 
--   Likely capability slug(s): `ops_brief` (requires careful guardrails to avoid hallucinated “data access”)
+-   Owner-only; restaurant-owner scope.
