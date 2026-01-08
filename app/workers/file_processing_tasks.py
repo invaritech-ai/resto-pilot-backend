@@ -3,8 +3,10 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
+import uuid
 
 from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.db.models.documents import Documents
@@ -12,6 +14,8 @@ from app.db.models.file_processing_staging import FileProcessingStaging
 from app.db.models.processing_events import ProcessingEvents
 from app.db.models.suppliers import Suppliers
 from app.db.models.telegram_messages import TelegramMessages
+from app.ai.openrouter_generation import extract_openrouter_generation_id
+from app.ai.vision_client import VisionCallResult, _get_vision_settings
 from app.processing.file_processor import (
     extract_inventory_data,
     extract_invoice_data,
@@ -21,9 +25,97 @@ from app.processing.file_processor import (
 from app.telegram.bot_api import get_file_bytes, send_message
 from app.workers.celery_app import celery_app
 from app.workers.db import worker_db_session
+from app.workers.telemetry import record_llm_call, schedule_openrouter_cost_backfill
 from app.workers.utils import _get_task_id, _parse_uuid
 
 logger = logging.getLogger(__name__)
+
+
+def _record_vision_telemetry(
+    db: Session,
+    session_uuid: uuid.UUID | None,
+    chat_id: int,
+    telemetry_results: list,
+    purpose_base: str,
+    processing_type: str,
+) -> None:
+    """
+    Record telemetry for vision model calls.
+
+    Args:
+        db: Database session
+        session_uuid: Session UUID (if None, logs warning and skips)
+        chat_id: Chat ID
+        telemetry_results: List of VisionCallResult objects
+        purpose_base: Base purpose name (e.g., "vision_invoice")
+        processing_type: Processing type (invoice/price_list/inventory)
+    """
+    if not session_uuid:
+        logger.warning(
+            "vision_telemetry_skipped_no_session",
+            extra={"chat_id": chat_id, "purpose_base": purpose_base},
+        )
+        return
+
+    for idx, result in enumerate(telemetry_results):
+        # Determine purpose with page index if applicable
+        if len(telemetry_results) > 1:
+            purpose = f"{purpose_base}_page_{idx + 1}"
+        else:
+            purpose = f"{purpose_base}_page"
+
+        # Build metadata with page index
+        generation_json = {}
+        if result.response_data:
+            generation_json = result.response_data.copy()
+        if len(telemetry_results) > 1:
+            generation_json["page_index"] = idx + 1
+        generation_json["processing_type"] = processing_type
+
+        try:
+            llm_call_id = record_llm_call(
+                db=db,
+                session_id=session_uuid,
+                chat_id=chat_id,
+                purpose=purpose,
+                model=result.model,
+                openrouter_generation_id=result.openrouter_generation_id,
+                upstream_id=result.response_data.get("id")
+                if isinstance(result.response_data.get("id"), str)
+                else None,
+                provider_name=result.response_data.get("provider")
+                if isinstance(result.response_data.get("provider"), str)
+                else None,
+                usage=result.usage,
+                latency_ms=result.latency_ms,
+                openrouter_generation_json=generation_json if generation_json else None,
+                error=result.error,
+            )
+            db.commit()
+
+            # Schedule cost backfill if generation ID exists
+            if result.openrouter_generation_id:
+                try:
+                    schedule_openrouter_cost_backfill(
+                        llm_call_id=llm_call_id, delay_seconds=120
+                    )
+                except Exception:
+                    logger.exception(
+                        "vision_cost_backfill_schedule_failed",
+                        extra={
+                            "llm_call_id": str(llm_call_id),
+                            "generation_id": result.openrouter_generation_id,
+                        },
+                    )
+        except Exception:
+            logger.exception(
+                "vision_telemetry_record_failed",
+                extra={
+                    "purpose": purpose,
+                    "model": result.model,
+                    "error": result.error,
+                },
+            )
 
 
 @celery_app.task(name="process_invoice_file_task")
@@ -68,7 +160,46 @@ def process_invoice_file_task(
             filename = telegram_msg.filename if telegram_msg else None
 
             # Extract invoice data (with DB-aware extraction)
-            extracted_data = extract_invoice_data(file_bytes, mime_type, settings, db, filename)
+            try:
+                extracted_data = extract_invoice_data(file_bytes, mime_type, settings, db, filename)
+
+                # Record telemetry for vision calls
+                telemetry_results = extracted_data.pop("_telemetry_results", [])
+                if telemetry_results:
+                    _record_vision_telemetry(
+                        db=db,
+                        session_uuid=session_uuid,
+                        chat_id=chat_id,
+                        telemetry_results=telemetry_results,
+                        purpose_base="vision_invoice",
+                        processing_type="invoice",
+                    )
+            except Exception as exc:
+                # Record error telemetry if possible
+                if session_uuid:
+                    try:
+                        model, _, _ = _get_vision_settings(settings)
+                        error_result = VisionCallResult(
+                            content="",
+                            model=model,
+                            latency_ms=0,
+                            usage=None,
+                            openrouter_generation_id=None,
+                            response_headers={},
+                            response_data={},
+                            error=f"Invoice extraction failed: {exc}",
+                        )
+                        _record_vision_telemetry(
+                            db=db,
+                            session_uuid=session_uuid,
+                            chat_id=chat_id,
+                            telemetry_results=[error_result],
+                            purpose_base="vision_invoice",
+                            processing_type="invoice",
+                        )
+                    except Exception:
+                        logger.exception("failed_to_record_error_telemetry")
+                raise
 
             # Check for missing required fields
             supplier_name = extracted_data.get("supplier_name", "").strip() if extracted_data.get("supplier_name") else ""
@@ -247,7 +378,46 @@ def process_price_list_file_task(
             filename = telegram_msg.filename if telegram_msg else None
 
             # Extract price list data (with DB-aware extraction)
-            extracted_data = extract_price_list_data(file_bytes, mime_type, settings, db, filename)
+            try:
+                extracted_data = extract_price_list_data(file_bytes, mime_type, settings, db, filename)
+
+                # Record telemetry for vision calls
+                telemetry_results = extracted_data.pop("_telemetry_results", [])
+                if telemetry_results:
+                    _record_vision_telemetry(
+                        db=db,
+                        session_uuid=session_uuid,
+                        chat_id=chat_id,
+                        telemetry_results=telemetry_results,
+                        purpose_base="vision_price_list",
+                        processing_type="price_list",
+                    )
+            except Exception as exc:
+                # Record error telemetry if possible
+                if session_uuid:
+                    try:
+                        model, _, _ = _get_vision_settings(settings)
+                        error_result = VisionCallResult(
+                            content="",
+                            model=model,
+                            latency_ms=0,
+                            usage=None,
+                            openrouter_generation_id=None,
+                            response_headers={},
+                            response_data={},
+                            error=f"Price list extraction failed: {exc}",
+                        )
+                        _record_vision_telemetry(
+                            db=db,
+                            session_uuid=session_uuid,
+                            chat_id=chat_id,
+                            telemetry_results=[error_result],
+                            purpose_base="vision_price_list",
+                            processing_type="price_list",
+                        )
+                    except Exception:
+                        logger.exception("failed_to_record_error_telemetry")
+                raise
 
             # Check for missing required fields
             supplier_name = extracted_data.get("supplier_name", "").strip() if extracted_data.get("supplier_name") else ""
@@ -431,7 +601,46 @@ def process_inventory_photo_task(
             filename = telegram_msg.filename if telegram_msg else None
 
             # Extract inventory data (with DB-aware extraction)
-            extracted_data = extract_inventory_data(file_bytes, mime_type, settings, db, filename)
+            try:
+                extracted_data = extract_inventory_data(file_bytes, mime_type, settings, db, filename)
+
+                # Record telemetry for vision calls
+                telemetry_results = extracted_data.pop("_telemetry_results", [])
+                if telemetry_results:
+                    _record_vision_telemetry(
+                        db=db,
+                        session_uuid=session_uuid,
+                        chat_id=chat_id,
+                        telemetry_results=telemetry_results,
+                        purpose_base="vision_inventory",
+                        processing_type="inventory",
+                    )
+            except Exception as exc:
+                # Record error telemetry if possible
+                if session_uuid:
+                    try:
+                        model, _, _ = _get_vision_settings(settings)
+                        error_result = VisionCallResult(
+                            content="",
+                            model=model,
+                            latency_ms=0,
+                            usage=None,
+                            openrouter_generation_id=None,
+                            response_headers={},
+                            response_data={},
+                            error=f"Inventory extraction failed: {exc}",
+                        )
+                        _record_vision_telemetry(
+                            db=db,
+                            session_uuid=session_uuid,
+                            chat_id=chat_id,
+                            telemetry_results=[error_result],
+                            purpose_base="vision_inventory",
+                            processing_type="inventory",
+                        )
+                    except Exception:
+                        logger.exception("failed_to_record_error_telemetry")
+                raise
 
             # Match product aliases for detected items
             supplier_names = [

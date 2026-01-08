@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.ai.db_schema import get_table_schema
 from app.ai.openai_client import OpenAIError, chat_completions_create
-from app.ai.vision_client import process_document_with_vision
+from app.ai.vision_client import process_document_with_vision, VisionDocumentResult
 from app.core.config import Settings
 from app.db.models.products import Products
 from app.db.models.product_aliases import ProductAliases
@@ -172,12 +172,12 @@ CRITICAL RULES:
 5. Return ONLY valid JSON, no other text."""
 
     try:
-        extracted_text = process_document_with_vision(
+        result = process_document_with_vision(
             file_bytes, mime_type, prompt, settings, filename
         )
         # Parse JSON from response
         # The model might return JSON wrapped in markdown code blocks
-        extracted_text = extracted_text.strip()
+        extracted_text = result.content.strip()
         if extracted_text.startswith("```"):
             # Remove markdown code blocks
             lines = extracted_text.split("\n")
@@ -205,6 +205,8 @@ CRITICAL RULES:
                 if "description" in item and "description_raw" not in item:
                     item["description_raw"] = item["description"]
 
+        # Store telemetry for access by file_processing_tasks
+        data["_telemetry_results"] = result.telemetry_results
         return data
     except json.JSONDecodeError as e:
         logger.exception("invoice_extraction_json_parse_failed")
@@ -337,6 +339,8 @@ CRITICAL RULES:
                 if "name" in item and "supplier_name_raw" not in item:
                     item["supplier_name_raw"] = item["name"]
 
+        # Store telemetry for access by file_processing_tasks
+        data["_telemetry_results"] = result.telemetry_results
         return data
     except json.JSONDecodeError as e:
         logger.exception("price_list_extraction_json_parse_failed")
@@ -418,11 +422,11 @@ CRITICAL RULES:
 5. Return ONLY valid JSON, no other text."""
 
     try:
-        extracted_text = process_document_with_vision(
+        result = process_document_with_vision(
             file_bytes, mime_type, prompt, settings, filename
         )
         # Parse JSON from response
-        extracted_text = extracted_text.strip()
+        extracted_text = result.content.strip()
         if extracted_text.startswith("```"):
             lines = extracted_text.split("\n")
             extracted_text = (
@@ -446,6 +450,8 @@ CRITICAL RULES:
                 if "raw_row" not in item:
                     item["raw_row"] = None
 
+        # Store telemetry for access by file_processing_tasks
+        data["_telemetry_results"] = result.telemetry_results
         return data
     except json.JSONDecodeError as e:
         logger.exception("inventory_extraction_json_parse_failed")
