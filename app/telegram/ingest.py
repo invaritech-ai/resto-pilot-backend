@@ -1,32 +1,21 @@
+"""
+Telegram update parsing utilities.
+
+Provides the ParsedTelegramMessage dataclass and parse_update function
+for extracting structured data from Telegram webhook payloads.
+"""
+
 from __future__ import annotations
 
 import datetime as dt
-import logging
 from dataclasses import dataclass
-import random
 from typing import Any, Mapping, cast
-import uuid
-
-from sqlalchemy import select, update
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
-
-from app.core.config import Settings
-from app.db.models.processing_events import ProcessingEvents
-from app.db.models.telegram_messages import TelegramMessages
-from app.db.models.telegram_session import TelegramSessions
-from app.db.models.user import User
-from app.telegram.commands import extract_command
-from app.telegram.session_lock import lock_chat_id
-from app.workers.celery_types import CeleryApplyAsync
-
-logger = logging.getLogger(__name__)
-
-MESSAGE_BACKCHANNEL_SKIP_PROBABILITY = 0.40
 
 
 @dataclass(frozen=True)
 class ParsedTelegramMessage:
+    """Structured representation of a Telegram message."""
+
     update_id: int
     message_id: int
     chat_id: int
@@ -42,44 +31,15 @@ class ParsedTelegramMessage:
     size: int | None = None
 
 
-_HINT_COMMANDS: set[str] = {
-    "/invoice",
-    "/inventory",
-    "/prices",
-    "/recipe",
-    "/menu",
-    "/done",
-    "/reset",
-    "/help",
-}
-
-
-def _coerce_utc(value: dt.datetime) -> dt.datetime:
-    """
-    Normalize datetimes to UTC-aware.
-
-    SQLite may return naive datetimes even when columns are declared with
-    timezone=True; treat naive values as UTC.
-    """
-    if value.tzinfo is None:
-        return value.replace(tzinfo=dt.UTC)
-    return value.astimezone(dt.UTC)
-
-
 def _parse_unix_seconds(value: object) -> dt.datetime:
+    """Convert Unix timestamp to datetime."""
     if isinstance(value, int):
         return dt.datetime.fromtimestamp(value, tz=dt.UTC)
     return dt.datetime.now(dt.UTC)
 
 
-def _extract_hint_command(*, text: str | None, caption: str | None) -> str | None:
-    command, _args = extract_command(text, caption)
-    if command in _HINT_COMMANDS:
-        return command
-    return None
-
-
 def _pick_photo_variant(photo: object) -> dict | None:
+    """Pick the best quality photo variant from Telegram's array."""
     if not isinstance(photo, list) or not photo:
         return None
 
@@ -111,6 +71,15 @@ def _pick_photo_variant(photo: object) -> dict | None:
 
 
 def parse_update(update: Mapping[str, Any]) -> ParsedTelegramMessage | None:
+    """
+    Parse a Telegram update into a structured message.
+
+    Args:
+        update: Raw Telegram webhook update dictionary
+
+    Returns:
+        ParsedTelegramMessage or None if the update cannot be parsed
+    """
     message_obj = update.get("message") or update.get("edited_message")
     if not isinstance(message_obj, dict):
         return None
@@ -178,9 +147,7 @@ def parse_update(update: Mapping[str, Any]) -> ParsedTelegramMessage | None:
                 else None
             )
             size = (
-                best.get("file_size")
-                if isinstance(best.get("file_size"), int)
-                else None
+                best.get("file_size") if isinstance(best.get("file_size"), int) else None
             )
 
     return ParsedTelegramMessage(
@@ -198,255 +165,3 @@ def parse_update(update: Mapping[str, Any]) -> ParsedTelegramMessage | None:
         filename=filename,
         size=size,
     )
-
-
-def _compute_flush_at(
-    *, started_at: dt.datetime, last_activity_at: dt.datetime, settings: Settings
-) -> dt.datetime:
-    idle_deadline = last_activity_at + dt.timedelta(
-        seconds=settings.telegram_batch_idle_seconds
-    )
-    cap_deadline = started_at + dt.timedelta(
-        seconds=settings.telegram_batch_max_seconds
-    )
-    return min(idle_deadline, cap_deadline)
-
-
-def ingest_update(
-    *,
-    update: Mapping[str, Any],
-    session: Session,
-    settings: Settings,
-    schedule_flush: bool = True,
-) -> uuid.UUID | None:
-    parsed = parse_update(update)
-    if parsed is None:
-        logger.info("telegram_ingest_parse_failed")
-        return None
-
-    lock_chat_id(session=session, chat_id=parsed.chat_id)
-
-    user = session.scalar(select(User).where(User.telegram_id == parsed.telegram_id))
-    if user is None:
-        logger.info(
-            "telegram_ingest_user_not_registered",
-            extra={
-                "telegram_id": parsed.telegram_id,
-                "chat_id": parsed.chat_id,
-                "update_id": parsed.update_id,
-                "message_id": parsed.message_id,
-            },
-        )
-        return None
-
-    now = dt.datetime.now(dt.UTC)
-    hint = _extract_hint_command(text=parsed.text, caption=parsed.caption)
-    logger.info(
-        "telegram_ingest_start update_id=%s message_id=%s chat_id=%s telegram_id=%s hint=%s schedule_flush=%s",
-        parsed.update_id,
-        parsed.message_id,
-        parsed.chat_id,
-        parsed.telegram_id,
-        hint,
-        schedule_flush,
-    )
-
-    open_session = session.scalar(
-        select(TelegramSessions)
-        .where(
-            TelegramSessions.chat_id == parsed.chat_id,
-            TelegramSessions.status == "open",
-        )
-        .order_by(TelegramSessions.started_at.desc())
-        .limit(1)
-    )
-
-    should_start_new = True
-    if open_session is not None:
-        idle_gap = (now - _coerce_utc(open_session.last_activity_at)).total_seconds()
-        age = (now - _coerce_utc(open_session.started_at)).total_seconds()
-        if (
-            idle_gap < settings.telegram_batch_idle_seconds
-            and age < settings.telegram_batch_max_seconds
-        ):
-            should_start_new = False
-
-    if open_session is None or should_start_new:
-        open_session = TelegramSessions(
-            chat_id=parsed.chat_id,
-            started_at=now,
-            last_activity_at=now,
-            flush_at=_compute_flush_at(
-                started_at=now, last_activity_at=now, settings=settings
-            ),
-            status="open",
-            hint_command=None,
-        )
-        session.add(open_session)
-        session.flush()
-        logger.info(
-            "telegram_ingest_open_session_created update_id=%s chat_id=%s session_id=%s",
-            parsed.update_id,
-            parsed.chat_id,
-            str(open_session.id),
-        )
-    else:
-        logger.info(
-            "telegram_ingest_open_session_reused update_id=%s chat_id=%s session_id=%s",
-            parsed.update_id,
-            parsed.chat_id,
-            str(open_session.id),
-        )
-
-    assert open_session is not None
-
-    if hint == "/reset":
-        open_session.hint_command = None
-    elif hint and hint not in {"/done", "/help"}:
-        open_session.hint_command = hint
-
-    open_session.last_activity_at = now
-    open_session.flush_at = _compute_flush_at(
-        started_at=_coerce_utc(open_session.started_at),
-        last_activity_at=now,
-        settings=settings,
-    )
-    if hint == "/done":
-        open_session.flush_at = now
-
-    msg = TelegramMessages(
-        session_id=open_session.id,
-        chat_id=parsed.chat_id,
-        user_id=user.id,
-        telegram_id=parsed.telegram_id,
-        message_id=parsed.message_id,
-        update_id=parsed.update_id,
-        received_at=parsed.received_at,
-        text=parsed.text,
-        caption=parsed.caption,
-        file_id=parsed.file_id,
-        file_unique_id=parsed.file_unique_id,
-        file_kind=parsed.file_kind,
-        mime=parsed.mime,
-        filename=parsed.filename,
-        size=parsed.size,
-    )
-    session.add(msg)
-
-    session.add(
-        ProcessingEvents(
-            session_id=open_session.id,
-            at=now,
-            event="ingested_update",
-            payload_json=None,
-            error=None,
-        )
-    )
-
-    try:
-        session.commit()
-    except IntegrityError:
-        session.rollback()
-        logger.info(
-            "telegram_ingest_duplicate_update",
-            extra={"update_id": parsed.update_id, "chat_id": parsed.chat_id},
-        )
-        return None
-
-    # Per-message backchannel (best-effort): decide quickly whether to respond with a
-    # short ack now, without waiting for the session flush.
-    if schedule_flush and settings.celery_broker_url:
-        if random.random() >= MESSAGE_BACKCHANNEL_SKIP_PROBABILITY:
-            from app.workers.tasks import send_message_backchannel  # imported lazily
-
-            logger.info(
-                "telegram_ingest_scheduling_message_backchannel update_id=%s chat_id=%s session_id=%s",
-                parsed.update_id,
-                parsed.chat_id,
-                str(open_session.id),
-            )
-            cast(CeleryApplyAsync, send_message_backchannel).apply_async(
-                kwargs={"session_id": str(open_session.id)},
-                countdown=0.0,
-            )
-
-    if not schedule_flush:
-        logger.info(
-            "telegram_ingest_done_no_flush_scheduled update_id=%s chat_id=%s session_id=%s",
-            parsed.update_id,
-            parsed.chat_id,
-            str(open_session.id),
-        )
-        return open_session.id
-
-    countdown = max(0.0, (_coerce_utc(open_session.flush_at) - now).total_seconds())
-
-    if not settings.celery_broker_url:
-        logger.warning("celery_broker_not_configured")
-        return open_session.id
-
-    from app.workers.tasks import flush_session  # imported lazily
-
-    logger.info(
-        "telegram_ingest_scheduling_flush update_id=%s chat_id=%s session_id=%s countdown=%s",
-        parsed.update_id,
-        parsed.chat_id,
-        str(open_session.id),
-        countdown,
-    )
-    async_result = cast(CeleryApplyAsync, flush_session).apply_async(
-        kwargs={
-            "session_id": str(open_session.id),
-            "expected_last_activity_at": open_session.last_activity_at.isoformat(),
-        },
-        countdown=countdown,
-    )
-    logger.info(
-        "telegram_ingest_flush_scheduled task_id=%s update_id=%s chat_id=%s session_id=%s",
-        getattr(async_result, "id", None),
-        parsed.update_id,
-        parsed.chat_id,
-        str(open_session.id),
-    )
-
-    return open_session.id
-
-
-def seal_open_session(*, chat_id: int, session: Session) -> uuid.UUID | None:
-    now = dt.datetime.now(dt.UTC)
-
-    lock_chat_id(session=session, chat_id=chat_id)
-
-    latest_open_session_id = (
-        select(TelegramSessions.id)
-        .where(TelegramSessions.chat_id == chat_id, TelegramSessions.status == "open")
-        .order_by(TelegramSessions.started_at.desc())
-        .limit(1)
-        .scalar_subquery()
-    )
-
-    sealed_id = session.execute(
-        update(TelegramSessions)
-        .where(
-            TelegramSessions.id == latest_open_session_id,
-            TelegramSessions.status == "open",
-        )
-        .values(status="processing", closed_at=now)
-        .returning(TelegramSessions.id)
-    ).scalar_one_or_none()
-
-    if sealed_id is None:
-        return None
-
-    session.add(
-        ProcessingEvents(
-            session_id=sealed_id,
-            at=now,
-            event="session_sealed_by_command",
-            payload_json=None,
-            error=None,
-        )
-    )
-
-    session.commit()
-    return sealed_id

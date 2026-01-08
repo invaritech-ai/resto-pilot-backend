@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 
 from app.core.config import get_settings
-from app.telegram.handler_v2 import handle_update_v2
+from app.telegram.handler import handle_update_v2
 from app.workers.celery_app import celery_app
 from app.workers.db import worker_db_session
 from app.workers.utils import _get_task_id

@@ -1,12 +1,13 @@
+"""
+Utility functions for Celery workers.
+"""
+
 from __future__ import annotations
 
 import datetime as dt
 import uuid
-from celery import current_task
 
-# Constants
-SESSION_FLUSH_REPLY_TEXT = "Got it — I'm on it."
-MESSAGE_BACKCHANNEL_KIND = "ack_message"
+from celery import current_task
 
 
 def _coerce_utc(value: dt.datetime) -> dt.datetime:
@@ -22,9 +23,11 @@ def _coerce_utc(value: dt.datetime) -> dt.datetime:
 
 
 def _parse_uuid(value: str) -> uuid.UUID:
+    """Parse a string UUID."""
     return uuid.UUID(value)
 
 
 def _get_task_id() -> str | None:
+    """Get the current Celery task ID."""
     request = getattr(current_task, "request", None)
     return getattr(request, "id", None)
