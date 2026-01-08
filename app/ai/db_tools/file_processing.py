@@ -151,7 +151,9 @@ def create_file_processing_tools(
             countdown=0.0,
         )
 
-        return "I'm analyzing your inventory photo. I'll show you what I found for review."
+        return (
+            "I'm analyzing your inventory photo. I'll show you what I found for review."
+        )
 
     def review_file_processing(args: dict[str, Any]) -> str:
         """Show extracted data from file processing for review."""
@@ -171,7 +173,11 @@ def create_file_processing_tools(
         if not has_restaurant_access(db, user_id, staging.restaurant_id):
             return "Error: You don't have access to this file processing record."
 
-        if staging.status not in ("pending_review", "awaiting_supplier", "awaiting_currency"):
+        if staging.status not in (
+            "pending_review",
+            "awaiting_supplier",
+            "awaiting_currency",
+        ):
             return f"Error: This record is already {staging.status}. Cannot review."
 
         # Format the extracted data nicely
@@ -180,12 +186,22 @@ def create_file_processing_tools(
 
         if processing_type == "invoice":
             lines = ["📄 Invoice Preview:\n"]
-            supplier_name = extracted_data.get("supplier_name", "").strip() if extracted_data.get("supplier_name") else ""
-            currency = extracted_data.get("currency", "").strip() if extracted_data.get("currency") else ""
+            supplier_name = (
+                extracted_data.get("supplier_name", "").strip()
+                if extracted_data.get("supplier_name")
+                else ""
+            )
+            currency = (
+                extracted_data.get("currency", "").strip()
+                if extracted_data.get("currency")
+                else ""
+            )
             supplier_display = supplier_name or "⚠️ MISSING"
             currency_display = currency or "⚠️ MISSING"
             lines.append(f"Supplier: {supplier_display}")
-            lines.append(f"Invoice Number: {extracted_data.get('invoice_number', 'N/A')}")
+            lines.append(
+                f"Invoice Number: {extracted_data.get('invoice_number', 'N/A')}"
+            )
             lines.append(f"Date: {extracted_data.get('invoice_date', 'N/A')}")
             lines.append(f"Currency: {currency_display}")
             lines.append(f"Total: {extracted_data.get('total', 'N/A')}")
@@ -204,8 +220,16 @@ def create_file_processing_tools(
                 )
         elif processing_type == "price_list":
             lines = ["📋 Price List Preview:\n"]
-            supplier_name = extracted_data.get("supplier_name", "").strip() if extracted_data.get("supplier_name") else ""
-            currency = extracted_data.get("currency", "").strip() if extracted_data.get("currency") else ""
+            supplier_name = (
+                extracted_data.get("supplier_name", "").strip()
+                if extracted_data.get("supplier_name")
+                else ""
+            )
+            currency = (
+                extracted_data.get("currency", "").strip()
+                if extracted_data.get("currency")
+                else ""
+            )
             supplier_display = supplier_name or "⚠️ MISSING"
             currency_display = currency or "⚠️ MISSING"
             lines.append(f"Supplier: {supplier_display}")
@@ -222,7 +246,7 @@ def create_file_processing_tools(
                 source_info = ""
                 if item.get("source_page"):
                     source_info = f" [Page {item['source_page']}]"
-                
+
                 item_line = f"  {i}. {name}"
                 if pack_size:
                     item_line += f" (pack_size_text: {pack_size})"
@@ -245,7 +269,7 @@ def create_file_processing_tools(
                 source_info = ""
                 if item.get("source_page"):
                     source_info = f" [Page {item['source_page']}]"
-                
+
                 item_line = f"  {i}. {product_name} - {quantity} {unit}"
                 if unit_cost is not None:
                     item_line += f" (unit_cost: {unit_cost})"
@@ -257,7 +281,9 @@ def create_file_processing_tools(
             lines = [f"Preview for {processing_type}:\n"]
             lines.append(json.dumps(extracted_data, indent=2))
 
-        lines.append("\n\nReview the data above. Tell me if anything needs changing, or say /confirm to save.")
+        lines.append(
+            "\n\nReview the data above. Tell me if anything needs changing, or say /confirm to save."
+        )
         return "\n".join(lines)
 
     def update_missing_field(args: dict[str, Any]) -> str:
@@ -287,11 +313,15 @@ def create_file_processing_tools(
 
         # Update extracted_data_json
         extracted_data = staging.extracted_data_json.copy()
-        
+
         if staging.status == "awaiting_supplier":
             extracted_data["supplier_name"] = field_value
             # Check if currency is also missing
-            currency = extracted_data.get("currency", "").strip() if extracted_data.get("currency") else ""
+            currency = (
+                extracted_data.get("currency", "").strip()
+                if extracted_data.get("currency")
+                else ""
+            )
             if not currency:
                 staging.status = "awaiting_currency"
             else:
@@ -303,7 +333,7 @@ def create_file_processing_tools(
         staging.extracted_data_json = extracted_data
         try:
             db.commit()
-            
+
             # If status is now pending_review, return preview
             if staging.status == "pending_review":
                 # Use review_file_processing logic to format preview
@@ -313,13 +343,17 @@ def create_file_processing_tools(
                     supplier_display = extracted_data.get("supplier_name", "N/A")
                     currency_display = extracted_data.get("currency", "N/A")
                     lines.append(f"Supplier: {supplier_display}")
-                    lines.append(f"Invoice Number: {extracted_data.get('invoice_number', 'N/A')}")
+                    lines.append(
+                        f"Invoice Number: {extracted_data.get('invoice_number', 'N/A')}"
+                    )
                     lines.append(f"Date: {extracted_data.get('invoice_date', 'N/A')}")
                     lines.append(f"Currency: {currency_display}")
                     lines.append(f"Total: {extracted_data.get('total', 'N/A')}")
                     lines.append("\nLine Items:")
                     for i, item in enumerate(extracted_data.get("line_items", []), 1):
-                        desc = item.get("description_raw", item.get("description", "N/A"))
+                        desc = item.get(
+                            "description_raw", item.get("description", "N/A")
+                        )
                         qty = item.get("quantity", "N/A")
                         unit = item.get("unit", "")
                         price = item.get("unit_price", "N/A")
@@ -348,7 +382,7 @@ def create_file_processing_tools(
                         source_info = ""
                         if item.get("source_page"):
                             source_info = f" [Page {item['source_page']}]"
-                        
+
                         item_line = f"  {i}. {name}"
                         if pack_size:
                             item_line += f" (pack_size_text: {pack_size})"
@@ -358,13 +392,17 @@ def create_file_processing_tools(
                             item_line += f" (min_order_qty: {min_order_qty})"
                         item_line += f" - {price} {item_currency}{source_info}"
                         lines.append(item_line)
-                
-                lines.append("\n\nReview the data above. Tell me if anything needs changing, or say /confirm to save.")
+
+                lines.append(
+                    "\n\nReview the data above. Tell me if anything needs changing, or say /confirm to save."
+                )
                 return "\n".join(lines)
             else:
                 # Still waiting for another field
                 if staging.status == "awaiting_currency":
-                    return "Updated supplier. What currency is this in? (e.g., USD, EUR)"
+                    return (
+                        "Updated supplier. What currency is this in? (e.g., USD, EUR)"
+                    )
                 return f"Updated {field_value}. Status: {staging.status}"
         except Exception as e:
             db.rollback()
@@ -408,7 +446,9 @@ def create_file_processing_tools(
             if isinstance(part, str) and part.isdigit():
                 part = int(part)
             if not isinstance(current, (dict, list)):
-                return f"Error: Invalid path '{field_path}' - '{part}' is not a dict/list."
+                return (
+                    f"Error: Invalid path '{field_path}' - '{part}' is not a dict/list."
+                )
             if isinstance(current, list):
                 if not isinstance(part, int) or part >= len(current):
                     return f"Error: Invalid path '{field_path}' - index {part} out of range."
@@ -440,7 +480,7 @@ def create_file_processing_tools(
             return f"Error updating data: {str(e)}"
 
     def confirm_file_processing(args: dict[str, Any]) -> str:
-        """Confirm and write extracted data to final tables. Only restaurant owners can confirm."""
+        """Confirm and write extracted data to final tables. Both owners and staff can confirm (attribution is tracked)."""
         staging_id_str = args.get("staging_id", "").strip()
         if not staging_id_str:
             return "Error: staging_id is required."
@@ -454,8 +494,9 @@ def create_file_processing_tools(
         if not staging:
             return "Error: File processing record not found."
 
-        if not is_restaurant_owner(db, user_id, staging.restaurant_id):
-            return "Error: Only restaurant owners can confirm file processing."
+        # Allow both owners and staff to confirm - attribution is tracked via authorized_by_user_id
+        if not has_restaurant_access(db, user_id, staging.restaurant_id):
+            return "Error: You don't have access to this restaurant."
 
         if staging.status != "pending_review":
             return f"Error: This record is already {staging.status}. Cannot confirm."
@@ -480,7 +521,9 @@ def create_file_processing_tools(
                     # Try YYYY-MM-DD format
                     if len(date_str) >= 10:
                         date_part = date_str[:10]
-                        return dt.datetime.strptime(date_part, "%Y-%m-%d").replace(tzinfo=dt.UTC)
+                        return dt.datetime.strptime(date_part, "%Y-%m-%d").replace(
+                            tzinfo=dt.UTC
+                        )
                 except ValueError:
                     pass
                 return None
@@ -529,9 +572,9 @@ def create_file_processing_tools(
                 # Update document with supplier_id
                 document.supplier_id = supplier_id
 
-                invoice_date = parse_date(extracted_data.get("invoice_date")) or dt.datetime.now(
-                    dt.UTC
-                )
+                invoice_date = parse_date(
+                    extracted_data.get("invoice_date")
+                ) or dt.datetime.now(dt.UTC)
                 due_date = parse_date(extracted_data.get("due_date"))
 
                 # Create invoice
@@ -557,7 +600,9 @@ def create_file_processing_tools(
                     line_item = InvoiceLineItems(
                         invoice_id=invoice.id,
                         supplier_id=supplier_id,
-                        description_raw=item.get("description_raw", item.get("description", "")),
+                        description_raw=item.get(
+                            "description_raw", item.get("description", "")
+                        ),
                         quantity=float(item.get("quantity", 0)),
                         unit=item.get("unit", ""),
                         unit_price=float(item.get("unit_price", 0)),
@@ -570,12 +615,220 @@ def create_file_processing_tools(
                 summary = f"Invoice created: {invoice.invoice_number}, {len(extracted_data.get('line_items', []))} line items, Total: {invoice.total} {invoice.currency}"
 
             elif processing_type == "price_list":
-                # TODO: Implement price list confirmation
-                summary = "Price list confirmation not yet implemented."
+                from app.db.models.documents import Documents
+                from app.db.models.suppliers import Suppliers
+                from app.db.models.supplier_items import SupplierItems
+                from app.db.models.supplier_prices import SupplierPrices
+
+                # Get document (should already exist from processing task)
+                document = None
+                if staging.document_id:
+                    document = db.get(Documents, staging.document_id)
+
+                if not document:
+                    return "Error: Document record not found. The file processing may not have completed correctly."
+
+                # Find or create supplier by name
+                supplier_name = extracted_data.get("supplier_name", "").strip()
+                if not supplier_name:
+                    return "Error: Supplier name is required for price list processing."
+
+                supplier = db.scalar(
+                    select(Suppliers).where(
+                        Suppliers.restaurant_id == staging.restaurant_id,
+                        Suppliers.name.ilike(supplier_name),
+                        Suppliers.is_active == True,
+                    )
+                )
+
+                if not supplier:
+                    # Create new supplier with contact info if available
+                    supplier = Suppliers(
+                        restaurant_id=staging.restaurant_id,
+                        name=supplier_name,
+                        contact_name=extracted_data.get("contact_name"),
+                        contact_email=extracted_data.get("contact_email"),
+                        contact_phone=extracted_data.get("contact_phone"),
+                        currency=extracted_data.get("currency", "USD"),
+                        is_active=True,
+                    )
+                    db.add(supplier)
+                    db.flush()
+                else:
+                    # Update contact info if provided and not already set
+                    if extracted_data.get("contact_name") and not supplier.contact_name:
+                        supplier.contact_name = extracted_data.get("contact_name")
+                    if (
+                        extracted_data.get("contact_email")
+                        and not supplier.contact_email
+                    ):
+                        supplier.contact_email = extracted_data.get("contact_email")
+                    if (
+                        extracted_data.get("contact_phone")
+                        and not supplier.contact_phone
+                    ):
+                        supplier.contact_phone = extracted_data.get("contact_phone")
+                    if extracted_data.get("currency") and not supplier.currency:
+                        supplier.currency = extracted_data.get("currency")
+
+                supplier_id = supplier.id
+
+                # Update document with supplier_id
+                document.supplier_id = supplier_id
+
+                # Parse effective date
+                effective_date = parse_date(
+                    extracted_data.get("effective_date")
+                ) or dt.datetime.now(dt.UTC)
+
+                # Create supplier items and prices
+                items_created = 0
+                prices_created = 0
+
+                for item_data in extracted_data.get("items", []):
+                    supplier_name_raw = item_data.get(
+                        "supplier_name_raw", item_data.get("name", "")
+                    )
+                    if not supplier_name_raw:
+                        continue
+
+                    # Check if item already exists (de-duplicate by supplier_name_raw + supplier_id)
+                    existing_item = db.scalar(
+                        select(SupplierItems).where(
+                            SupplierItems.supplier_id == supplier_id,
+                            SupplierItems.supplier_name_raw.ilike(supplier_name_raw),
+                            SupplierItems.status == "active",
+                        )
+                    )
+
+                    if existing_item:
+                        supplier_item = existing_item
+                    else:
+                        # Create new supplier item WITHOUT product_id
+                        # We store raw names and search when user asks "who has item X?"
+                        supplier_item = SupplierItems(
+                            supplier_id=supplier_id,
+                            product_id=None,  # No product matching - store raw names only
+                            supplier_sku=item_data.get("supplier_sku"),
+                            supplier_name_raw=supplier_name_raw,
+                            pack_size_text=item_data.get("pack_size_text"),
+                            unit_basis=item_data.get("unit_basis"),
+                            min_order_qty=float(item_data.get("min_order_qty", 0))
+                            if item_data.get("min_order_qty") is not None
+                            else None,
+                            status="active",
+                            source_document_id=document.id,
+                        )
+                        db.add(supplier_item)
+                        db.flush()
+                        items_created += 1
+
+                    # Create price entry
+                    valid_from = (
+                        parse_date(item_data.get("valid_from")) or effective_date
+                    )
+                    valid_to = parse_date(item_data.get("valid_to"))
+
+                    price = SupplierPrices(
+                        supplier_item_id=supplier_item.id,
+                        price=float(item_data.get("price", 0)),
+                        currency=item_data.get(
+                            "currency", extracted_data.get("currency", "USD")
+                        ),
+                        price_type=item_data.get("price_type", "standard"),
+                        valid_from=valid_from,
+                        valid_to=valid_to,
+                        min_qty=float(item_data.get("min_qty", 0))
+                        if item_data.get("min_qty") is not None
+                        else None,
+                        source_document_id=document.id,
+                    )
+                    db.add(price)
+                    prices_created += 1
+
+                summary = f"Price list confirmed: {items_created} items, {prices_created} prices for {supplier_name}"
 
             elif processing_type == "inventory":
-                # TODO: Implement inventory confirmation
-                summary = "Inventory confirmation not yet implemented."
+                from app.db.models.inventory_batches import InventoryBatches
+                from app.db.models.products import Products
+                from app.db.models.suppliers import Suppliers
+
+                # For inventory, we need product_id - user will need to match products
+                # For now, we'll create batches but they need product_id
+                # TODO: Consider making product_id optional or handling unmatched items differently
+
+                batches_created = 0
+                skipped_no_product = 0
+
+                for item_data in extracted_data.get("items", []):
+                    product_name = item_data.get("product_name", "").strip()
+                    if not product_name:
+                        continue
+
+                    # Try to find product by name
+                    product = db.scalar(
+                        select(Products).where(
+                            Products.restaurant_id == staging.restaurant_id,
+                            (
+                                Products.name_en.ilike(product_name)
+                                | Products.name_local.ilike(product_name)
+                            ),
+                            Products.is_active == True,
+                        )
+                    )
+
+                    if not product:
+                        skipped_no_product += 1
+                        continue  # Skip items without matching product
+
+                    # Find or use default supplier (inventory may not have supplier info)
+                    supplier_id = None
+                    if item_data.get("supplier_id"):
+                        supplier_id = uuid.UUID(item_data.get("supplier_id"))
+                    else:
+                        # Try to find supplier by name if provided
+                        supplier_name = extracted_data.get("supplier_name")
+                        if supplier_name:
+                            supplier = db.scalar(
+                                select(Suppliers).where(
+                                    Suppliers.restaurant_id == staging.restaurant_id,
+                                    Suppliers.name.ilike(supplier_name),
+                                    Suppliers.is_active == True,
+                                )
+                            )
+                            if supplier:
+                                supplier_id = supplier.id
+
+                    if not supplier_id:
+                        skipped_no_product += 1
+                        continue  # Need supplier for inventory batch
+
+                    received_date = parse_date(
+                        item_data.get("received_date")
+                    ) or dt.datetime.now(dt.UTC)
+                    expiry_date = parse_date(item_data.get("expiry_date"))
+
+                    batch = InventoryBatches(
+                        restaurant_id=staging.restaurant_id,
+                        product_id=product.id,
+                        supplier_id=supplier_id,
+                        quantity=float(item_data.get("quantity", 0)),
+                        unit=item_data.get("unit", ""),
+                        unit_cost=float(item_data.get("unit_cost", 0))
+                        if item_data.get("unit_cost") is not None
+                        else 0.0,
+                        received_date=received_date,
+                        expiry_date=expiry_date,
+                        status=item_data.get("status", "available"),
+                    )
+                    db.add(batch)
+                    batches_created += 1
+
+                summary = f"Inventory confirmed: {batches_created} batches created"
+                if skipped_no_product > 0:
+                    summary += (
+                        f", {skipped_no_product} items skipped (no matching product)"
+                    )
 
             else:
                 return f"Error: Unknown processing type: {processing_type}"
@@ -723,7 +976,7 @@ def create_file_processing_tools(
         ),
         "confirm_file_processing": Tool(
             name="confirm_file_processing",
-            description="Confirm and write extracted data to final tables. Only restaurant owners can confirm.",
+            description="Confirm and write extracted data to final tables. Both owners and staff can confirm (attribution is tracked).",
             parameters={
                 "type": "object",
                 "properties": {
@@ -738,4 +991,3 @@ def create_file_processing_tools(
             handler=confirm_file_processing,
         ),
     }
-
