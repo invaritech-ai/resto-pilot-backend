@@ -18,9 +18,10 @@ MAIN_MENU = """Welcome! Here's what I can help you with:
 📋 *Profile* - View or update your name/phone
 🏪 *Outlets* - Manage your restaurants
 👥 *Staff* - View or invite team members
-📦 *Suppliers* - Manage your vendors
-📊 *Inventory* - Track your stock
-📄 *Files* - Upload price lists or invoices
+📦 *Suppliers* - Manage vendors, view price lists & items
+📄 *Invoices* - View past invoices
+📊 *Inventory* - Track stock, locations, log usage
+📤 *Files* - Upload price lists or invoices
 
 Just tell me what you'd like to do!"""
 
@@ -168,6 +169,108 @@ def supplier_details(supplier: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def supplier_price_list(supplier_name: str, items: list[dict[str, Any]]) -> str:
+    """Format supplier price list response."""
+    if not items:
+        return f"No price list found for {supplier_name}."
+    
+    lines = [f"💰 *{supplier_name} - Price List*\n"]
+    for item in items[:30]:
+        name = item.get("name", "Unknown")
+        price = item.get("price")
+        unit = item.get("unit", "")
+        currency = item.get("currency", "")
+        if price is not None:
+            lines.append(f"• {name}: {price} {currency}/{unit}")
+        else:
+            lines.append(f"• {name}: (no price)")
+    
+    if len(items) > 30:
+        lines.append(f"\n...and {len(items) - 30} more items")
+    
+    return "\n".join(lines)
+
+
+def supplier_items_list(supplier_name: str, items: list[dict[str, Any]]) -> str:
+    """Format supplier items list response."""
+    if not items:
+        return f"No items found for {supplier_name}."
+    
+    lines = [f"📋 *{supplier_name} - Items Offered*\n"]
+    for i, item in enumerate(items[:30], 1):
+        name = item.get("name", "Unknown")
+        sku = item.get("sku")
+        unit = item.get("unit", "")
+        sku_str = f" (SKU: {sku})" if sku else ""
+        lines.append(f"{i}. {name}{sku_str} - {unit}")
+    
+    if len(items) > 30:
+        lines.append(f"\n...and {len(items) - 30} more items")
+    
+    return "\n".join(lines)
+
+
+# =============================================================================
+# INVOICES
+# =============================================================================
+
+def invoices_list(invoices: list[dict[str, Any]]) -> str:
+    """Format invoices list response."""
+    if not invoices:
+        return "No invoices recorded yet."
+    
+    lines = ["📄 *Recent Invoices*\n"]
+    for inv in invoices[:20]:
+        date = inv.get("date", "N/A")
+        supplier = inv.get("supplier", "Unknown")
+        total = inv.get("total")
+        currency = inv.get("currency", "")
+        status = inv.get("status", "")
+        
+        total_str = f"{total} {currency}" if total else "N/A"
+        status_emoji = "✅" if status == "completed" else "⏳"
+        lines.append(f"{status_emoji} {date} - {supplier}: {total_str}")
+    
+    if len(invoices) > 20:
+        lines.append(f"\n...and {len(invoices) - 20} more invoices")
+    
+    return "\n".join(lines)
+
+
+def invoice_details(invoice: dict[str, Any], line_items: list[dict[str, Any]]) -> str:
+    """Format invoice details response."""
+    lines = ["📄 *Invoice Details*\n"]
+    lines.append(f"Date: {invoice.get('date', 'N/A')}")
+    lines.append(f"Supplier: {invoice.get('supplier', 'Unknown')}")
+    if invoice.get("invoice_number"):
+        lines.append(f"Invoice #: {invoice['invoice_number']}")
+    total = invoice.get("total")
+    currency = invoice.get("currency", "")
+    if total:
+        lines.append(f"Total: {total} {currency}")
+    lines.append(f"Status: {invoice.get('status', 'N/A')}")
+    
+    if line_items:
+        lines.append("\n*Line Items:*")
+        for i, li in enumerate(line_items[:20], 1):
+            desc = li.get("description", "Unknown")
+            qty = li.get("quantity")
+            unit = li.get("unit", "")
+            unit_price = li.get("unit_price")
+            total_amt = li.get("total")
+            
+            qty_str = f"{qty} {unit}" if qty else ""
+            price_str = f"@ {unit_price}" if unit_price else ""
+            total_str = f"= {total_amt}" if total_amt else ""
+            
+            lines.append(f"{i}. {desc} {qty_str} {price_str} {total_str}".strip())
+        
+        if len(line_items) > 20:
+            lines.append(f"...and {len(line_items) - 20} more items")
+    
+    return "\n".join(lines)
+
+
 # =============================================================================
 # INVENTORY
 # =============================================================================
@@ -197,6 +300,26 @@ INVENTORY_ADDED = "Added {quantity} {unit} of {product}."
 INVENTORY_UPDATED = "Updated inventory: {movement_type} {quantity} {unit}."
 
 INVENTORY_ERROR = "Couldn't update inventory. Please try again."
+
+
+def locations_list(locations: list[dict[str, Any]]) -> str:
+    """Format inventory locations list response."""
+    if not locations:
+        return "No storage locations set up yet. Would you like to add one?"
+    
+    lines = ["📍 *Storage Locations*\n"]
+    for loc in locations:
+        name = loc.get("name", "Unknown")
+        loc_type = loc.get("type", "")
+        type_str = f" ({loc_type})" if loc_type else ""
+        lines.append(f"• {name}{type_str}")
+    
+    return "\n".join(lines)
+
+
+LOCATION_CREATED = "Created storage location '{name}'."
+
+LOCATION_ERROR = "Couldn't create the location. Please try again."
 
 
 # =============================================================================

@@ -46,11 +46,20 @@ class Intent(str, Enum):
     ADD_SUPPLIER = "add_supplier"
     UPDATE_SUPPLIER = "update_supplier"
     VIEW_SUPPLIER = "view_supplier"
+    VIEW_SUPPLIER_PRICE_LIST = "view_supplier_price_list"
+    VIEW_SUPPLIER_ITEMS = "view_supplier_items"
 
     # Inventory
     LIST_INVENTORY = "list_inventory"
     ADD_INVENTORY = "add_inventory"
     UPDATE_INVENTORY = "update_inventory"
+    LOG_INVENTORY_USAGE = "log_inventory_usage"
+    LIST_LOCATIONS = "list_locations"
+    ADD_LOCATION = "add_location"
+
+    # Invoices
+    LIST_INVOICES = "list_invoices"
+    VIEW_INVOICE = "view_invoice"
 
     # File Upload
     UPLOAD_PRICE_LIST = "upload_price_list"
@@ -80,9 +89,16 @@ INTENT_PARAMS: dict[Intent, list[str]] = {
     Intent.ADD_SUPPLIER: ["restaurant_id", "name"],
     Intent.UPDATE_SUPPLIER: ["supplier_id", "name"],
     Intent.VIEW_SUPPLIER: ["supplier_id"],
+    Intent.VIEW_SUPPLIER_PRICE_LIST: ["supplier_id"],
+    Intent.VIEW_SUPPLIER_ITEMS: ["supplier_id"],
     Intent.LIST_INVENTORY: ["restaurant_id"],
     Intent.ADD_INVENTORY: ["restaurant_id", "product_name", "quantity", "unit"],
     Intent.UPDATE_INVENTORY: ["batch_id", "quantity"],
+    Intent.LOG_INVENTORY_USAGE: ["batch_id", "quantity", "reason"],
+    Intent.LIST_LOCATIONS: ["restaurant_id"],
+    Intent.ADD_LOCATION: ["restaurant_id", "name"],
+    Intent.LIST_INVOICES: ["restaurant_id"],
+    Intent.VIEW_INVOICE: ["invoice_id"],
     Intent.UPLOAD_PRICE_LIST: ["file_id", "restaurant_id"],
     Intent.UPLOAD_INVOICE: ["file_id", "restaurant_id"],
     Intent.CONFIRM_UPLOAD: ["staging_id"],
@@ -134,12 +150,21 @@ Your job is to:
 - list_suppliers: User wants to see suppliers. Extract "restaurant_id" if mentioned.
 - add_supplier: User wants to add a supplier. Extract "name" and optionally "restaurant_id".
 - update_supplier: User wants to update supplier details. Extract "supplier_id" and fields.
-- view_supplier: User wants to see supplier details/prices. Extract "supplier_id" or supplier name.
+- view_supplier: User wants to see supplier details. Extract "supplier_id" or supplier name.
+- view_supplier_price_list: User wants to see supplier's current prices. Extract "supplier_id".
+- view_supplier_items: User wants to see items/products a supplier offers. Extract "supplier_id".
 
 ### Inventory Management
 - list_inventory: User wants to see inventory. Extract "restaurant_id" if mentioned.
 - add_inventory: User wants to record received inventory.
-- update_inventory: User wants to adjust inventory (consume, waste, etc).
+- update_inventory: User wants to adjust inventory quantity.
+- log_inventory_usage: User wants to log usage, waste, or consumption. Extract "batch_id", "quantity", "reason".
+- list_locations: User wants to see storage locations. Extract "restaurant_id" if mentioned.
+- add_location: User wants to add a storage location. Extract "restaurant_id", "name".
+
+### Invoices
+- list_invoices: User wants to see past invoices. Extract "restaurant_id" if mentioned.
+- view_invoice: User wants to see invoice details. Extract "invoice_id".
 
 ### File Processing
 - upload_price_list: User uploaded a price list file
@@ -363,6 +388,14 @@ def get_missing_param_prompt(intent: Intent, missing_param: str) -> str:
         ): "Which supplier would you like to update?",
         (Intent.VIEW_SUPPLIER, "supplier_id"): "Which supplier would you like to view?",
         (
+            Intent.VIEW_SUPPLIER_PRICE_LIST,
+            "supplier_id",
+        ): "Which supplier's price list would you like to see?",
+        (
+            Intent.VIEW_SUPPLIER_ITEMS,
+            "supplier_id",
+        ): "Which supplier's items would you like to see?",
+        (
             Intent.LIST_SUPPLIERS,
             "restaurant_id",
         ): "Which outlet's suppliers would you like to see?",
@@ -380,6 +413,30 @@ def get_missing_param_prompt(intent: Intent, missing_param: str) -> str:
             "batch_id",
         ): "Which inventory batch would you like to update?",
         (Intent.UPDATE_INVENTORY, "quantity"): "What's the new quantity?",
+        (
+            Intent.LOG_INVENTORY_USAGE,
+            "batch_id",
+        ): "Which inventory batch are you logging usage for?",
+        (Intent.LOG_INVENTORY_USAGE, "quantity"): "How much was used/wasted?",
+        (
+            Intent.LOG_INVENTORY_USAGE,
+            "reason",
+        ): "What's the reason? (usage, waste, expired, etc)",
+        (
+            Intent.LIST_LOCATIONS,
+            "restaurant_id",
+        ): "Which outlet's locations would you like to see?",
+        (Intent.ADD_LOCATION, "restaurant_id"): "Which outlet is this location for?",
+        (
+            Intent.ADD_LOCATION,
+            "name",
+        ): "What would you like to name this location? (e.g., Main Fridge, Dry Storage)",
+        # Invoices
+        (
+            Intent.LIST_INVOICES,
+            "restaurant_id",
+        ): "Which outlet's invoices would you like to see?",
+        (Intent.VIEW_INVOICE, "invoice_id"): "Which invoice would you like to view?",
         # File
         (
             Intent.UPLOAD_PRICE_LIST,

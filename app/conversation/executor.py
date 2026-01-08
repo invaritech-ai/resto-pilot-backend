@@ -218,6 +218,19 @@ def execute_intent(
     if intent == Intent.VIEW_SUPPLIER:
         return _execute_view_supplier(db, user, params, context)
 
+    if intent == Intent.VIEW_SUPPLIER_PRICE_LIST:
+        return _execute_view_supplier_price_list(db, user, params, context)
+
+    if intent == Intent.VIEW_SUPPLIER_ITEMS:
+        return _execute_view_supplier_items(db, user, params, context)
+
+    # Invoice intents
+    if intent == Intent.LIST_INVOICES:
+        return _execute_list_invoices(db, user, params, context)
+
+    if intent == Intent.VIEW_INVOICE:
+        return _execute_view_invoice(db, user, params, context)
+
     # Inventory intents
     if intent == Intent.LIST_INVENTORY:
         return _execute_list_inventory(db, user, params, context)
@@ -227,6 +240,15 @@ def execute_intent(
 
     if intent == Intent.UPDATE_INVENTORY:
         return _execute_update_inventory(db, user, params, context)
+
+    if intent == Intent.LOG_INVENTORY_USAGE:
+        return _execute_log_inventory_usage(db, user, params, context)
+
+    if intent == Intent.LIST_LOCATIONS:
+        return _execute_list_locations(db, user, params, context)
+
+    if intent == Intent.ADD_LOCATION:
+        return _execute_add_location(db, user, params, context)
 
     # File intents
     if intent == Intent.CONFIRM_UPLOAD:
@@ -780,6 +802,230 @@ def _execute_view_supplier(
     )
 
 
+def _execute_view_supplier_price_list(
+    db: Session,
+    user: User,
+    params: dict[str, Any],
+    context: UserContext,
+) -> ExecutionResult:
+    """View supplier's current price list."""
+    supplier_id = params.get("supplier_id", "").strip()
+    if not supplier_id:
+        return ExecutionResult(
+            response=get_missing_param_prompt(Intent.VIEW_SUPPLIER_PRICE_LIST, "supplier_id"),
+            needs_input=True,
+            context_update={
+                "active_operation": Intent.VIEW_SUPPLIER_PRICE_LIST.value,
+                "pending_params": ["supplier_id"],
+                "collected_params": params,
+            },
+        )
+
+    try:
+        supplier = db.get(Suppliers, uuid.UUID(supplier_id))
+    except ValueError:
+        return ExecutionResult(response=responses.SUPPLIER_NOT_FOUND, success=False)
+
+    if not supplier:
+        return ExecutionResult(response=responses.SUPPLIER_NOT_FOUND, success=False)
+
+    from app.db.models.supplier_items import SupplierItems
+    from app.db.models.supplier_prices import SupplierPrices
+
+    # Get latest prices for this supplier's items
+    prices = db.execute(
+        select(SupplierItems, SupplierPrices)
+        .outerjoin(
+            SupplierPrices,
+            (SupplierPrices.supplier_item_id == SupplierItems.id) &
+            (SupplierPrices.is_current == True)
+        )
+        .where(SupplierItems.supplier_id == uuid.UUID(supplier_id))
+        .order_by(SupplierItems.supplier_sku.asc())
+    ).all()
+
+    formatted = [
+        {
+            "name": item.supplier_name,
+            "sku": item.supplier_sku,
+            "unit": item.supplier_unit,
+            "price": float(price.unit_price) if price else None,
+            "currency": price.currency if price else supplier.currency,
+        }
+        for item, price in prices
+    ]
+
+    return ExecutionResult(
+        response=responses.supplier_price_list(supplier.name, formatted),
+    )
+
+
+def _execute_view_supplier_items(
+    db: Session,
+    user: User,
+    params: dict[str, Any],
+    context: UserContext,
+) -> ExecutionResult:
+    """View items offered by a supplier."""
+    supplier_id = params.get("supplier_id", "").strip()
+    if not supplier_id:
+        return ExecutionResult(
+            response=get_missing_param_prompt(Intent.VIEW_SUPPLIER_ITEMS, "supplier_id"),
+            needs_input=True,
+            context_update={
+                "active_operation": Intent.VIEW_SUPPLIER_ITEMS.value,
+                "pending_params": ["supplier_id"],
+                "collected_params": params,
+            },
+        )
+
+    try:
+        supplier = db.get(Suppliers, uuid.UUID(supplier_id))
+    except ValueError:
+        return ExecutionResult(response=responses.SUPPLIER_NOT_FOUND, success=False)
+
+    if not supplier:
+        return ExecutionResult(response=responses.SUPPLIER_NOT_FOUND, success=False)
+
+    from app.db.models.supplier_items import SupplierItems
+
+    items = db.scalars(
+        select(SupplierItems)
+        .where(SupplierItems.supplier_id == uuid.UUID(supplier_id))
+        .order_by(SupplierItems.supplier_name.asc())
+    ).all()
+
+    formatted = [
+        {
+            "name": item.supplier_name,
+            "sku": item.supplier_sku,
+            "unit": item.supplier_unit,
+        }
+        for item in items
+    ]
+
+    return ExecutionResult(
+        response=responses.supplier_items_list(supplier.name, formatted),
+    )
+
+
+# =============================================================================
+# INVOICE HANDLERS
+# =============================================================================
+
+
+def _execute_list_invoices(
+    db: Session,
+    user: User,
+    params: dict[str, Any],
+    context: UserContext,
+) -> ExecutionResult:
+    """List invoices for a restaurant."""
+    restaurant_id, error = _resolve_restaurant_id(db, user.id, context, params)
+    if error:
+        return ExecutionResult(response=error, success=False)
+
+    if not restaurant_id:
+        restaurants = _get_user_restaurants(db, user.id)
+        return ExecutionResult(
+            response=responses.outlet_select_prompt(restaurants),
+            needs_input=True,
+            context_update={
+                "active_operation": Intent.LIST_INVOICES.value,
+                "pending_params": ["restaurant_id"],
+                "collected_params": params,
+            },
+        )
+
+    from app.db.models.invoices import Invoices
+
+    invoices = db.scalars(
+        select(Invoices)
+        .where(Invoices.restaurant_id == uuid.UUID(restaurant_id))
+        .order_by(Invoices.invoice_date.desc())
+        .limit(20)
+    ).all()
+
+    formatted = [
+        {
+            "id": str(inv.id),
+            "date": inv.invoice_date.strftime("%Y-%m-%d") if inv.invoice_date else "N/A",
+            "supplier": inv.supplier_name,
+            "total": float(inv.total_amount) if inv.total_amount else None,
+            "currency": inv.currency,
+            "status": inv.status,
+        }
+        for inv in invoices
+    ]
+
+    return ExecutionResult(
+        response=responses.invoices_list(formatted),
+        context_update={"active_restaurant_id": restaurant_id},
+    )
+
+
+def _execute_view_invoice(
+    db: Session,
+    user: User,
+    params: dict[str, Any],
+    context: UserContext,
+) -> ExecutionResult:
+    """View invoice details with line items."""
+    invoice_id = params.get("invoice_id", "").strip()
+    if not invoice_id:
+        return ExecutionResult(
+            response=get_missing_param_prompt(Intent.VIEW_INVOICE, "invoice_id"),
+            needs_input=True,
+            context_update={
+                "active_operation": Intent.VIEW_INVOICE.value,
+                "pending_params": ["invoice_id"],
+                "collected_params": params,
+            },
+        )
+
+    from app.db.models.invoices import Invoices
+    from app.db.models.invoice_line_items import InvoiceLineItems
+
+    try:
+        invoice = db.get(Invoices, uuid.UUID(invoice_id))
+    except ValueError:
+        return ExecutionResult(response="Invoice not found.", success=False)
+
+    if not invoice:
+        return ExecutionResult(response="Invoice not found.", success=False)
+
+    line_items = db.scalars(
+        select(InvoiceLineItems)
+        .where(InvoiceLineItems.invoice_id == uuid.UUID(invoice_id))
+        .order_by(InvoiceLineItems.id.asc())
+    ).all()
+
+    formatted_items = [
+        {
+            "description": li.description,
+            "quantity": float(li.quantity) if li.quantity else None,
+            "unit": li.unit,
+            "unit_price": float(li.unit_price) if li.unit_price else None,
+            "total": float(li.total_amount) if li.total_amount else None,
+        }
+        for li in line_items
+    ]
+
+    return ExecutionResult(
+        response=responses.invoice_details(
+            invoice={
+                "date": invoice.invoice_date.strftime("%Y-%m-%d") if invoice.invoice_date else "N/A",
+                "supplier": invoice.supplier_name,
+                "invoice_number": invoice.invoice_number,
+                "total": float(invoice.total_amount) if invoice.total_amount else None,
+                "currency": invoice.currency,
+                "status": invoice.status,
+            },
+            line_items=formatted_items,
+        ),
+    )
+
+
 # =============================================================================
 # INVENTORY HANDLERS
 # =============================================================================
@@ -860,6 +1106,209 @@ def _execute_update_inventory(
         response="To update inventory, please specify the batch and the change you'd like to make.",
         context_update={"clear": True},
     )
+
+
+def _execute_log_inventory_usage(
+    db: Session,
+    user: User,
+    params: dict[str, Any],
+    context: UserContext,
+) -> ExecutionResult:
+    """Log inventory usage, waste, or consumption."""
+    batch_id = params.get("batch_id", "").strip()
+    if not batch_id:
+        return ExecutionResult(
+            response=get_missing_param_prompt(Intent.LOG_INVENTORY_USAGE, "batch_id"),
+            needs_input=True,
+            context_update={
+                "active_operation": Intent.LOG_INVENTORY_USAGE.value,
+                "pending_params": ["batch_id", "quantity", "reason"],
+                "collected_params": params,
+            },
+        )
+
+    quantity = params.get("quantity")
+    if not quantity:
+        return ExecutionResult(
+            response=get_missing_param_prompt(Intent.LOG_INVENTORY_USAGE, "quantity"),
+            needs_input=True,
+            context_update={
+                "active_operation": Intent.LOG_INVENTORY_USAGE.value,
+                "pending_params": ["quantity", "reason"],
+                "collected_params": {**params, "batch_id": batch_id},
+            },
+        )
+
+    reason = params.get("reason", "").strip()
+    if not reason:
+        return ExecutionResult(
+            response=get_missing_param_prompt(Intent.LOG_INVENTORY_USAGE, "reason"),
+            needs_input=True,
+            context_update={
+                "active_operation": Intent.LOG_INVENTORY_USAGE.value,
+                "pending_params": ["reason"],
+                "collected_params": {**params, "batch_id": batch_id, "quantity": quantity},
+            },
+        )
+
+    from app.db.models.inventory_batches import InventoryBatches
+    from app.db.models.inventory_movements import InventoryMovements
+    from decimal import Decimal
+
+    try:
+        batch = db.get(InventoryBatches, uuid.UUID(batch_id))
+    except ValueError:
+        return ExecutionResult(response="Inventory batch not found.", success=False)
+
+    if not batch:
+        return ExecutionResult(response="Inventory batch not found.", success=False)
+
+    try:
+        qty = Decimal(str(quantity))
+        if qty <= 0:
+            return ExecutionResult(response="Quantity must be positive.", success=False)
+
+        # Check sufficient quantity
+        if batch.quantity < qty:
+            return ExecutionResult(
+                response=f"Insufficient quantity. Current: {batch.quantity} {batch.unit}",
+                success=False,
+            )
+
+        # Create movement record
+        movement = InventoryMovements(
+            batch_id=uuid.UUID(batch_id),
+            movement_type=reason.lower() if reason.lower() in ("usage", "waste", "expired", "transfer") else "usage",
+            quantity=qty,
+            reason=reason,
+            recorded_by_user_id=user.id,
+        )
+        db.add(movement)
+
+        # Update batch quantity
+        batch.quantity = batch.quantity - qty
+        if batch.quantity <= 0:
+            batch.status = "depleted"
+
+        db.commit()
+
+        return ExecutionResult(
+            response=f"Logged {qty} {batch.unit} as {reason}. Remaining: {batch.quantity} {batch.unit}",
+            context_update={"clear": True},
+        )
+    except Exception as e:
+        db.rollback()
+        logger.exception("log_inventory_usage_failed", extra={"error": str(e)})
+        return ExecutionResult(response=responses.ERROR_GENERIC, success=False)
+
+
+def _execute_list_locations(
+    db: Session,
+    user: User,
+    params: dict[str, Any],
+    context: UserContext,
+) -> ExecutionResult:
+    """List inventory storage locations."""
+    restaurant_id, error = _resolve_restaurant_id(db, user.id, context, params)
+    if error:
+        return ExecutionResult(response=error, success=False)
+
+    if not restaurant_id:
+        restaurants = _get_user_restaurants(db, user.id)
+        return ExecutionResult(
+            response=responses.outlet_select_prompt(restaurants),
+            needs_input=True,
+            context_update={
+                "active_operation": Intent.LIST_LOCATIONS.value,
+                "pending_params": ["restaurant_id"],
+                "collected_params": params,
+            },
+        )
+
+    from app.db.models.inventory_locations import InventoryLocations
+
+    locations = db.scalars(
+        select(InventoryLocations)
+        .where(InventoryLocations.restaurant_id == uuid.UUID(restaurant_id))
+        .order_by(InventoryLocations.name.asc())
+    ).all()
+
+    formatted = [
+        {
+            "id": str(loc.id),
+            "name": loc.name,
+            "type": loc.location_type,
+        }
+        for loc in locations
+    ]
+
+    return ExecutionResult(
+        response=responses.locations_list(formatted),
+        context_update={"active_restaurant_id": restaurant_id},
+    )
+
+
+def _execute_add_location(
+    db: Session,
+    user: User,
+    params: dict[str, Any],
+    context: UserContext,
+) -> ExecutionResult:
+    """Add a new inventory storage location."""
+    restaurant_id, error = _resolve_restaurant_id(db, user.id, context, params)
+    if error:
+        return ExecutionResult(response=error, success=False)
+
+    if not restaurant_id:
+        restaurants = _get_user_restaurants(db, user.id)
+        return ExecutionResult(
+            response=responses.outlet_select_prompt(restaurants),
+            needs_input=True,
+            context_update={
+                "active_operation": Intent.ADD_LOCATION.value,
+                "pending_params": ["restaurant_id", "name"],
+                "collected_params": params,
+            },
+        )
+
+    # Check ownership (only owners can add locations)
+    if not _is_restaurant_owner(db, user.id, uuid.UUID(restaurant_id)):
+        return ExecutionResult(
+            response="Only outlet owners can add storage locations.",
+            success=False,
+        )
+
+    name = params.get("name", "").strip()
+    if not name:
+        return ExecutionResult(
+            response=get_missing_param_prompt(Intent.ADD_LOCATION, "name"),
+            needs_input=True,
+            context_update={
+                "active_operation": Intent.ADD_LOCATION.value,
+                "pending_params": ["name"],
+                "collected_params": {**params, "restaurant_id": restaurant_id},
+            },
+        )
+
+    from app.db.models.inventory_locations import InventoryLocations
+
+    try:
+        location = InventoryLocations(
+            restaurant_id=uuid.UUID(restaurant_id),
+            name=name,
+            location_type="general",  # Default type
+        )
+        db.add(location)
+        db.commit()
+
+        return ExecutionResult(
+            response=f"Storage location '{name}' created successfully.",
+            context_update={"clear": True, "active_restaurant_id": restaurant_id},
+        )
+    except Exception as e:
+        db.rollback()
+        logger.exception("add_location_failed", extra={"error": str(e)})
+        return ExecutionResult(response=responses.ERROR_GENERIC, success=False)
 
 
 # =============================================================================
