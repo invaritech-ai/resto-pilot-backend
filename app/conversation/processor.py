@@ -121,7 +121,7 @@ def process_message_instant(
 
     # Load user context
     context = load_context(db, user)
-    classifier_context = get_context_for_classifier(context)
+    classifier_context = get_context_for_classifier(context, db=db)
 
     # Record start time
     started_at = dt.datetime.now(dt.UTC)

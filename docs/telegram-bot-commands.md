@@ -7,10 +7,10 @@ curl -sS -X POST "https://api.telegram.org/bot$APP_TELEGRAM_BOT_TOKEN/setMyComma
   -H "Content-Type: application/json" \
   -d '{"commands":[
     {"command":"start","description":"Start / register"},
-    {"command":"respond","description":"Force process current session"},
-    {"command":"done","description":"Finish and process"},
-    {"command":"confirm","description":"Confirm pending action"},
-    {"command":"cancel","description":"Cancel pending action"}
+    {"command":"menu","description":"Show main menu"},
+    {"command":"help","description":"Show help / menu"},
+    {"command":"confirm","description":"Confirm a pending upload"},
+    {"command":"cancel","description":"Cancel current operation"}
   ]}'
 ```
 

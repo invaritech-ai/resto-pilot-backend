@@ -89,6 +89,49 @@ def _get_user_restaurants(db: Session, user_id: uuid.UUID) -> list[dict[str, Any
     ]
 
 
+def _match_by_name_or_number(
+    search_value: str,
+    items: list[dict[str, Any]],
+    name_key: str = "name",
+    id_key: str = "id",
+) -> str | None:
+    """
+    Match an item by name, partial name, or list number.
+    
+    Args:
+        search_value: User's input (name, partial name, or number like "1", "2")
+        items: List of dicts with at least name_key and id_key
+        name_key: Key to use for name matching
+        id_key: Key to return as the matched ID
+    
+    Returns:
+        The matched item's ID, or None if no match
+    """
+    if not search_value or not items:
+        return None
+    
+    search_value = search_value.strip()
+    
+    # Try to match by number (1, 2, 3, etc) - 1-indexed
+    if search_value.isdigit():
+        idx = int(search_value) - 1
+        if 0 <= idx < len(items):
+            return items[idx][id_key]
+    
+    # Try exact name match (case-insensitive)
+    search_lower = search_value.lower()
+    for item in items:
+        if item[name_key].lower() == search_lower:
+            return item[id_key]
+    
+    # Try partial name match
+    for item in items:
+        if search_lower in item[name_key].lower():
+            return item[id_key]
+    
+    return None
+
+
 def _resolve_restaurant_id(
     db: Session,
     user_id: uuid.UUID,
@@ -98,19 +141,45 @@ def _resolve_restaurant_id(
     """
     Resolve restaurant_id from params, context, or auto-select if only one.
     Returns (restaurant_id, error_message).
+    
+    Handles multiple input formats:
+    - Valid UUID string
+    - Restaurant name (fuzzy match)
+    - Number (1, 2, 3) referring to list position
     """
-    # Check if provided in params
-    if params.get("restaurant_id"):
-        return params["restaurant_id"], None
-
-    # Check context
-    if context.active_restaurant_id:
-        return context.active_restaurant_id, None
-
-    # Auto-select if user has only one restaurant
     restaurants = _get_user_restaurants(db, user_id)
     if not restaurants:
         return None, responses.ERROR_NO_OUTLETS
+
+    # Check if provided in params
+    param_value = params.get("restaurant_id", "").strip() if params.get("restaurant_id") else ""
+    
+    if param_value:
+        # Try to parse as UUID first
+        try:
+            uuid.UUID(param_value)
+            # Valid UUID - verify user has access
+            if any(r["id"] == param_value for r in restaurants):
+                return param_value, None
+            else:
+                return None, responses.OUTLET_NO_ACCESS
+        except ValueError:
+            pass
+        
+        # Try to match by name or number
+        matched_id = _match_by_name_or_number(param_value, restaurants)
+        if matched_id:
+            return matched_id, None
+        
+        # No match found - will prompt for selection
+
+    # Check context
+    if context.active_restaurant_id:
+        # Verify context restaurant is still accessible
+        if any(r["id"] == context.active_restaurant_id for r in restaurants):
+            return context.active_restaurant_id, None
+
+    # Auto-select if user has only one restaurant
     if len(restaurants) == 1:
         return restaurants[0]["id"], None
 
@@ -129,6 +198,59 @@ def _is_restaurant_owner(db: Session, user_id: uuid.UUID, restaurant_id: uuid.UU
         )
     )
     return membership is not None
+
+
+def _resolve_supplier_id(
+    db: Session,
+    restaurant_id: str,
+    param_value: str | None,
+) -> str | None:
+    """
+    Resolve supplier_id from user input.
+    
+    Handles:
+    - Valid UUID string
+    - Supplier name (fuzzy match)
+    - Number (1, 2, 3) referring to list position
+    
+    Returns supplier_id as string or None if not resolved.
+    """
+    if not param_value:
+        return None
+    
+    param_value = param_value.strip()
+    
+    # Try to parse as UUID first
+    try:
+        uuid.UUID(param_value)
+        return param_value
+    except ValueError:
+        pass
+    
+    # Load suppliers for this restaurant
+    suppliers = db.scalars(
+        select(Suppliers).where(
+            Suppliers.restaurant_id == uuid.UUID(restaurant_id),
+            Suppliers.is_active == True,
+        ).order_by(Suppliers.name.asc())
+    ).all()
+    
+    if not suppliers:
+        return None
+    
+    # Convert to list of dicts for the helper
+    supplier_list = [{"id": str(s.id), "name": s.name} for s in suppliers]
+    return _match_by_name_or_number(param_value, supplier_list)
+
+
+def _safe_uuid(value: str | None) -> uuid.UUID | None:
+    """Safely parse a UUID string, returning None if invalid."""
+    if not value:
+        return None
+    try:
+        return uuid.UUID(value.strip())
+    except (ValueError, AttributeError):
+        return None
 
 
 def execute_intent(
@@ -560,8 +682,8 @@ def _execute_revoke_staff(
     if not _is_restaurant_owner(db, user.id, uuid.UUID(restaurant_id)):
         return ExecutionResult(response=responses.STAFF_NOT_OWNER, success=False)
 
-    target_user_id = params.get("user_id", "").strip()
-    if not target_user_id:
+    target_user_id_raw = params.get("user_id", "").strip() if params.get("user_id") else ""
+    if not target_user_id_raw:
         return ExecutionResult(
             response=get_missing_param_prompt(Intent.REVOKE_STAFF, "user_id"),
             needs_input=True,
@@ -571,6 +693,34 @@ def _execute_revoke_staff(
                 "collected_params": {**params, "restaurant_id": restaurant_id},
             },
         )
+
+    # Resolve user_id - try UUID first, then by name/number
+    target_user_id = None
+    if _safe_uuid(target_user_id_raw):
+        target_user_id = target_user_id_raw
+    else:
+        # Get members and try to match by name or number
+        service = RestaurantService(db)
+        members = service.list_members(restaurant_id=uuid.UUID(restaurant_id))
+        
+        # Try number match (1, 2, 3...)
+        if target_user_id_raw.isdigit():
+            idx = int(target_user_id_raw) - 1
+            if 0 <= idx < len(members):
+                target_user_id = str(members[idx][0].id)
+        else:
+            # Try name match
+            search_lower = target_user_id_raw.lower()
+            for u, m in members:
+                if u.full_name and search_lower in u.full_name.lower():
+                    target_user_id = str(u.id)
+                    break
+                if u.username and search_lower in u.username.lower():
+                    target_user_id = str(u.id)
+                    break
+    
+    if not target_user_id:
+        return ExecutionResult(response="User not found. Please provide a valid user name or number.", success=False)
 
     # Can't revoke self
     if target_user_id == str(user.id):
@@ -714,8 +864,8 @@ def _execute_update_supplier(
     params: dict[str, Any],
     context: UserContext,
 ) -> ExecutionResult:
-    supplier_id = params.get("supplier_id", "").strip()
-    if not supplier_id:
+    supplier_id_raw = params.get("supplier_id", "").strip() if params.get("supplier_id") else ""
+    if not supplier_id_raw:
         return ExecutionResult(
             response=get_missing_param_prompt(Intent.UPDATE_SUPPLIER, "supplier_id"),
             needs_input=True,
@@ -726,11 +876,25 @@ def _execute_update_supplier(
             },
         )
 
-    try:
-        supplier = db.get(Suppliers, uuid.UUID(supplier_id))
-    except ValueError:
+    # Try to resolve supplier_id - may need restaurant context
+    restaurant_id = context.active_restaurant_id
+    if not restaurant_id:
+        restaurants = _get_user_restaurants(db, user.id)
+        if len(restaurants) == 1:
+            restaurant_id = restaurants[0]["id"]
+    
+    supplier_id = None
+    if restaurant_id:
+        supplier_id = _resolve_supplier_id(db, restaurant_id, supplier_id_raw)
+    
+    if not supplier_id:
+        # Try direct UUID parse as fallback
+        supplier_id = supplier_id_raw if _safe_uuid(supplier_id_raw) else None
+    
+    if not supplier_id:
         return ExecutionResult(response=responses.SUPPLIER_NOT_FOUND, success=False)
 
+    supplier = db.get(Suppliers, uuid.UUID(supplier_id))
     if not supplier:
         return ExecutionResult(response=responses.SUPPLIER_NOT_FOUND, success=False)
 
@@ -772,8 +936,8 @@ def _execute_view_supplier(
     params: dict[str, Any],
     context: UserContext,
 ) -> ExecutionResult:
-    supplier_id = params.get("supplier_id", "").strip()
-    if not supplier_id:
+    supplier_id_raw = params.get("supplier_id", "").strip() if params.get("supplier_id") else ""
+    if not supplier_id_raw:
         return ExecutionResult(
             response=get_missing_param_prompt(Intent.VIEW_SUPPLIER, "supplier_id"),
             needs_input=True,
@@ -784,11 +948,24 @@ def _execute_view_supplier(
             },
         )
 
-    try:
-        supplier = db.get(Suppliers, uuid.UUID(supplier_id))
-    except ValueError:
+    # Try to resolve supplier_id
+    restaurant_id = context.active_restaurant_id
+    if not restaurant_id:
+        restaurants = _get_user_restaurants(db, user.id)
+        if len(restaurants) == 1:
+            restaurant_id = restaurants[0]["id"]
+    
+    supplier_id = None
+    if restaurant_id:
+        supplier_id = _resolve_supplier_id(db, restaurant_id, supplier_id_raw)
+    
+    if not supplier_id:
+        supplier_id = supplier_id_raw if _safe_uuid(supplier_id_raw) else None
+    
+    if not supplier_id:
         return ExecutionResult(response=responses.SUPPLIER_NOT_FOUND, success=False)
 
+    supplier = db.get(Suppliers, uuid.UUID(supplier_id))
     if not supplier:
         return ExecutionResult(response=responses.SUPPLIER_NOT_FOUND, success=False)
 
@@ -809,8 +986,8 @@ def _execute_view_supplier_price_list(
     context: UserContext,
 ) -> ExecutionResult:
     """View supplier's current price list."""
-    supplier_id = params.get("supplier_id", "").strip()
-    if not supplier_id:
+    supplier_id_raw = params.get("supplier_id", "").strip() if params.get("supplier_id") else ""
+    if not supplier_id_raw:
         return ExecutionResult(
             response=get_missing_param_prompt(Intent.VIEW_SUPPLIER_PRICE_LIST, "supplier_id"),
             needs_input=True,
@@ -821,11 +998,24 @@ def _execute_view_supplier_price_list(
             },
         )
 
-    try:
-        supplier = db.get(Suppliers, uuid.UUID(supplier_id))
-    except ValueError:
+    # Resolve supplier_id
+    restaurant_id = context.active_restaurant_id
+    if not restaurant_id:
+        restaurants = _get_user_restaurants(db, user.id)
+        if len(restaurants) == 1:
+            restaurant_id = restaurants[0]["id"]
+    
+    supplier_id = None
+    if restaurant_id:
+        supplier_id = _resolve_supplier_id(db, restaurant_id, supplier_id_raw)
+    
+    if not supplier_id:
+        supplier_id = supplier_id_raw if _safe_uuid(supplier_id_raw) else None
+    
+    if not supplier_id:
         return ExecutionResult(response=responses.SUPPLIER_NOT_FOUND, success=False)
 
+    supplier = db.get(Suppliers, uuid.UUID(supplier_id))
     if not supplier:
         return ExecutionResult(response=responses.SUPPLIER_NOT_FOUND, success=False)
 
@@ -867,8 +1057,8 @@ def _execute_view_supplier_items(
     context: UserContext,
 ) -> ExecutionResult:
     """View items offered by a supplier."""
-    supplier_id = params.get("supplier_id", "").strip()
-    if not supplier_id:
+    supplier_id_raw = params.get("supplier_id", "").strip() if params.get("supplier_id") else ""
+    if not supplier_id_raw:
         return ExecutionResult(
             response=get_missing_param_prompt(Intent.VIEW_SUPPLIER_ITEMS, "supplier_id"),
             needs_input=True,
@@ -879,11 +1069,24 @@ def _execute_view_supplier_items(
             },
         )
 
-    try:
-        supplier = db.get(Suppliers, uuid.UUID(supplier_id))
-    except ValueError:
+    # Resolve supplier_id
+    restaurant_id = context.active_restaurant_id
+    if not restaurant_id:
+        restaurants = _get_user_restaurants(db, user.id)
+        if len(restaurants) == 1:
+            restaurant_id = restaurants[0]["id"]
+    
+    supplier_id = None
+    if restaurant_id:
+        supplier_id = _resolve_supplier_id(db, restaurant_id, supplier_id_raw)
+    
+    if not supplier_id:
+        supplier_id = supplier_id_raw if _safe_uuid(supplier_id_raw) else None
+    
+    if not supplier_id:
         return ExecutionResult(response=responses.SUPPLIER_NOT_FOUND, success=False)
 
+    supplier = db.get(Suppliers, uuid.UUID(supplier_id))
     if not supplier:
         return ExecutionResult(response=responses.SUPPLIER_NOT_FOUND, success=False)
 

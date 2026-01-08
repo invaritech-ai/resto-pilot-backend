@@ -1,3 +1,12 @@
+## Overview
+
+This is a Telegram bot with intent classification and static, deterministic actions.
+Messages are processed instantly (no batching): the webhook enqueues updates to Celery,
+the worker classifies intent, executes a fixed operation, and returns a template response.
+Anything outside supported intents returns "I can't help with that."
+
+Supported intents and manual test paths: `docs/intents-and-paths.md`.
+
 ## Local dev
 
 -   Copy `.env.example` to `.env` and set `APP_DATABASE_URL` to your Neon connection string (e.g. `postgresql+psycopg://user:pass@host/db?sslmode=require`).
@@ -7,12 +16,8 @@
 
 ## Background workers (Celery)
 
-When batching is enabled (`APP_TELEGRAM_BATCHING_ENABLED=true`), the Telegram webhook persists incoming updates to Postgres and schedules Celery tasks for flushing + processing sessions. A running Celery worker is required for:
-
--   scheduled session flushes (`flush_session`)
--   sending session ack messages (`send_session_ack`)
--   processing sessions (`process_session`)
--   non-batching flows and `/start` routing (`handle_telegram_update`)
+The Telegram webhook enqueues updates to Celery for instant processing. A running Celery
+worker is required for message handling and file processing tasks.
 
 -   Broker options:
     -   Redis/Upstash: `APP_CELERY_BROKER_URL=rediss://...`
@@ -24,12 +29,10 @@ When batching is enabled (`APP_TELEGRAM_BATCHING_ENABLED=true`), the Telegram we
 
 ## LLM configuration (OpenRouter/OpenAI-compatible)
 
-This project uses the Chat Completions endpoint and supports splitting "cheap" vs "expensive" models:
+This project uses the Chat Completions endpoint:
 
--   `APP_OPENAI_MODEL`: main model (general-purpose agent with tool-calling support for session processing).
--   `APP_OPENAI_ACK_MODEL`: optional cheap model for backchannel acks (when batching).
--   `APP_OPENAI_GATE_MODEL`: optional cheap model for on-topic gating + chat memory summarization.
--   Optional: `APP_MODEL_PRICES_JSON=...` for local cost estimation fallback (primary cost source is OpenRouter `/generation` backfill).
+-   `APP_OPENAI_MODEL`: main model.
+-   `APP_OPENAI_GATE_MODEL`: optional cheap model for intent classification and file type detection.
 
 **Telemetry & Cost Tracking**: Every LLM call is recorded in `llm_calls` with `openrouter_generation_id` for cost attribution. Cost backfill is scheduled automatically via Celery tasks to fetch actual costs from OpenRouter.
 
@@ -77,14 +80,12 @@ This repo includes a `Dockerfile` and `docker-compose.yaml` to run the API + Cel
     -   `APP_DATABASE_URL` (Neon Postgres)
     -   `APP_TELEGRAM_WEBHOOK_SECRET_TOKEN`
     -   `APP_TELEGRAM_BOT_TOKEN`
-    -   `APP_TELEGRAM_BATCHING_ENABLED=true`
     -   `APP_CELERY_BROKER_URL=sqs://` + `APP_CELERY_SQS_QUEUE_URL` + `APP_CELERY_SQS_REGION`
     -   AWS creds (either `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` + `AWS_DEFAULT_REGION`, or an IAM role if your server supports it)
     -   OpenRouter/OpenAI-compatible settings:
         -   `APP_OPENAI_BASE_URL=https://openrouter.ai/api/v1`
         -   `APP_OPENAI_API_KEY=<OPENROUTER_KEY>`
         -   `APP_OPENAI_MODEL=<main-model-slug>`
-        -   Optional: `APP_OPENAI_ACK_MODEL=<cheap-ack-model-slug>`
         -   Optional: `APP_OPENAI_GATE_MODEL=<cheap-gate-model-slug>`
         -   Optional: `APP_OPENROUTER_HTTP_REFERER` + `APP_OPENROUTER_TITLE`
     -   Run DB migrations once (Coolify exec into the `api` container): `alembic upgrade head`
@@ -93,4 +94,4 @@ This repo includes a `Dockerfile` and `docker-compose.yaml` to run the API + Cel
 Notes:
 
 -   Scripts may need permissions once: `chmod +x scripts/*.sh`.
--   If you deploy the API to Lambda/serverless but keep Celery, run the Celery worker separately (e.g. ECS/Fargate, EC2, Fly, or a small VM). In batching mode, the API persists updates and Celery performs flushing/ack/processing.
+-   If you deploy the API to Lambda/serverless but keep Celery, run the Celery worker separately (e.g. ECS/Fargate, EC2, Fly, or a small VM).

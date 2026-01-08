@@ -114,21 +114,44 @@ def update_context_from_result(
     return context
 
 
-def get_context_for_classifier(context: UserContext) -> dict[str, Any] | None:
+def get_context_for_classifier(
+    context: UserContext,
+    db: Session | None = None,
+) -> dict[str, Any] | None:
     """
     Format context for passing to intent classifier.
 
     Args:
         context: User's current context
+        db: Database session (optional, for resolving restaurant name)
 
     Returns:
-        Dict to pass to classifier, or None if no active operation
+        Dict to pass to classifier with hints about current state
     """
-    if not context.active_operation:
-        return None
+    result: dict[str, Any] = {}
 
-    return {
-        "active_operation": context.active_operation,
-        "pending_params": context.pending_params,
-        "collected_params": context.collected_params,
-    }
+    # Include active restaurant info if available
+    if context.active_restaurant_id and db:
+        from app.db.models.restaurant import Restaurant
+        import uuid as uuid_mod
+
+        try:
+            restaurant = db.get(Restaurant, uuid_mod.UUID(context.active_restaurant_id))
+            if restaurant:
+                result["active_outlet"] = {
+                    "id": context.active_restaurant_id,
+                    "name": restaurant.name,
+                }
+                result["hint"] = (
+                    f"User is currently working with outlet '{restaurant.name}'. Use this as restaurant_id if not specified."
+                )
+        except (ValueError, AttributeError):
+            pass
+
+    # Include active operation if any
+    if context.active_operation:
+        result["active_operation"] = context.active_operation
+        result["pending_params"] = context.pending_params
+        result["collected_params"] = context.collected_params
+
+    return result if result else None

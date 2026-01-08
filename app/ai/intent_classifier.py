@@ -184,6 +184,14 @@ You will receive:
 - The user's current message
 - Recent conversation history (if any)
 - Current active operation context (if any)
+- Active outlet/restaurant context (if the user has selected one)
+
+**IMPORTANT**: If the context includes an "active_outlet" with a name, use that outlet's ID as "restaurant_id" for any action that requires it, unless the user explicitly mentions a different outlet.
+
+For example:
+- Context: {"active_outlet": {"id": "abc-123", "name": "Main Restaurant"}}
+- User says: "show suppliers"
+- You should return: {"intent": "list_suppliers", "params": {"restaurant_id": "abc-123"}}
 
 If there's an active operation awaiting parameters, interpret the user's message in that context.
 For example, if we asked "What's the supplier's name?" and user says "Fresh Farms", that's providing the name parameter.
