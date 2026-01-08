@@ -69,7 +69,7 @@ def send_message(chat_id: int, text: str, settings: Settings) -> int | None:
         raise
 
 
-def get_file_bytes(*, file_id: str, settings: Settings, max_bytes: int = 2_000_000) -> bytes:
+def get_file_bytes(*, file_id: str, settings: Settings, max_bytes: int = 20_000_000) -> bytes:
     """
     Download a Telegram file by file_id.
 
