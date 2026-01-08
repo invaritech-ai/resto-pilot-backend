@@ -308,11 +308,11 @@ CRITICAL RULES:
 5. Return ONLY valid JSON, no other text."""
 
     try:
-        extracted_text = process_document_with_vision(
+        result = process_document_with_vision(
             file_bytes, mime_type, prompt, settings, filename
         )
         # Parse JSON from response
-        extracted_text = extracted_text.strip()
+        extracted_text = result.content.strip()
         if extracted_text.startswith("```"):
             lines = extracted_text.split("\n")
             extracted_text = (
