@@ -14,6 +14,7 @@ Processes messages immediately without batching:
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
 import uuid
 from typing import Any
@@ -206,11 +207,11 @@ def process_message_instant(
             session_id=session_id,
             at=dt.datetime.now(dt.UTC),
             event="instant_processed_v1",
-            payload_json={
+            payload_json=json.dumps({
                 "intent": classified.intent.value,
                 "confidence": classified.confidence,
                 "success": result.success,
-            },
+            }),
             error=None,
         )
     )

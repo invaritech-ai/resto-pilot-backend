@@ -21,7 +21,6 @@ celery_app = Celery(
     backend=settings.celery_result_backend or None,
     include=[
         "app.workers.tasks",  # Re-export module (for backward compatibility)
-        "app.workers.session_tasks",
         "app.workers.file_processing_tasks",
         "app.workers.llm_tasks",
         "app.workers.telegram_tasks",
@@ -38,13 +37,6 @@ celery_app.conf.update(
     worker_prefetch_multiplier=1,
     task_acks_late=True,
     task_reject_on_worker_lost=True,
-    # Periodic task schedule
-    beat_schedule={
-        "close-stale-sessions": {
-            "task": "close_stale_sessions",
-            "schedule": 300.0,  # Run every 5 minutes
-        },
-    },
 )
 
 logger.info(
