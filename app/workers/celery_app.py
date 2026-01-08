@@ -19,7 +19,13 @@ celery_app = Celery(
     "resto_pilot",
     broker=settings.celery_broker_url or None,
     backend=settings.celery_result_backend or None,
-    include=["app.workers.tasks"],
+    include=[
+        "app.workers.tasks",  # Re-export module (for backward compatibility)
+        "app.workers.session_tasks",
+        "app.workers.file_processing_tasks",
+        "app.workers.llm_tasks",
+        "app.workers.telegram_tasks",
+    ],
 )
 
 celery_app.conf.update(
