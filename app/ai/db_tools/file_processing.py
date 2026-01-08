@@ -13,12 +13,10 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.ai.tools import Tool
-from app.core.config import Settings, get_settings
 from app.db.models.file_processing_staging import FileProcessingStaging
-from app.db.models.restaurant_user import RestaurantUser
 from app.workers.celery_types import CeleryApplyAsync
 
-from .base import has_restaurant_access, is_restaurant_owner
+from .base import has_restaurant_access
 
 logger = logging.getLogger(__name__)
 
@@ -552,7 +550,7 @@ def create_file_processing_tools(
                     select(Suppliers).where(
                         Suppliers.restaurant_id == staging.restaurant_id,
                         Suppliers.name.ilike(supplier_name),
-                        Suppliers.is_active == True,
+                        Suppliers.is_active,
                     )
                 )
 
@@ -637,7 +635,7 @@ def create_file_processing_tools(
                     select(Suppliers).where(
                         Suppliers.restaurant_id == staging.restaurant_id,
                         Suppliers.name.ilike(supplier_name),
-                        Suppliers.is_active == True,
+                        Suppliers.is_active,
                     )
                 )
 
@@ -773,7 +771,7 @@ def create_file_processing_tools(
                                 Products.name_en.ilike(product_name)
                                 | Products.name_local.ilike(product_name)
                             ),
-                            Products.is_active == True,
+                            Products.is_active,
                         )
                     )
 
@@ -793,7 +791,7 @@ def create_file_processing_tools(
                                 select(Suppliers).where(
                                     Suppliers.restaurant_id == staging.restaurant_id,
                                     Suppliers.name.ilike(supplier_name),
-                                    Suppliers.is_active == True,
+                                    Suppliers.is_active,
                                 )
                             )
                             if supplier:
