@@ -8,6 +8,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.ai.db_schema import get_table_schema
 from app.ai.openai_client import OpenAIError, chat_completions_create
 from app.ai.vision_client import process_document_with_vision
 from app.core.config import Settings
@@ -17,8 +18,79 @@ from app.db.models.product_aliases import ProductAliases
 logger = logging.getLogger(__name__)
 
 
+def _format_schema_for_extraction(table_names: list[str], role: str = "owner") -> str:
+    """
+    Format database schema information for extraction prompts.
+
+    Args:
+        table_names: List of table names to include
+        role: User role (default: "owner" for full access)
+
+    Returns:
+        Formatted string describing tables, columns, types, and constraints
+    """
+    lines = []
+    lines.append("Database schema for target tables:\n")
+
+    for table_name in table_names:
+        schema = get_table_schema(table_name, role)
+        if not schema:
+            continue
+
+        lines.append(f"\n## Table: {table_name}")
+
+        # List columns with details
+        lines.append("  Columns:")
+        for col in schema.get("columns", []):
+            col_name = col["name"]
+            col_type = col["type"]
+            nullable = "optional" if col["nullable"] else "required"
+            primary_key = " (PRIMARY KEY)" if col["primary_key"] else ""
+            unique = " (UNIQUE)" if col.get("unique") else ""
+
+            # Extract enum values if present
+            enum_info = ""
+            if "Enum" in col_type:
+                # Try to extract enum values from type string
+                # Format is usually: Enum('value1', 'value2', name='enum_name')
+                import re
+
+                enum_match = re.search(r"Enum\(([^)]+)\)", col_type)
+                if enum_match:
+                    enum_values = enum_match.group(1)
+                    # Extract quoted values
+                    value_matches = re.findall(r"'([^']+)'", enum_values)
+                    if value_matches:
+                        enum_info = f" (enum values: {', '.join(value_matches)})"
+
+            lines.append(
+                f"    - {col_name}: {col_type}, {nullable}{primary_key}{unique}{enum_info}"
+            )
+
+        # Show unique constraints
+        unique_constraints = schema.get("unique_constraints", [])
+        if unique_constraints:
+            lines.append("  Unique constraints:")
+            for constraint in unique_constraints:
+                lines.append(f"    - {', '.join(constraint)}")
+
+        # Show foreign keys
+        foreign_keys = schema.get("foreign_keys", [])
+        if foreign_keys:
+            lines.append("  Foreign keys:")
+            for fk in foreign_keys:
+                lines.append(f"    - {fk['column']} → {fk['references']}")
+
+    return "\n".join(lines)
+
+
 def extract_invoice_data(
-    file_bytes: bytes, mime_type: str, settings: Settings, filename: str | None = None
+    file_bytes: bytes,
+    mime_type: str,
+    settings: Settings,
+    db: Session,
+    filename: str | None = None,
+    source_page: int | None = None,
 ) -> dict[str, Any]:
     """
     Extract structured invoice data from a file using vision model.
@@ -27,6 +99,9 @@ def extract_invoice_data(
         file_bytes: File bytes (image or PDF)
         mime_type: MIME type of the file
         settings: Application settings
+        db: Database session for schema access
+        filename: Optional filename
+        source_page: Optional page number (for multi-page PDFs)
 
     Returns:
         Dictionary with extracted invoice data:
@@ -38,12 +113,16 @@ def extract_invoice_data(
             "currency": str,
             "line_items": [
                 {
-                    "description": str,
+                    "description_raw": str,
                     "quantity": float,
                     "unit": str,
                     "unit_price": float,
                     "line_total": float,
+                    "currency": str,
                     "tax_amount": float,
+                    "source_page": int | None,
+                    "row_index": int | None,
+                    "raw_row": str | None,
                 }
             ],
             "subtotal": float,
@@ -51,41 +130,81 @@ def extract_invoice_data(
             "total": float,
         }
     """
-    prompt = """Extract all invoice data from this document and return it as JSON.
+    # Get DB schema for invoice_line_items table
+    schema_info = _format_schema_for_extraction(["invoices", "invoice_line_items"])
 
-Include:
-- supplier_name: The name of the supplier/vendor
-- invoice_number: The invoice number or reference
-- invoice_date: Invoice date in ISO format (YYYY-MM-DD)
-- due_date: Due date in ISO format if present, otherwise null
-- currency: Currency code (e.g., USD, EUR)
+    prompt = f"""Extract all invoice data from this document and return it as JSON.
+
+{schema_info}
+
+IMPORTANT: Map extracted data to the exact database column names shown above.
+
+Required fields (must not be null):
+- supplier_name: The name of the supplier/vendor (required)
+- invoice_number: The invoice number or reference (required)
+- invoice_date: Invoice date in ISO format YYYY-MM-DD (required)
+- currency: Currency code e.g., USD, EUR (required)
 - line_items: Array of line items, each with:
-  - description: Full description of the item
-  - quantity: Numeric quantity
-  - unit: Unit of measure (kg, pack, piece, etc.)
-  - unit_price: Price per unit
-  - line_total: Total for this line
-  - tax_amount: Tax amount for this line (0 if none)
-- subtotal: Subtotal before tax
-- tax: Total tax amount
-- total: Grand total
+  - description_raw: Full description of the item as shown (required, maps to invoice_line_items.description_raw)
+  - quantity: Numeric quantity (required, Numeric type)
+  - unit: Unit of measure string (required, String type)
+  - unit_price: Price per unit (required, Numeric type)
+  - line_total: Total for this line (required, Numeric type)
+  - currency: Currency code (required, String type)
+  - tax_amount: Tax amount for this line, use 0 if none (required, Numeric type)
+  - source_page: Page number where this item was found ({source_page if source_page is not None else "null if not applicable"})
+  - row_index: Row number/index in the document (null if not applicable)
+  - raw_row: Original text/row content before extraction (null if not applicable)
 
-Return ONLY valid JSON, no other text."""
+Optional fields (use null if not found):
+- due_date: Due date in ISO format YYYY-MM-DD (nullable)
+
+Summary fields:
+- subtotal: Subtotal before tax (Numeric)
+- tax: Total tax amount (Numeric)
+- total: Grand total (Numeric)
+
+CRITICAL RULES:
+1. Return null for any field you cannot determine - NEVER summarize or guess
+2. Use exact column names from the schema above
+3. Include trace fields (source_page, row_index, raw_row) for each line_item
+4. All numeric fields must be actual numbers, not strings
+5. Return ONLY valid JSON, no other text."""
 
     try:
-        extracted_text = process_document_with_vision(file_bytes, mime_type, prompt, settings, filename)
+        extracted_text = process_document_with_vision(
+            file_bytes, mime_type, prompt, settings, filename
+        )
         # Parse JSON from response
         # The model might return JSON wrapped in markdown code blocks
         extracted_text = extracted_text.strip()
         if extracted_text.startswith("```"):
             # Remove markdown code blocks
             lines = extracted_text.split("\n")
-            extracted_text = "\n".join(lines[1:-1]) if len(lines) > 2 else extracted_text
+            extracted_text = (
+                "\n".join(lines[1:-1]) if len(lines) > 2 else extracted_text
+            )
         if extracted_text.startswith("```json"):
             lines = extracted_text.split("\n")
-            extracted_text = "\n".join(lines[1:-1]) if len(lines) > 2 else extracted_text
+            extracted_text = (
+                "\n".join(lines[1:-1]) if len(lines) > 2 else extracted_text
+            )
 
         data = json.loads(extracted_text)
+
+        # Ensure trace fields are set for each line item
+        if "line_items" in data:
+            for idx, item in enumerate(data["line_items"]):
+                if source_page is not None and "source_page" not in item:
+                    item["source_page"] = source_page
+                if "row_index" not in item:
+                    item["row_index"] = idx
+                if "raw_row" not in item:
+                    item["raw_row"] = None
+                # Ensure description_raw is used (backward compatibility)
+                if "description" in item and "description_raw" not in item:
+                    item["description_raw"] = item["description"]
+
         return data
     except json.JSONDecodeError as e:
         logger.exception("invoice_extraction_json_parse_failed")
@@ -96,7 +215,12 @@ Return ONLY valid JSON, no other text."""
 
 
 def extract_price_list_data(
-    file_bytes: bytes, mime_type: str, settings: Settings, filename: str | None = None
+    file_bytes: bytes,
+    mime_type: str,
+    settings: Settings,
+    db: Session,
+    filename: str | None = None,
+    source_page: int | None = None,
 ) -> dict[str, Any]:
     """
     Extract structured price list data from a file using vision model.
@@ -105,6 +229,9 @@ def extract_price_list_data(
         file_bytes: File bytes (image, PDF, CSV, XLSX)
         mime_type: MIME type of the file
         settings: Application settings
+        db: Database session for schema access
+        filename: Optional filename
+        source_page: Optional page number (for multi-page PDFs)
 
     Returns:
         Dictionary with extracted price list data:
@@ -114,44 +241,102 @@ def extract_price_list_data(
             "currency": str,
             "items": [
                 {
-                    "name": str,
-                    "sku": str | None,
-                    "price": float,
-                    "unit": str,
-                    "pack_size": str | None,
+                    "supplier_name_raw": str,
+                    "supplier_sku": str | None,
+                    "pack_size_text": str | None,
+                    "unit_basis": str | None (enum: "kg", "pack", "piece"),
                     "min_order_qty": float | None,
+                    "price": float,
+                    "currency": str,
+                    "price_type": str (enum: "standard", "promo", "special"),
+                    "min_qty": float | None,
+                    "valid_from": str (ISO format),
+                    "valid_to": str | None (ISO format),
+                    "source_page": int | None,
+                    "row_index": int | None,
+                    "raw_row": str | None,
                 }
             ],
         }
     """
-    prompt = """Extract all price list data from this document and return it as JSON.
+    # Get DB schema for supplier_items and supplier_prices tables
+    schema_info = _format_schema_for_extraction(["supplier_items", "supplier_prices"])
 
-Include:
-- supplier_name: The name of the supplier/vendor
-- effective_date: Effective date in ISO format (YYYY-MM-DD) if present, otherwise null
-- currency: Currency code (e.g., USD, EUR)
+    prompt = f"""Extract all price list data from this document and return it as JSON.
+
+{schema_info}
+
+IMPORTANT: Map extracted data to the exact database column names shown above.
+
+Required fields (must not be null):
+- supplier_name: The name of the supplier/vendor (required)
+- currency: Currency code e.g., USD, EUR (required)
 - items: Array of items, each with:
-  - name: Product name as shown in the document
-  - sku: SKU or product code if present, otherwise null
-  - price: Price per unit
-  - unit: Unit of measure (kg, pack, piece, etc.)
-  - pack_size: Pack size description if present (e.g., "10 x 1kg"), otherwise null
-  - min_order_qty: Minimum order quantity if specified, otherwise null
+  - supplier_name_raw: Product name as shown in the document (required, maps to supplier_items.supplier_name_raw)
+  - price: Price per unit (required, Numeric type, maps to supplier_prices.price)
+  - currency: Currency code (required, String type, maps to supplier_prices.currency)
+  - price_type: Price type (required, enum: "standard", "promo", "special", maps to supplier_prices.price_type)
+  - valid_from: Effective/valid from date in ISO format YYYY-MM-DD (required, maps to supplier_prices.valid_from)
 
-Return ONLY valid JSON, no other text."""
+Optional fields (use null if not found):
+- effective_date: Effective date in ISO format YYYY-MM-DD (nullable)
+- supplier_sku: SKU or product code (nullable, maps to supplier_items.supplier_sku)
+- pack_size_text: Pack size description e.g., "10 x 1kg" (nullable, maps to supplier_items.pack_size_text)
+- unit_basis: Unit basis (nullable, enum: "kg", "pack", "piece", maps to supplier_items.unit_basis)
+- min_order_qty: Minimum order quantity (nullable, Numeric, maps to supplier_items.min_order_qty)
+- min_qty: Minimum quantity for this price (nullable, Numeric, maps to supplier_prices.min_qty)
+- valid_to: Valid until date in ISO format YYYY-MM-DD (nullable, maps to supplier_prices.valid_to)
+- source_page: Page number where this item was found ({source_page if source_page is not None else "null if not applicable"})
+- row_index: Row number/index in the document (null if not applicable)
+- raw_row: Original text/row content before extraction (null if not applicable)
+
+NORMALIZATION RULES:
+1. Normalize product names: Extract base name and separate size/pack/MOQ information
+2. Split variants: If same base name appears with different sizes/prices, create separate items
+3. Example: "Tomatoes 1kg" and "Tomatoes 5kg" should be two items with:
+   - supplier_name_raw: "Tomatoes" (base name)
+   - pack_size_text: "1kg" and "5kg" respectively
+   - unit_basis: "kg" for both
+
+CRITICAL RULES:
+1. Return null for any field you cannot determine - NEVER summarize or guess
+2. Use exact column names from the schema above
+3. Include trace fields (source_page, row_index, raw_row) for each item
+4. All numeric fields must be actual numbers, not strings
+5. Return ONLY valid JSON, no other text."""
 
     try:
-        extracted_text = process_document_with_vision(file_bytes, mime_type, prompt, settings, filename)
+        extracted_text = process_document_with_vision(
+            file_bytes, mime_type, prompt, settings, filename
+        )
         # Parse JSON from response
         extracted_text = extracted_text.strip()
         if extracted_text.startswith("```"):
             lines = extracted_text.split("\n")
-            extracted_text = "\n".join(lines[1:-1]) if len(lines) > 2 else extracted_text
+            extracted_text = (
+                "\n".join(lines[1:-1]) if len(lines) > 2 else extracted_text
+            )
         if extracted_text.startswith("```json"):
             lines = extracted_text.split("\n")
-            extracted_text = "\n".join(lines[1:-1]) if len(lines) > 2 else extracted_text
+            extracted_text = (
+                "\n".join(lines[1:-1]) if len(lines) > 2 else extracted_text
+            )
 
         data = json.loads(extracted_text)
+
+        # Ensure trace fields are set for each item
+        if "items" in data:
+            for idx, item in enumerate(data["items"]):
+                if source_page is not None and "source_page" not in item:
+                    item["source_page"] = source_page
+                if "row_index" not in item:
+                    item["row_index"] = idx
+                if "raw_row" not in item:
+                    item["raw_row"] = None
+                # Ensure supplier_name_raw is used (backward compatibility)
+                if "name" in item and "supplier_name_raw" not in item:
+                    item["supplier_name_raw"] = item["name"]
+
         return data
     except json.JSONDecodeError as e:
         logger.exception("price_list_extraction_json_parse_failed")
@@ -162,7 +347,12 @@ Return ONLY valid JSON, no other text."""
 
 
 def extract_inventory_data(
-    file_bytes: bytes, mime_type: str, settings: Settings, filename: str | None = None
+    file_bytes: bytes,
+    mime_type: str,
+    settings: Settings,
+    db: Session,
+    filename: str | None = None,
+    source_page: int | None = None,
 ) -> dict[str, Any]:
     """
     Extract structured inventory data from a photo using vision model.
@@ -171,6 +361,9 @@ def extract_inventory_data(
         file_bytes: Image file bytes
         mime_type: MIME type of the file
         settings: Application settings
+        db: Database session for schema access
+        filename: Optional filename
+        source_page: Optional page number (for multi-page PDFs)
 
     Returns:
         Dictionary with extracted inventory data:
@@ -178,38 +371,81 @@ def extract_inventory_data(
             "items": [
                 {
                     "product_name": str,
-                    "quantity": float | None,
-                    "unit": str | None,
+                    "quantity": float (required),
+                    "unit": str (required),
+                    "unit_cost": float | None,
+                    "received_date": str | None (ISO format),
+                    "expiry_date": str | None (ISO format),
+                    "status": str | None (enum: "available", "consumed", "expired"),
                     "location": str | None,
-                    "notes": str | None,
+                    "source_page": int | None,
+                    "row_index": int | None,
+                    "raw_row": str | None,
                 }
             ],
         }
     """
-    prompt = """Analyze this inventory photo and extract all visible items/products.
+    # Get DB schema for inventory_batches table
+    schema_info = _format_schema_for_extraction(["inventory_batches"])
 
-Return the data as JSON with:
+    prompt = f"""Analyze this inventory photo and extract all visible items/products.
+
+{schema_info}
+
+IMPORTANT: Map extracted data to the exact database column names shown above.
+
+Required fields (must not be null):
 - items: Array of detected items, each with:
-  - product_name: Name or description of the product/item
-  - quantity: Numeric quantity if visible, otherwise null
-  - unit: Unit of measure if visible (kg, pack, piece, etc.), otherwise null
-  - location: Location description if visible (e.g., "Freezer A", "Shelf 3"), otherwise null
-  - notes: Any additional notes or observations, otherwise null
+  - product_name: Name or description of the product/item (for matching to products table)
+  - quantity: Numeric quantity (required, Numeric type, maps to inventory_batches.quantity)
+  - unit: Unit of measure (required, String type, maps to inventory_batches.unit)
 
-Return ONLY valid JSON, no other text."""
+Optional fields (use null if not found):
+- unit_cost: Unit cost/price if visible (nullable, Numeric, maps to inventory_batches.unit_cost)
+- received_date: Date received in ISO format YYYY-MM-DD if visible (nullable, maps to inventory_batches.received_date)
+- expiry_date: Expiry date in ISO format YYYY-MM-DD if visible (nullable, maps to inventory_batches.expiry_date)
+- status: Batch status (nullable, enum: "available", "consumed", "expired", maps to inventory_batches.status)
+- location: Location description if visible e.g., "Freezer A", "Shelf 3" (nullable, for inventory_locations lookup)
+- source_page: Page number where this item was found ({source_page if source_page is not None else "null if not applicable"})
+- row_index: Row number/index in the document (null if not applicable)
+- raw_row: Original text/row content before extraction (null if not applicable)
+
+CRITICAL RULES:
+1. Return null for any field you cannot determine - NEVER summarize or guess
+2. Use exact column names from the schema above
+3. Include trace fields (source_page, row_index, raw_row) for each item
+4. All numeric fields must be actual numbers, not strings
+5. Return ONLY valid JSON, no other text."""
 
     try:
-        extracted_text = process_document_with_vision(file_bytes, mime_type, prompt, settings, filename)
+        extracted_text = process_document_with_vision(
+            file_bytes, mime_type, prompt, settings, filename
+        )
         # Parse JSON from response
         extracted_text = extracted_text.strip()
         if extracted_text.startswith("```"):
             lines = extracted_text.split("\n")
-            extracted_text = "\n".join(lines[1:-1]) if len(lines) > 2 else extracted_text
+            extracted_text = (
+                "\n".join(lines[1:-1]) if len(lines) > 2 else extracted_text
+            )
         if extracted_text.startswith("```json"):
             lines = extracted_text.split("\n")
-            extracted_text = "\n".join(lines[1:-1]) if len(lines) > 2 else extracted_text
+            extracted_text = (
+                "\n".join(lines[1:-1]) if len(lines) > 2 else extracted_text
+            )
 
         data = json.loads(extracted_text)
+
+        # Ensure trace fields are set for each item
+        if "items" in data:
+            for idx, item in enumerate(data["items"]):
+                if source_page is not None and "source_page" not in item:
+                    item["source_page"] = source_page
+                if "row_index" not in item:
+                    item["row_index"] = idx
+                if "raw_row" not in item:
+                    item["raw_row"] = None
+
         return data
     except json.JSONDecodeError as e:
         logger.exception("inventory_extraction_json_parse_failed")
@@ -263,7 +499,9 @@ def match_product_aliases(
     ).all()
 
     aliases = db.scalars(
-        select(ProductAliases).join(Products).where(Products.restaurant_id == restaurant_id)
+        select(ProductAliases)
+        .join(Products)
+        .where(Products.restaurant_id == restaurant_id)
     ).all()
 
     if not products:
@@ -367,4 +605,3 @@ Return ONLY valid JSON, no other text."""
     except Exception as e:
         logger.exception("product_alias_matching_failed")
         raise OpenAIError(f"Product alias matching failed: {e}") from e
-

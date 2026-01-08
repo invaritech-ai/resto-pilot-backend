@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import base64
+import io
+import json
 import logging
 import random
 import time
@@ -12,6 +14,7 @@ from app.ai.openai_client import (
     OpenAIError,
     _is_retryable_exception,
     _is_retryable_status,
+    chat_completions_create,
 )
 from app.core.config import Settings
 
@@ -148,11 +151,181 @@ def process_image_with_vision(
     raise OpenAIError(f"Vision request failed: {last_exc!r}")
 
 
+def _is_text_based_pdf(file_bytes: bytes) -> bool:
+    """
+    Check if PDF is text-based (can extract text directly) or image-based (needs OCR).
+
+    Args:
+        file_bytes: PDF file bytes
+
+    Returns:
+        True if text-based, False if image-based
+    """
+    try:
+        from pypdf import PdfReader
+
+        pdf_reader = PdfReader(io.BytesIO(file_bytes))
+        # Check first few pages for extractable text
+        text_length = 0
+        pages_to_check = min(3, len(pdf_reader.pages))
+        for i in range(pages_to_check):
+            try:
+                page_text = pdf_reader.pages[i].extract_text()
+                if page_text:
+                    text_length += len(page_text.strip())
+            except Exception:
+                pass
+
+        # If we can extract substantial text, it's text-based
+        return text_length > 100
+    except ImportError:
+        logger.warning("pypdf not available, assuming image-based PDF")
+        return False
+    except Exception as e:
+        logger.warning(f"Error checking PDF type: {e}, assuming image-based")
+        return False
+
+
+def _extract_text_from_pdf_pages(file_bytes: bytes) -> list[tuple[int, str]]:
+    """
+    Extract text from each page of a text-based PDF.
+
+    Args:
+        file_bytes: PDF file bytes
+
+    Returns:
+        List of (page_number, text) tuples (1-indexed)
+    """
+    try:
+        from pypdf import PdfReader
+
+        pdf_reader = PdfReader(io.BytesIO(file_bytes))
+        pages = []
+        for i, page in enumerate(pdf_reader.pages, start=1):
+            try:
+                text = page.extract_text()
+                pages.append((i, text))
+            except Exception as e:
+                logger.warning(f"Error extracting text from page {i}: {e}")
+                pages.append((i, ""))
+        return pages
+    except ImportError:
+        raise OpenAIError("pypdf is required for text-based PDF extraction")
+    except Exception as e:
+        raise OpenAIError(f"Failed to extract text from PDF: {e}") from e
+
+
+def _convert_pdf_pages_to_images(file_bytes: bytes) -> list[tuple[int, bytes]]:
+    """
+    Convert PDF pages to images.
+
+    Args:
+        file_bytes: PDF file bytes
+
+    Returns:
+        List of (page_number, image_bytes) tuples (1-indexed)
+    """
+    try:
+        from pdf2image import convert_from_bytes
+        from PIL import Image
+
+        images = convert_from_bytes(file_bytes)
+        pages = []
+        for i, img in enumerate(images, start=1):
+            # Convert PIL Image to bytes
+            img_bytes_io = io.BytesIO()
+            img.save(img_bytes_io, format="PNG")
+            pages.append((i, img_bytes_io.getvalue()))
+        return pages
+    except ImportError:
+        raise OpenAIError(
+            "pdf2image and Pillow are required for image-based PDF processing"
+        )
+    except Exception as e:
+        raise OpenAIError(f"Failed to convert PDF pages to images: {e}") from e
+
+
 def process_pdf_with_vision(
+    file_bytes: bytes,
+    filename: str | None,
+    prompt: str,
+    settings: Settings,
+    page_by_page: bool = True,
+) -> str:
+    """
+    Process a PDF file with a vision model, optionally page-by-page.
+
+    Args:
+        file_bytes: PDF file bytes
+        filename: Optional filename for the PDF
+        prompt: Prompt describing what to extract from the PDF
+        settings: Application settings
+        page_by_page: If True, process each page separately and consolidate
+
+    Returns:
+        Extracted text/structured data as string (consolidated if page_by_page=True)
+    """
+    if not page_by_page:
+        # Original behavior: process entire PDF at once
+        return _process_pdf_single(file_bytes, filename, prompt, settings)
+
+    # Page-by-page processing
+    is_text_based = _is_text_based_pdf(file_bytes)
+
+    if is_text_based:
+        # Extract text from each page
+        pages = _extract_text_from_pdf_pages(file_bytes)
+        page_results = []
+
+        for page_num, page_text in pages:
+            if not page_text.strip():
+                continue
+
+            # Process text with LLM
+            system_prompt = "You are a helpful assistant that extracts structured data from text. Return ONLY valid JSON, no other text."
+            user_prompt = f"{prompt}\n\nExtracted text from page {page_num}:\n{page_text}"
+
+            try:
+                response = chat_completions_create(
+                    settings=settings,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    temperature=0.2,
+                )
+                content = response.get("choices", [{}])[0].get("message", {}).get("content")
+                if not isinstance(content, str):
+                    raise OpenAIError(f"Unexpected LLM response: {response}")
+                page_results.append((page_num, content))
+            except Exception as e:
+                logger.warning(f"Error processing page {page_num}: {e}")
+                continue
+
+    else:
+        # Convert pages to images and process with vision API
+        pages = _convert_pdf_pages_to_images(file_bytes)
+        page_results = []
+
+        for page_num, page_image_bytes in pages:
+            try:
+                result = process_image_with_vision(
+                    page_image_bytes, prompt, settings, "image/png"
+                )
+                page_results.append((page_num, result))
+            except Exception as e:
+                logger.warning(f"Error processing page {page_num}: {e}")
+                continue
+
+    # Consolidate results
+    return _consolidate_pdf_page_results(page_results, prompt, settings)
+
+
+def _process_pdf_single(
     file_bytes: bytes, filename: str | None, prompt: str, settings: Settings
 ) -> str:
     """
-    Process a PDF file with a vision model using OpenRouter's file format.
+    Process entire PDF at once (original behavior).
 
     Args:
         file_bytes: PDF file bytes
@@ -260,6 +433,105 @@ def process_pdf_with_vision(
             raise OpenAIError(f"Vision request failed: {exc}") from exc
 
     raise OpenAIError(f"Vision request failed: {last_exc!r}")
+
+
+def _consolidate_pdf_page_results(
+    page_results: list[tuple[int, str]], prompt: str, settings: Settings
+) -> str:
+    """
+    Consolidate results from multiple PDF pages into a single structured response.
+
+    Args:
+        page_results: List of (page_number, extracted_json_string) tuples
+        prompt: Original extraction prompt
+        settings: Application settings
+
+    Returns:
+        Consolidated JSON string
+    """
+    if not page_results:
+        raise OpenAIError("No pages were successfully processed")
+
+    if len(page_results) == 1:
+        # Single page, return as-is
+        return page_results[0][1]
+
+    # Parse all page results
+    parsed_results = []
+    for page_num, result_str in page_results:
+        try:
+            # Clean JSON string
+            cleaned = result_str.strip()
+            if cleaned.startswith("```"):
+                lines = cleaned.split("\n")
+                cleaned = "\n".join(lines[1:-1]) if len(lines) > 2 else cleaned
+            if cleaned.startswith("```json"):
+                lines = cleaned.split("\n")
+                cleaned = "\n".join(lines[1:-1]) if len(lines) > 2 else cleaned
+
+            data = json.loads(cleaned)
+            parsed_results.append((page_num, data))
+        except json.JSONDecodeError as e:
+            logger.warning(f"Failed to parse page {page_num} result: {e}")
+            continue
+
+    if not parsed_results:
+        raise OpenAIError("No valid page results to consolidate")
+
+    # Consolidate: merge line_items/items from all pages, keep header/metadata from first page
+    consolidated = parsed_results[0][1].copy()  # Start with first page data
+
+    # Merge arrays (line_items for invoices, items for price lists/inventory)
+    array_keys = ["line_items", "items"]
+    for key in array_keys:
+        if key in consolidated:
+            all_items = consolidated[key].copy()
+            # Add items from other pages
+            for page_num, page_data in parsed_results[1:]:
+                if key in page_data:
+                    for item in page_data[key]:
+                        # Ensure source_page is set
+                        if "source_page" not in item:
+                            item["source_page"] = page_num
+                        all_items.append(item)
+            
+            # De-duplicate items based on DB column matching
+            if key == "line_items":
+                # For invoices: de-dupe on description_raw + quantity + unit + unit_price
+                deduplicated = []
+                seen = set()
+                for item in all_items:
+                    desc = item.get("description_raw", item.get("description", ""))
+                    qty = item.get("quantity")
+                    unit = item.get("unit", "")
+                    price = item.get("unit_price")
+                    # Create key for deduplication
+                    dedup_key = (desc, qty, unit, price)
+                    if dedup_key not in seen:
+                        seen.add(dedup_key)
+                        deduplicated.append(item)
+                all_items = deduplicated
+            elif key == "items":
+                # For price lists: de-dupe on supplier_name_raw + pack_size_text + unit_basis + min_order_qty
+                # Note: We preserve items with different prices even if other fields match
+                deduplicated = []
+                seen = set()
+                for item in all_items:
+                    name = item.get("supplier_name_raw", item.get("name", ""))
+                    pack_size = item.get("pack_size_text", "")
+                    unit_basis = item.get("unit_basis", "")
+                    min_order_qty = item.get("min_order_qty")
+                    # Create key for deduplication (excluding price to preserve variants)
+                    dedup_key = (name, pack_size, unit_basis, min_order_qty)
+                    if dedup_key not in seen:
+                        seen.add(dedup_key)
+                        deduplicated.append(item)
+                all_items = deduplicated
+            
+            consolidated[key] = all_items
+
+    # Return consolidated JSON
+    return json.dumps(consolidated, ensure_ascii=False)
 
 
 def extract_text_from_file(
@@ -422,9 +694,9 @@ def process_document_with_vision(
     if mime_type.startswith("image/"):
         return process_image_with_vision(file_bytes, prompt, settings, mime_type)
 
-    # For PDFs, use OpenRouter's file format
+    # For PDFs, use page-by-page processing
     if mime_type == "application/pdf":
-        return process_pdf_with_vision(file_bytes, filename, prompt, settings)
+        return process_pdf_with_vision(file_bytes, filename, prompt, settings, page_by_page=True)
 
     # For text files, extract text directly and send to LLM for processing
     if (

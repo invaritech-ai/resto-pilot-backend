@@ -67,30 +67,32 @@ def process_invoice_file_task(
                 mime_type = "image/jpeg"  # Fallback
             filename = telegram_msg.filename if telegram_msg else None
 
-            # Extract invoice data
-            extracted_data = extract_invoice_data(file_bytes, mime_type, settings, filename)
+            # Extract invoice data (with DB-aware extraction)
+            extracted_data = extract_invoice_data(file_bytes, mime_type, settings, db, filename)
+
+            # Check for missing required fields
+            supplier_name = extracted_data.get("supplier_name", "").strip() if extracted_data.get("supplier_name") else ""
+            currency = extracted_data.get("currency", "").strip() if extracted_data.get("currency") else ""
 
             # Find or create supplier if not provided
             supplier_uuid = None
             if supplier_id:
                 supplier_uuid = _parse_uuid(supplier_id)
-            else:
-                # Try to find supplier by name from extracted data
-                supplier_name = extracted_data.get("supplier_name", "").strip()
-                if supplier_name:
-                    supplier = db.scalar(
-                        select(Suppliers).where(
-                            Suppliers.restaurant_id == restaurant_uuid,
-                            Suppliers.name.ilike(supplier_name),
-                            Suppliers.is_active == True,
-                        )
+            elif supplier_name:
+                supplier = db.scalar(
+                    select(Suppliers).where(
+                        Suppliers.restaurant_id == restaurant_uuid,
+                        Suppliers.name.ilike(supplier_name),
+                        Suppliers.is_active == True,
                     )
-                    if supplier:
-                        supplier_uuid = supplier.id
+                )
+                if supplier:
+                    supplier_uuid = supplier.id
 
             # Match product aliases for line items
             supplier_names = [
-                item.get("description", "") for item in extracted_data.get("line_items", [])
+                item.get("description_raw", item.get("description", ""))
+                for item in extracted_data.get("line_items", [])
             ]
             alias_matches = match_product_aliases(restaurant_uuid, supplier_names, db, settings)
 
@@ -105,6 +107,13 @@ def process_invoice_file_task(
             db.add(document)
             db.flush()
 
+            # Determine status based on missing fields
+            status = "pending_review"
+            if not supplier_name:
+                status = "awaiting_supplier"
+            elif not currency:
+                status = "awaiting_currency"
+
             # Create staging record
             staging = FileProcessingStaging(
                 restaurant_id=restaurant_uuid,
@@ -113,31 +122,52 @@ def process_invoice_file_task(
                 processing_type="invoice",
                 extracted_data_json=extracted_data,
                 product_alias_matches_json=alias_matches,
-                status="pending_review",
+                status=status,
             )
             db.add(staging)
             db.commit()
 
-            # Format and send preview message
-            lines = ["📄 Invoice Preview:\n"]
-            lines.append(f"Supplier: {extracted_data.get('supplier_name', 'N/A')}")
-            lines.append(f"Invoice Number: {extracted_data.get('invoice_number', 'N/A')}")
-            lines.append(f"Date: {extracted_data.get('invoice_date', 'N/A')}")
-            lines.append(f"Currency: {extracted_data.get('currency', 'N/A')}")
-            lines.append(f"Total: {extracted_data.get('total', 'N/A')}")
-            lines.append("\nLine Items:")
-            for i, item in enumerate(extracted_data.get("line_items", []), 1):
-                lines.append(
-                    f"  {i}. {item.get('description', 'N/A')} - "
-                    f"{item.get('quantity', 'N/A')} {item.get('unit', '')} @ "
-                    f"{item.get('unit_price', 'N/A')} = {item.get('line_total', 'N/A')}"
+            # Send message based on status
+            if status == "awaiting_supplier":
+                send_message(
+                    chat_id=chat_id,
+                    text="What supplier is this invoice from?",
+                    settings=settings,
                 )
-            lines.append(
-                f"\n\nReview the data above. Tell me if anything needs changing, or say /confirm to save."
-            )
-            preview_text = "\n".join(lines)
-
-            send_message(chat_id=chat_id, text=preview_text, settings=settings)
+            elif status == "awaiting_currency":
+                send_message(
+                    chat_id=chat_id,
+                    text="What currency is this invoice in? (e.g., USD, EUR)",
+                    settings=settings,
+                )
+            else:
+                # Format and send preview message
+                lines = ["📄 Invoice Preview:\n"]
+                supplier_display = supplier_name or "⚠️ MISSING"
+                currency_display = currency or "⚠️ MISSING"
+                lines.append(f"Supplier: {supplier_display}")
+                lines.append(f"Invoice Number: {extracted_data.get('invoice_number', 'N/A')}")
+                lines.append(f"Date: {extracted_data.get('invoice_date', 'N/A')}")
+                lines.append(f"Currency: {currency_display}")
+                lines.append(f"Total: {extracted_data.get('total', 'N/A')}")
+                lines.append("\nLine Items:")
+                for i, item in enumerate(extracted_data.get("line_items", []), 1):
+                    desc = item.get("description_raw", item.get("description", "N/A"))
+                    qty = item.get("quantity", "N/A")
+                    unit = item.get("unit", "")
+                    price = item.get("unit_price", "N/A")
+                    total = item.get("line_total", "N/A")
+                    source_info = ""
+                    if item.get("source_page"):
+                        source_info = f" [Page {item['source_page']}]"
+                    lines.append(
+                        f"  {i}. {desc} - {qty} {unit} @ {price} = {total}{source_info}"
+                    )
+                lines.append(
+                    "\n\nReview the data above. Tell me if anything needs changing, or say /confirm to save."
+                )
+                preview_text = "\n".join(lines)
+                send_message(chat_id=chat_id, text=preview_text, settings=settings)
 
             # Record processing event
             db.add(
@@ -216,29 +246,33 @@ def process_price_list_file_task(
                 mime_type = "image/jpeg"  # Fallback
             filename = telegram_msg.filename if telegram_msg else None
 
-            # Extract price list data
-            extracted_data = extract_price_list_data(file_bytes, mime_type, settings, filename)
+            # Extract price list data (with DB-aware extraction)
+            extracted_data = extract_price_list_data(file_bytes, mime_type, settings, db, filename)
+
+            # Check for missing required fields
+            supplier_name = extracted_data.get("supplier_name", "").strip() if extracted_data.get("supplier_name") else ""
+            currency = extracted_data.get("currency", "").strip() if extracted_data.get("currency") else ""
 
             # Find or create supplier if not provided
             supplier_uuid = None
             if supplier_id:
                 supplier_uuid = _parse_uuid(supplier_id)
-            else:
-                # Try to find supplier by name from extracted data
-                supplier_name = extracted_data.get("supplier_name", "").strip()
-                if supplier_name:
-                    supplier = db.scalar(
-                        select(Suppliers).where(
-                            Suppliers.restaurant_id == restaurant_uuid,
-                            Suppliers.name.ilike(supplier_name),
-                            Suppliers.is_active == True,
-                        )
+            elif supplier_name:
+                supplier = db.scalar(
+                    select(Suppliers).where(
+                        Suppliers.restaurant_id == restaurant_uuid,
+                        Suppliers.name.ilike(supplier_name),
+                        Suppliers.is_active == True,
                     )
-                    if supplier:
-                        supplier_uuid = supplier.id
+                )
+                if supplier:
+                    supplier_uuid = supplier.id
 
             # Match product aliases for items
-            supplier_names = [item.get("name", "") for item in extracted_data.get("items", [])]
+            supplier_names = [
+                item.get("supplier_name_raw", item.get("name", ""))
+                for item in extracted_data.get("items", [])
+            ]
             alias_matches = match_product_aliases(restaurant_uuid, supplier_names, db, settings)
 
             # Create document record
@@ -252,6 +286,13 @@ def process_price_list_file_task(
             db.add(document)
             db.flush()
 
+            # Determine status based on missing fields
+            status = "pending_review"
+            if not supplier_name:
+                status = "awaiting_supplier"
+            elif not currency:
+                status = "awaiting_currency"
+
             # Create staging record
             staging = FileProcessingStaging(
                 restaurant_id=restaurant_uuid,
@@ -260,28 +301,58 @@ def process_price_list_file_task(
                 processing_type="price_list",
                 extracted_data_json=extracted_data,
                 product_alias_matches_json=alias_matches,
-                status="pending_review",
+                status=status,
             )
             db.add(staging)
             db.commit()
 
-            # Format and send preview message
-            lines = ["📋 Price List Preview:\n"]
-            lines.append(f"Supplier: {extracted_data.get('supplier_name', 'N/A')}")
-            lines.append(f"Currency: {extracted_data.get('currency', 'N/A')}")
-            lines.append(f"Items: {len(extracted_data.get('items', []))}")
-            lines.append("\nItems:")
-            for i, item in enumerate(extracted_data.get("items", []), 1):
-                lines.append(
-                    f"  {i}. {item.get('name', 'N/A')} - "
-                    f"{item.get('price', 'N/A')} {item.get('currency', '')} per {item.get('unit', '')}"
+            # Send message based on status
+            if status == "awaiting_supplier":
+                send_message(
+                    chat_id=chat_id,
+                    text="What supplier is this price list from?",
+                    settings=settings,
                 )
-            lines.append(
-                f"\n\nReview the data above. Tell me if anything needs changing, or say /confirm to save."
-            )
-            preview_text = "\n".join(lines)
-
-            send_message(chat_id=chat_id, text=preview_text, settings=settings)
+            elif status == "awaiting_currency":
+                send_message(
+                    chat_id=chat_id,
+                    text="What currency is this price list in? (e.g., USD, EUR)",
+                    settings=settings,
+                )
+            else:
+                # Format and send preview message
+                lines = ["📋 Price List Preview:\n"]
+                supplier_display = supplier_name or "⚠️ MISSING"
+                currency_display = currency or "⚠️ MISSING"
+                lines.append(f"Supplier: {supplier_display}")
+                lines.append(f"Currency: {currency_display}")
+                lines.append(f"Items: {len(extracted_data.get('items', []))}")
+                lines.append("\nItems:")
+                for i, item in enumerate(extracted_data.get("items", []), 1):
+                    name = item.get("supplier_name_raw", item.get("name", "N/A"))
+                    price = item.get("price", "N/A")
+                    item_currency = item.get("currency", currency_display)
+                    unit_basis = item.get("unit_basis", "")
+                    pack_size = item.get("pack_size_text", "")
+                    min_order_qty = item.get("min_order_qty")
+                    source_info = ""
+                    if item.get("source_page"):
+                        source_info = f" [Page {item['source_page']}]"
+                    
+                    item_line = f"  {i}. {name}"
+                    if pack_size:
+                        item_line += f" (pack_size_text: {pack_size})"
+                    if unit_basis:
+                        item_line += f" (unit_basis: {unit_basis})"
+                    if min_order_qty is not None:
+                        item_line += f" (min_order_qty: {min_order_qty})"
+                    item_line += f" - {price} {item_currency}{source_info}"
+                    lines.append(item_line)
+                lines.append(
+                    "\n\nReview the data above. Tell me if anything needs changing, or say /confirm to save."
+                )
+                preview_text = "\n".join(lines)
+                send_message(chat_id=chat_id, text=preview_text, settings=settings)
 
             # Record processing event
             db.add(
@@ -359,8 +430,8 @@ def process_inventory_photo_task(
                 mime_type = "image/jpeg"  # Fallback
             filename = telegram_msg.filename if telegram_msg else None
 
-            # Extract inventory data
-            extracted_data = extract_inventory_data(file_bytes, mime_type, settings, filename)
+            # Extract inventory data (with DB-aware extraction)
+            extracted_data = extract_inventory_data(file_bytes, mime_type, settings, db, filename)
 
             # Match product aliases for detected items
             supplier_names = [
@@ -386,15 +457,26 @@ def process_inventory_photo_task(
             lines.append(f"Items Detected: {len(extracted_data.get('items', []))}")
             lines.append("\nItems:")
             for i, item in enumerate(extracted_data.get("items", []), 1):
-                lines.append(
-                    f"  {i}. {item.get('product_name', 'N/A')} - "
-                    f"{item.get('quantity', 'N/A')} {item.get('unit', '')}"
-                )
+                product_name = item.get("product_name", "N/A")
+                quantity = item.get("quantity", "N/A")
+                unit = item.get("unit", "")
+                unit_cost = item.get("unit_cost")
+                status_val = item.get("status")
+                source_info = ""
+                if item.get("source_page"):
+                    source_info = f" [Page {item['source_page']}]"
+                
+                item_line = f"  {i}. {product_name} - {quantity} {unit}"
+                if unit_cost is not None:
+                    item_line += f" (unit_cost: {unit_cost})"
+                if status_val:
+                    item_line += f" (status: {status_val})"
+                item_line += source_info
+                lines.append(item_line)
             lines.append(
-                f"\n\nReview the data above. Tell me if anything needs changing, or say /confirm to save."
+                "\n\nReview the data above. Tell me if anything needs changing, or say /confirm to save."
             )
             preview_text = "\n".join(lines)
-
             send_message(chat_id=chat_id, text=preview_text, settings=settings)
 
             # Record processing event
