@@ -172,7 +172,7 @@ Your job is to:
 - confirm_upload: User wants to confirm processed file data (/confirm, "yes", "looks good")
 
 ### Navigation
-- show_menu: User wants to see available options ("menu", "help", "what can you do")
+- show_menu: User greets or wants to see available options ("hi", "hello", "menu", "help", "what can you do")
 - cancel: User wants to cancel current operation ("cancel", "nevermind", "/cancel")
 
 ### Unknown
@@ -236,8 +236,16 @@ def classify_intent(
     """
     # Quick checks for command shortcuts
     text_lower = message_text.strip().lower()
+    # Also strip common punctuation for matching
+    text_clean = text_lower.rstrip("!?.,")
 
-    if text_lower in ("/menu", "menu", "/help", "help", "what can you do", "?"):
+    # Greetings and menu requests -> show menu
+    if text_lower in ("/menu", "/help", "?") or text_clean in (
+        "menu", "help", "what can you do",
+        "hi", "hello", "hey", "hii", "hiii", "yo", "sup",
+        "good morning", "good afternoon", "good evening",
+        "hi there", "hello there", "hey there",
+    ):
         return ClassifiedIntent(intent=Intent.SHOW_MENU, confidence=1.0)
 
     if text_lower in ("/cancel", "cancel", "nevermind", "stop"):
