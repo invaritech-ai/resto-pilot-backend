@@ -171,7 +171,7 @@ def create_file_processing_tools(
         if not has_restaurant_access(db, user_id, staging.restaurant_id):
             return "Error: You don't have access to this file processing record."
 
-        if staging.status != "pending_review":
+        if staging.status not in ("pending_review", "awaiting_supplier", "awaiting_currency"):
             return f"Error: This record is already {staging.status}. Cannot review."
 
         # Format the extracted data nicely
@@ -180,44 +180,196 @@ def create_file_processing_tools(
 
         if processing_type == "invoice":
             lines = ["📄 Invoice Preview:\n"]
-            lines.append(f"Supplier: {extracted_data.get('supplier_name', 'N/A')}")
+            supplier_name = extracted_data.get("supplier_name", "").strip() if extracted_data.get("supplier_name") else ""
+            currency = extracted_data.get("currency", "").strip() if extracted_data.get("currency") else ""
+            supplier_display = supplier_name or "⚠️ MISSING"
+            currency_display = currency or "⚠️ MISSING"
+            lines.append(f"Supplier: {supplier_display}")
             lines.append(f"Invoice Number: {extracted_data.get('invoice_number', 'N/A')}")
             lines.append(f"Date: {extracted_data.get('invoice_date', 'N/A')}")
-            lines.append(f"Currency: {extracted_data.get('currency', 'N/A')}")
+            lines.append(f"Currency: {currency_display}")
             lines.append(f"Total: {extracted_data.get('total', 'N/A')}")
             lines.append("\nLine Items:")
             for i, item in enumerate(extracted_data.get("line_items", []), 1):
+                desc = item.get("description_raw", item.get("description", "N/A"))
+                qty = item.get("quantity", "N/A")
+                unit = item.get("unit", "")
+                price = item.get("unit_price", "N/A")
+                total = item.get("line_total", "N/A")
+                source_info = ""
+                if item.get("source_page"):
+                    source_info = f" [Page {item['source_page']}]"
                 lines.append(
-                    f"  {i}. {item.get('description', 'N/A')} - "
-                    f"{item.get('quantity', 'N/A')} {item.get('unit', '')} @ "
-                    f"{item.get('unit_price', 'N/A')} = {item.get('line_total', 'N/A')}"
+                    f"  {i}. {desc} - {qty} {unit} @ {price} = {total}{source_info}"
                 )
         elif processing_type == "price_list":
             lines = ["📋 Price List Preview:\n"]
-            lines.append(f"Supplier: {extracted_data.get('supplier_name', 'N/A')}")
-            lines.append(f"Currency: {extracted_data.get('currency', 'N/A')}")
+            supplier_name = extracted_data.get("supplier_name", "").strip() if extracted_data.get("supplier_name") else ""
+            currency = extracted_data.get("currency", "").strip() if extracted_data.get("currency") else ""
+            supplier_display = supplier_name or "⚠️ MISSING"
+            currency_display = currency or "⚠️ MISSING"
+            lines.append(f"Supplier: {supplier_display}")
+            lines.append(f"Currency: {currency_display}")
             lines.append(f"Items: {len(extracted_data.get('items', []))}")
             lines.append("\nItems:")
             for i, item in enumerate(extracted_data.get("items", []), 1):
-                lines.append(
-                    f"  {i}. {item.get('name', 'N/A')} - "
-                    f"{item.get('price', 'N/A')} {item.get('currency', '')} per {item.get('unit', '')}"
-                )
+                name = item.get("supplier_name_raw", item.get("name", "N/A"))
+                price = item.get("price", "N/A")
+                item_currency = item.get("currency", currency_display)
+                unit_basis = item.get("unit_basis", "")
+                pack_size = item.get("pack_size_text", "")
+                min_order_qty = item.get("min_order_qty")
+                source_info = ""
+                if item.get("source_page"):
+                    source_info = f" [Page {item['source_page']}]"
+                
+                item_line = f"  {i}. {name}"
+                if pack_size:
+                    item_line += f" (pack_size_text: {pack_size})"
+                if unit_basis:
+                    item_line += f" (unit_basis: {unit_basis})"
+                if min_order_qty is not None:
+                    item_line += f" (min_order_qty: {min_order_qty})"
+                item_line += f" - {price} {item_currency}{source_info}"
+                lines.append(item_line)
         elif processing_type == "inventory":
             lines = ["📸 Inventory Photo Preview:\n"]
             lines.append(f"Items Detected: {len(extracted_data.get('items', []))}")
             lines.append("\nItems:")
             for i, item in enumerate(extracted_data.get("items", []), 1):
-                lines.append(
-                    f"  {i}. {item.get('product_name', 'N/A')} - "
-                    f"{item.get('quantity', 'N/A')} {item.get('unit', '')}"
-                )
+                product_name = item.get("product_name", "N/A")
+                quantity = item.get("quantity", "N/A")
+                unit = item.get("unit", "")
+                unit_cost = item.get("unit_cost")
+                status_val = item.get("status")
+                source_info = ""
+                if item.get("source_page"):
+                    source_info = f" [Page {item['source_page']}]"
+                
+                item_line = f"  {i}. {product_name} - {quantity} {unit}"
+                if unit_cost is not None:
+                    item_line += f" (unit_cost: {unit_cost})"
+                if status_val:
+                    item_line += f" (status: {status_val})"
+                item_line += source_info
+                lines.append(item_line)
         else:
             lines = [f"Preview for {processing_type}:\n"]
             lines.append(json.dumps(extracted_data, indent=2))
 
         lines.append("\n\nReview the data above. Tell me if anything needs changing, or say /confirm to save.")
         return "\n".join(lines)
+
+    def update_missing_field(args: dict[str, Any]) -> str:
+        """Update a missing supplier or currency field and show preview."""
+        staging_id_str = args.get("staging_id", "").strip()
+        if not staging_id_str:
+            return "Error: staging_id is required."
+
+        try:
+            staging_id = uuid.UUID(staging_id_str)
+        except ValueError:
+            return "Error: Invalid staging_id format."
+
+        staging = db.get(FileProcessingStaging, staging_id)
+        if not staging:
+            return "Error: File processing record not found."
+
+        if not has_restaurant_access(db, user_id, staging.restaurant_id):
+            return "Error: You don't have access to this file processing record."
+
+        if staging.status not in ("awaiting_supplier", "awaiting_currency"):
+            return f"Error: This record is not awaiting a missing field. Current status: {staging.status}"
+
+        field_value = args.get("value", "").strip()
+        if not field_value:
+            return "Error: value is required."
+
+        # Update extracted_data_json
+        extracted_data = staging.extracted_data_json.copy()
+        
+        if staging.status == "awaiting_supplier":
+            extracted_data["supplier_name"] = field_value
+            # Check if currency is also missing
+            currency = extracted_data.get("currency", "").strip() if extracted_data.get("currency") else ""
+            if not currency:
+                staging.status = "awaiting_currency"
+            else:
+                staging.status = "pending_review"
+        elif staging.status == "awaiting_currency":
+            extracted_data["currency"] = field_value
+            staging.status = "pending_review"
+
+        staging.extracted_data_json = extracted_data
+        try:
+            db.commit()
+            
+            # If status is now pending_review, return preview
+            if staging.status == "pending_review":
+                # Use review_file_processing logic to format preview
+                processing_type = staging.processing_type
+                if processing_type == "invoice":
+                    lines = ["📄 Invoice Preview:\n"]
+                    supplier_display = extracted_data.get("supplier_name", "N/A")
+                    currency_display = extracted_data.get("currency", "N/A")
+                    lines.append(f"Supplier: {supplier_display}")
+                    lines.append(f"Invoice Number: {extracted_data.get('invoice_number', 'N/A')}")
+                    lines.append(f"Date: {extracted_data.get('invoice_date', 'N/A')}")
+                    lines.append(f"Currency: {currency_display}")
+                    lines.append(f"Total: {extracted_data.get('total', 'N/A')}")
+                    lines.append("\nLine Items:")
+                    for i, item in enumerate(extracted_data.get("line_items", []), 1):
+                        desc = item.get("description_raw", item.get("description", "N/A"))
+                        qty = item.get("quantity", "N/A")
+                        unit = item.get("unit", "")
+                        price = item.get("unit_price", "N/A")
+                        total = item.get("line_total", "N/A")
+                        source_info = ""
+                        if item.get("source_page"):
+                            source_info = f" [Page {item['source_page']}]"
+                        lines.append(
+                            f"  {i}. {desc} - {qty} {unit} @ {price} = {total}{source_info}"
+                        )
+                elif processing_type == "price_list":
+                    lines = ["📋 Price List Preview:\n"]
+                    supplier_display = extracted_data.get("supplier_name", "N/A")
+                    currency_display = extracted_data.get("currency", "N/A")
+                    lines.append(f"Supplier: {supplier_display}")
+                    lines.append(f"Currency: {currency_display}")
+                    lines.append(f"Items: {len(extracted_data.get('items', []))}")
+                    lines.append("\nItems:")
+                    for i, item in enumerate(extracted_data.get("items", []), 1):
+                        name = item.get("supplier_name_raw", item.get("name", "N/A"))
+                        price = item.get("price", "N/A")
+                        item_currency = item.get("currency", currency_display)
+                        unit_basis = item.get("unit_basis", "")
+                        pack_size = item.get("pack_size_text", "")
+                        min_order_qty = item.get("min_order_qty")
+                        source_info = ""
+                        if item.get("source_page"):
+                            source_info = f" [Page {item['source_page']}]"
+                        
+                        item_line = f"  {i}. {name}"
+                        if pack_size:
+                            item_line += f" (pack_size_text: {pack_size})"
+                        if unit_basis:
+                            item_line += f" (unit_basis: {unit_basis})"
+                        if min_order_qty is not None:
+                            item_line += f" (min_order_qty: {min_order_qty})"
+                        item_line += f" - {price} {item_currency}{source_info}"
+                        lines.append(item_line)
+                
+                lines.append("\n\nReview the data above. Tell me if anything needs changing, or say /confirm to save.")
+                return "\n".join(lines)
+            else:
+                # Still waiting for another field
+                if staging.status == "awaiting_currency":
+                    return "Updated supplier. What currency is this in? (e.g., USD, EUR)"
+                return f"Updated {field_value}. Status: {staging.status}"
+        except Exception as e:
+            db.rollback()
+            logger.exception("update_missing_field_failed")
+            return f"Error updating missing field: {str(e)}"
 
     def update_file_processing_data(args: dict[str, Any]) -> str:
         """Update a specific field in the extracted data before confirming."""
@@ -405,7 +557,7 @@ def create_file_processing_tools(
                     line_item = InvoiceLineItems(
                         invoice_id=invoice.id,
                         supplier_id=supplier_id,
-                        description_raw=item.get("description", ""),
+                        description_raw=item.get("description_raw", item.get("description", "")),
                         quantity=float(item.get("quantity", 0)),
                         unit=item.get("unit", ""),
                         unit_price=float(item.get("unit_price", 0)),
@@ -548,6 +700,26 @@ def create_file_processing_tools(
                 "additionalProperties": False,
             },
             handler=update_file_processing_data,
+        ),
+        "update_missing_field": Tool(
+            name="update_missing_field",
+            description="Update a missing supplier or currency field when the system asks for it. Use this when the user responds to a missing field question.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "staging_id": {
+                        "type": "string",
+                        "description": "The file processing staging record UUID.",
+                    },
+                    "value": {
+                        "type": "string",
+                        "description": "The supplier name or currency value provided by the user.",
+                    },
+                },
+                "required": ["staging_id", "value"],
+                "additionalProperties": False,
+            },
+            handler=update_missing_field,
         ),
         "confirm_file_processing": Tool(
             name="confirm_file_processing",

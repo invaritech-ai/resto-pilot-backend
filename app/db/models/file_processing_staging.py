@@ -35,7 +35,14 @@ class FileProcessingStaging(Base):
         JSON().with_variant(JSONB, "postgresql"), nullable=False, server_default="{}"
     )
     status: Mapped[str] = mapped_column(
-        Enum("pending_review", "confirmed", "cancelled", name="staging_status"),
+        Enum(
+            "pending_review",
+            "confirmed",
+            "cancelled",
+            "awaiting_supplier",
+            "awaiting_currency",
+            name="staging_status",
+        ),
         nullable=False,
         server_default="pending_review",
     )
