@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 
 from app.core.config import get_settings
-from app.telegram.handler import handle_update
+from app.telegram.handler_v2 import handle_update_v2
 from app.workers.celery_app import celery_app
 from app.workers.db import worker_db_session
 from app.workers.utils import _get_task_id
@@ -14,8 +14,13 @@ logger = logging.getLogger(__name__)
 @celery_app.task(name="handle_telegram_update")
 def handle_telegram_update(update: dict) -> None:
     """
-    Background task to handle Telegram updates without FastAPI request context.
-    
+    Background task to handle Telegram updates with instant intent-driven processing.
+
+    This task uses the new handler_v2 which:
+    - Processes messages instantly (no batching)
+    - Uses intent classification instead of agent loop
+    - Provides predictable, template-based responses
+
     Args:
         update: The Telegram update dictionary from the webhook
     """
@@ -37,7 +42,7 @@ def handle_telegram_update(update: dict) -> None:
     with worker_db_session() as db:
         settings = get_settings()
         try:
-            handle_update(update=update, db=db, settings=settings)
+            handle_update_v2(update=update, db=db, settings=settings)
         except Exception as exc:
             db.rollback()
             logger.exception(

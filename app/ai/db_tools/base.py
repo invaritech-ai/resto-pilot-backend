@@ -154,14 +154,15 @@ def create_db_tools(
 
     Tools can use check_policy_permission() to cross-reference with the policy allowlist
     for centralized permission management, especially useful for complex tables.
+
+    Note: products and product_aliases tools have been removed as they are not
+    part of the simplified intent-driven bot requirements.
     """
     # Import tool factories from each module (inside function to avoid circular imports)
     from . import (
         file_processing,
         inventory,
         invites,
-        product_aliases,
-        products,
         profile,
         restaurants,
         staff,
@@ -181,9 +182,6 @@ def create_db_tools(
     invite_tools = invites.create_invite_tools(
         db=db, user_id=user_id, actor_role=actor_role, restaurant_roles=restaurant_roles
     )
-    product_tools = products.create_product_tools(
-        db=db, user_id=user_id, actor_role=actor_role, restaurant_roles=restaurant_roles
-    )
     supplier_tools = suppliers.create_supplier_tools(
         db=db, user_id=user_id, actor_role=actor_role, restaurant_roles=restaurant_roles
     )
@@ -195,9 +193,6 @@ def create_db_tools(
         chat_id=chat_id,
         session_id=session_id,
     )
-    product_alias_tools = product_aliases.create_product_alias_tools(
-        db=db, user_id=user_id, actor_role=actor_role, restaurant_roles=restaurant_roles
-    )
     inventory_tools = inventory.create_inventory_tools(
         db=db, user_id=user_id, actor_role=actor_role, restaurant_roles=restaurant_roles
     )
@@ -208,10 +203,8 @@ def create_db_tools(
     all_tools.update(restaurant_tools)
     all_tools.update(staff_tools)
     all_tools.update(invite_tools)
-    all_tools.update(product_tools)
     all_tools.update(supplier_tools)
     all_tools.update(file_processing_tools)
-    all_tools.update(product_alias_tools)
     all_tools.update(inventory_tools)
 
     return all_tools

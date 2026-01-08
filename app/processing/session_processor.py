@@ -1,204 +1,83 @@
+"""
+Session processor - now redirects to the intent-driven processor.
+
+This module is kept for backward compatibility with existing session tasks.
+The main processing logic has moved to app.conversation.processor.
+"""
+
 from __future__ import annotations
 
 import datetime as dt
-import json
 import logging
 import uuid
-from typing import Any
-from sqlalchemy.orm import Session
-from sqlalchemy import select
 
-from app.ai.agent import run_agent_loop
-from app.ai.chat_memory import (
-    load_chat_history_messages,
-    load_chat_memory_summary,
-    update_chat_memory_summary,
-)
+from sqlalchemy import select
+from sqlalchemy.orm import Session as DBSession
+
+from app.ai.intent_classifier import classify_intent
 from app.ai.openai_client import OpenAIError
-from app.ai.openrouter_generation import extract_openrouter_generation_id
-from app.ai.openrouter_usage import extract_openrouter_usage
-from app.ai.topic_gate import classify_on_topic
-from app.core.config import Settings, get_settings
+from app.conversation import responses
+from app.conversation.context import load_context, update_context_from_result, get_context_for_classifier
+from app.conversation.executor import execute_intent
+from app.core.config import get_settings
 from app.db.models.processing_events import ProcessingEvents
-from app.db.models.telegram_chat_memory import TelegramChatMemory
 from app.db.models.telegram_messages import TelegramMessages
 from app.db.models.telegram_session import TelegramSessions
 from app.db.models.user import User
-from app.domain.services.db_pending_action_service import DBPendingActionService
-from app.domain.services.restaurant_service import RestaurantService
-from app.policies.db_allowlist import ROLE_OWNER
 from app.telegram.bot_api import send_message
-from app.workers.telemetry import (
-    get_or_create_chat_state,
-    record_llm_call,
-    record_outgoing_message,
-    schedule_openrouter_cost_backfill,
-    set_chat_off_topic,
-    set_chat_on_topic,
-)
 from app.workers.db import worker_db_session
+from app.workers.telemetry import record_llm_call, record_outgoing_message
 
 logger = logging.getLogger(__name__)
-
-OFF_TOPIC_REDIRECT_TEXT = (
-    "I can help with restaurant operations. What would you like to know or do?"
-)
-
-PENDING_ACTION_PROMPT = (
-    "You have a pending action. Please reply /confirm to proceed or /cancel to abort."
-)
-
-
-def _first_name(full_name: str | None) -> str | None:
-    if not isinstance(full_name, str):
-        return None
-    parts = [p for p in full_name.strip().split() if p]
-    return parts[0] if parts else None
-
-
-def _update_chat_memory(
-    *,
-    db: Session,
-    chat_id: int,
-    session_uuid: uuid.UUID,
-    settings: Settings,
-) -> None:
-    """
-    Update chat memory with the latest conversation history.
-    Should be called after every meaningful interaction, not just LLM replies.
-
-    This ensures the rolling summary stays up to date even for:
-    - Static responses (off-topic redirects, pending action prompts)
-    - DB engine actions (reads, staged CUD operations)
-    - Capability rejections
-    """
-    try:
-        previous_summary = load_chat_memory_summary(db=db, chat_id=chat_id)
-        history = load_chat_history_messages(
-            db=db,
-            chat_id=chat_id,
-            exclude_session_id=None,  # Include current session
-            limit=50,
-        )
-
-        new_summary, sum_data, sum_headers, sum_latency_ms = update_chat_memory_summary(
-            settings=settings,
-            previous_summary=previous_summary,
-            history_messages=history,
-        )
-
-        if isinstance(new_summary, str) and new_summary.strip():
-            row = db.scalar(
-                select(TelegramChatMemory).where(TelegramChatMemory.chat_id == chat_id)
-            )
-            if row is None:
-                row = TelegramChatMemory(chat_id=chat_id, summary_text=new_summary)
-                db.add(row)
-            else:
-                row.summary_text = new_summary
-
-            usage = extract_openrouter_usage(sum_data)
-            generation_id = extract_openrouter_generation_id(
-                headers=sum_headers, data=sum_data
-            )
-            model_raw = sum_data.get("model")
-            model = model_raw if isinstance(model_raw, str) else settings.openai_model
-            total_cost_usd = _extract_cost_from_usage(sum_data)
-
-            llm_call_id = record_llm_call(
-                db=db,
-                session_id=session_uuid,
-                chat_id=chat_id,
-                purpose="memory",
-                model=model,
-                openrouter_generation_id=generation_id,
-                upstream_id=None,
-                provider_name=None,
-                usage=usage,
-                latency_ms=sum_latency_ms,
-                total_cost_usd=total_cost_usd,
-                error=None,
-            )
-
-            if generation_id is not None:
-                try:
-                    schedule_openrouter_cost_backfill(
-                        llm_call_id=llm_call_id, delay_seconds=120
-                    )
-                except Exception:
-                    logger.exception(
-                        "memory_cost_backfill_schedule_failed",
-                        extra={"llm_call_id": str(llm_call_id), "chat_id": chat_id},
-                    )
-            db.commit()
-    except Exception:
-        logger.exception(
-            "chat_memory_update_failed",
-            extra={"session_uuid": str(session_uuid), "chat_id": chat_id},
-        )
 
 
 def _parse_uuid(value: str) -> uuid.UUID:
     return uuid.UUID(value)
 
 
-def _safe_float(value: Any) -> float | None:
-    """Return float(value) if numeric, else None."""
-    if isinstance(value, (int, float)):
-        return float(value)
-    return None
+def _get_message_text(messages: list[TelegramMessages]) -> str:
+    """Extract text from telegram messages."""
+    parts = []
+    for msg in messages:
+        if isinstance(msg.text, str) and msg.text.strip():
+            parts.append(msg.text.strip())
+        if isinstance(msg.caption, str) and msg.caption.strip():
+            parts.append(msg.caption.strip())
+    return "\n".join(parts).strip()
 
 
-def _extract_cost_from_usage(data: dict[str, Any]) -> float | None:
-    """
-    Extract cost from LLM response data.
-
-    Args:
-        data: Response data dictionary containing usage information
-
-    Returns:
-        Cost as float, or None if not available
-    """
-    usage_obj = data.get("usage")
-    if not isinstance(usage_obj, dict):
-        return None
-    return _safe_float(usage_obj.get("cost"))
-
-
-def _get_user_role_and_restaurants(
-    *, db: Session, user_id: uuid.UUID
-) -> tuple[str, dict[str, str]]:
-    """
-    Get user's role and restaurant IDs.
-
-    Returns:
-        (actor_role, restaurant_roles) where:
-        - actor_role is always "owner" for platform-level capabilities (everyone can create restaurants)
-        - restaurant_roles is a map of restaurant_id -> role for per-restaurant permission checks
-    """
-    rows = RestaurantService(db).list_for_user(user_id=user_id)
-    if not rows:
-        # Users with no restaurants still get "owner" role so they can create restaurants
-        return ROLE_OWNER, {}
-
-    restaurant_roles: dict[str, str] = {}
-    for _restaurant, membership in rows:
-        rid = str(membership.restaurant_id)
-        restaurant_roles[rid] = membership.role
-
-    # Always return "owner" as actor_role - per-restaurant checks use restaurant_roles
-    return ROLE_OWNER, restaurant_roles
+def _has_file(messages: list[TelegramMessages]) -> tuple[bool, str | None, str | None]:
+    """Check if messages contain a file."""
+    for msg in messages:
+        if msg.file_id:
+            return True, msg.file_kind, msg.file_id
+    return False, None, None
 
 
 def process_session(*, session_id: str, task_id: str | None = None) -> None:
+    """
+    Process a telegram session using the new intent-driven approach.
+
+    This replaces the old agent-based processing with:
+    1. Intent classification
+    2. Parameter extraction
+    3. Static operation execution
+    4. Template response
+
+    Args:
+        session_id: Session UUID string
+        task_id: Optional task ID for logging
+    """
     session_uuid = _parse_uuid(session_id)
 
     with worker_db_session() as db:
+        # Load session with lock
         db_session = db.execute(
             select(TelegramSessions)
             .where(TelegramSessions.id == session_uuid)
             .with_for_update()
         ).scalar_one_or_none()
+
         if db_session is None:
             logger.info(
                 "process_session_noop_session_not_found task_id=%s session_id=%s",
@@ -206,6 +85,7 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
                 session_id,
             )
             return
+
         if db_session.status == "closed":
             logger.info(
                 "process_session_noop_already_closed task_id=%s session_id=%s",
@@ -214,6 +94,7 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
             )
             return
 
+        # Check if reply already sent
         sent_event = db.execute(
             select(ProcessingEvents)
             .where(
@@ -223,33 +104,20 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
             .order_by(ProcessingEvents.at.desc())
             .limit(1)
         ).scalar_one_or_none()
+
         if sent_event is not None:
             logger.info(
                 "process_session_noop_reply_already_sent task_id=%s session_id=%s",
                 task_id,
                 session_id,
             )
-            if db_session.status != "closed":
-                now = dt.datetime.now(dt.UTC)
-                db_session.status = "closed"
-                if db_session.closed_at is None:
-                    db_session.closed_at = now
-                db.add(
-                    ProcessingEvents(
-                        session_id=session_uuid,
-                        at=now,
-                        event="session_processed_v0",
-                        payload_json=None,
-                        error=None,
-                    )
-                )
-                db.commit()
+            _close_session(db, db_session, session_uuid)
             return
 
-        rows = list(
-            db.execute(
-                select(TelegramMessages, User.full_name)
-                .join(User, TelegramMessages.user_id == User.id)
+        # Load messages
+        messages = list(
+            db.scalars(
+                select(TelegramMessages)
                 .where(TelegramMessages.session_id == session_uuid)
                 .order_by(
                     TelegramMessages.received_at.asc(),
@@ -257,369 +125,143 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
                 )
             )
         )
-        messages = [row[0] for row in rows]
-        user_first_name = next(
-            (
-                _first_name(row[1])
-                for row in rows
-                if isinstance(row[1], str) and row[1].strip()
-            ),
-            None,
-        )
 
-        hint = db_session.hint_command
-        file_kinds = [m.file_kind for m in messages if m.file_kind]
-        mime_types = [m.mime for m in messages if m.mime]
+        if not messages:
+            logger.info(
+                "process_session_noop_no_messages task_id=%s session_id=%s",
+                task_id,
+                session_id,
+            )
+            _close_session(db, db_session, session_uuid)
+            return
 
-        logger.info(
-            "process_session_loaded task_id=%s session_id=%s status=%s message_count=%s hint=%s",
-            task_id,
-            session_id,
-            db_session.status,
-            len(messages),
-            hint,
-        )
-
-        routing_plan = {
-            "hint_command": hint,
-            "message_count": len(messages),
-            "file_kinds": file_kinds,
-            "mime_types": mime_types,
-        }
+        # Get user
+        user = db.scalar(select(User).where(User.id == messages[0].user_id))
+        if user is None:
+            logger.warning(
+                "process_session_user_not_found task_id=%s session_id=%s",
+                task_id,
+                session_id,
+            )
+            _close_session(db, db_session, session_uuid)
+            return
 
         settings = get_settings()
-
-        # CONTEXT FIRST: Load history and memory BEFORE any classification
-        history_messages = load_chat_history_messages(
-            db=db,
-            chat_id=db_session.chat_id,
-            exclude_session_id=session_uuid,
-            limit=50,
-        )
-        memory_summary = load_chat_memory_summary(db=db, chat_id=db_session.chat_id)
+        message_text = _get_message_text(messages)
+        has_file, file_kind, file_id = _has_file(messages)
 
         logger.info(
-            "process_session_context_loaded task_id=%s session_id=%s history_count=%s has_memory=%s",
+            "process_session_loaded task_id=%s session_id=%s message_count=%s has_file=%s",
             task_id,
             session_id,
-            len(history_messages),
-            memory_summary is not None,
+            len(messages),
+            has_file,
         )
 
-        on_topic, gate_reason, gate_data, gate_headers, gate_latency_ms = (
-            classify_on_topic(
-                messages=messages,
-                settings=settings,
-                hint_command=hint,
-                history_messages=history_messages,
-                memory_summary=memory_summary,
-            )
+        # Load user context
+        context = load_context(db, user)
+        classifier_context = get_context_for_classifier(context)
+
+        # Classify intent
+        classified = classify_intent(
+            message_text=message_text or "",
+            settings=settings,
+            has_file=has_file,
+            file_kind=file_kind,
+            context=classifier_context,
         )
 
-        # Always log the topic gate LLM call for telemetry
-        gate_llm_call_id = None
-        if gate_data:
-            usage = extract_openrouter_usage(gate_data)
-            generation_id = extract_openrouter_generation_id(
-                headers=gate_headers, data=gate_data
-            )
-            model_raw = gate_data.get("model")
-            model = model_raw if isinstance(model_raw, str) else settings.openai_model
-            upstream_id_raw = gate_data.get("id")
-            upstream_id = upstream_id_raw if isinstance(upstream_id_raw, str) else None
-            provider_name_raw = gate_data.get("provider")
-            provider_name = (
-                provider_name_raw if isinstance(provider_name_raw, str) else None
-            )
-            total_cost_usd = _extract_cost_from_usage(gate_data)
-
-            gate_llm_call_id = record_llm_call(
+        # Record LLM call for telemetry
+        if classified.usage:
+            record_llm_call(
                 db=db,
                 session_id=session_uuid,
                 chat_id=db_session.chat_id,
-                purpose="gate",
-                model=model,
-                openrouter_generation_id=generation_id,
-                upstream_id=upstream_id,
-                provider_name=provider_name,
-                usage=usage,
-                latency_ms=gate_latency_ms,
-                total_cost_usd=total_cost_usd,
+                purpose="intent_classification",
+                model=classified.model,
+                openrouter_generation_id=classified.generation_id,
+                upstream_id=None,
+                provider_name=None,
+                usage=classified.usage,
+                latency_ms=classified.latency_ms,
+                total_cost_usd=None,
                 error=None,
             )
             db.commit()
 
-            if generation_id is not None:
-                try:
-                    schedule_openrouter_cost_backfill(
-                        llm_call_id=gate_llm_call_id, delay_seconds=120
-                    )
-                except Exception:
-                    logger.exception(
-                        "process_session_gate_cost_backfill_schedule_failed",
-                        extra={
-                            "llm_call_id": str(gate_llm_call_id),
-                            "session_id": session_id,
-                        },
-                    )
+        logger.info(
+            "process_session_intent_classified task_id=%s session_id=%s intent=%s confidence=%s",
+            task_id,
+            session_id,
+            classified.intent.value,
+            classified.confidence,
+        )
 
-        if not on_topic:
-            chat_state = get_or_create_chat_state(db=db, chat_id=db_session.chat_id)
-            if chat_state.off_topic_mode:
-                logger.info(
-                    "process_session_off_topic_ghost task_id=%s session_id=%s chat_id=%s reason=%s",
-                    task_id,
-                    session_id,
-                    db_session.chat_id,
-                    gate_reason,
-                )
-                now = dt.datetime.now(dt.UTC)
-                db_session.status = "closed"
-                if db_session.closed_at is None:
-                    db_session.closed_at = now
-                db.add(
-                    ProcessingEvents(
-                        session_id=session_uuid,
-                        at=now,
-                        event="session_off_topic_ghost_v0",
-                        payload_json=json.dumps(
-                            {"reason": gate_reason}, ensure_ascii=False
-                        )
-                        if gate_reason
-                        else None,
-                        error=None,
-                    )
-                )
-                db.add(
-                    ProcessingEvents(
-                        session_id=session_uuid,
-                        at=now,
-                        event="session_processed_v0",
-                        payload_json=None,
-                        error=None,
-                    )
-                )
-                db.commit()
-                _update_chat_memory(
-                    db=db,
-                    chat_id=db_session.chat_id,
-                    session_uuid=session_uuid,
-                    settings=settings,
-                )
-                return
-
-            logger.info(
-                "process_session_off_topic_redirect task_id=%s session_id=%s chat_id=%s reason=%s",
-                task_id,
-                session_id,
-                db_session.chat_id,
-                gate_reason,
-            )
-
-            telegram_message_id = send_message(
-                chat_id=db_session.chat_id,
-                text=OFF_TOPIC_REDIRECT_TEXT,
+        # Execute intent
+        try:
+            result = execute_intent(
+                classified=classified,
+                db=db,
+                user=user,
+                context=context,
                 settings=settings,
             )
+            response_text = result.response
+
+            # Update context
+            if result.context_update:
+                update_context_from_result(
+                    db=db,
+                    user=user,
+                    context=context,
+                    context_update=result.context_update,
+                )
+
+        except Exception as exc:
+            logger.exception(
+                "process_session_execution_failed task_id=%s session_id=%s",
+                task_id,
+                session_id,
+                extra={"error": str(exc)},
+            )
+            response_text = responses.ERROR_GENERIC
+
+        # Send response
+        try:
+            telegram_message_id = send_message(
+                chat_id=db_session.chat_id,
+                text=response_text,
+                settings=settings,
+            )
+
             record_outgoing_message(
                 db=db,
                 session_id=session_uuid,
                 chat_id=db_session.chat_id,
-                kind="redirect",
-                text=OFF_TOPIC_REDIRECT_TEXT,
+                kind="reply",
+                text=response_text,
                 telegram_message_id=telegram_message_id,
-                llm_call_id=gate_llm_call_id,
+                llm_call_id=None,
             )
 
-            set_chat_off_topic(db=db, chat_id=db_session.chat_id)
-
-            now = dt.datetime.now(dt.UTC)
-            db_session.status = "closed"
-            if db_session.closed_at is None:
-                db_session.closed_at = now
-            db.add(
-                ProcessingEvents(
-                    session_id=session_uuid,
-                    at=now,
-                    event="session_off_topic_redirect_sent_v0",
-                    payload_json=json.dumps({"reason": gate_reason}, ensure_ascii=False)
-                    if gate_reason
-                    else None,
-                    error=None,
-                )
-            )
-            db.add(
-                ProcessingEvents(
-                    session_id=session_uuid,
-                    at=now,
-                    event="session_processed_v0",
-                    payload_json=None,
-                    error=None,
-                )
-            )
-            db.commit()
-            _update_chat_memory(
-                db=db,
-                chat_id=db_session.chat_id,
-                session_uuid=session_uuid,
-                settings=settings,
-            )
-            return
-
-        chat_state = get_or_create_chat_state(db=db, chat_id=db_session.chat_id)
-
-        # Get user from messages
-        user = None
-        if messages:
-            user = db.scalar(select(User).where(User.id == messages[0].user_id))
-
-        # Check for pending DB actions (deterministic - must be handled before agent loop)
-        if user is not None:
-            pending_service = DBPendingActionService(db)
-            pending_action = pending_service.get_latest_pending(user_id=user.id)
-            if pending_action is not None:
-                logger.info(
-                    "process_session_pending_action_exists task_id=%s session_id=%s user_id=%s pending_id=%s",
-                    task_id,
-                    session_id,
-                    str(user.id),
-                    str(pending_action.id),
-                )
-                telegram_message_id = send_message(
-                    chat_id=db_session.chat_id,
-                    text=PENDING_ACTION_PROMPT,
-                    settings=settings,
-                )
-                record_outgoing_message(
-                    db=db,
-                    session_id=session_uuid,
-                    chat_id=db_session.chat_id,
-                    kind="reply",
-                    text=PENDING_ACTION_PROMPT,
-                    telegram_message_id=telegram_message_id,
-                    llm_call_id=None,
-                )
-                final_now = dt.datetime.now(dt.UTC)
-                db.add(
-                    ProcessingEvents(
-                        session_id=session_uuid,
-                        at=final_now,
-                        event="assistant_reply_sent_v0",
-                        payload_json=None,
-                        error=None,
-                    )
-                )
-                db_session.status = "closed"
-                if db_session.closed_at is None:
-                    db_session.closed_at = final_now
-                db.add(
-                    ProcessingEvents(
-                        session_id=session_uuid,
-                        at=final_now,
-                        event="session_processed_v0",
-                        payload_json=None,
-                        error=None,
-                    )
-                )
-                db.commit()
-                _update_chat_memory(
-                    db=db,
-                    chat_id=db_session.chat_id,
-                    session_uuid=session_uuid,
-                    settings=settings,
-                )
-                return
-
-        # Get user role and restaurants for agent tools
-        actor_role, restaurant_roles = (
-            _get_user_role_and_restaurants(db=db, user_id=user.id)
-            if user
-            else (ROLE_OWNER, {})  # Even users without profile get owner capabilities
-        )
-
-        if chat_state.off_topic_mode:
-            set_chat_on_topic(db=db, chat_id=db_session.chat_id)
-
-        now = dt.datetime.now(dt.UTC)
-        db.add(
-            ProcessingEvents(
-                session_id=session_uuid,
-                at=now,
-                event="router_plan_v0",
-                payload_json=json.dumps(routing_plan),
-                error=None,
-            )
-        )
-        db.commit()
-
-        # Run the agent loop with tool-calling support
-        # Agent loop records each LLM call individually for accurate cost tracking
-        try:
-            agent_result = run_agent_loop(
-                messages=messages,
-                db=db,
-                user_id=user.id
-                if user
-                else uuid.UUID("00000000-0000-0000-0000-000000000000"),
-                actor_role=actor_role,
-                restaurant_roles=restaurant_roles,
-                settings=settings,
-                session_id=session_uuid,
-                chat_id=db_session.chat_id,
-                history_messages=history_messages,
-                memory_summary=memory_summary,
-                user_first_name=user_first_name,
-            )
-        except OpenAIError as exc:
+            # Record sent event
             db.add(
                 ProcessingEvents(
                     session_id=session_uuid,
                     at=dt.datetime.now(dt.UTC),
-                    event="assistant_reply_attempt_failed_v0",
+                    event="assistant_reply_sent_v0",
                     payload_json=None,
-                    error=str(exc),
+                    error=None,
                 )
             )
             db.commit()
-            raise
 
-        reply_text = agent_result.text
-        reply_model = agent_result.model
-        metrics = agent_result.metrics
-
-        # LLM calls are already recorded per-call in agent loop
-        # Use final_llm_call_id for outgoing message attribution (the call that generated the response)
-        # This is None if the response is a fallback/error message not generated by an LLM
-        reply_llm_call_id = agent_result.final_llm_call_id
-
-        # Record the reply event with aggregated metrics for easy querying
-        db.add(
-            ProcessingEvents(
-                session_id=session_uuid,
-                at=dt.datetime.now(dt.UTC),
-                event="assistant_reply_generated_v0",
-                payload_json=json.dumps(
-                    {
-                        "text": reply_text,
-                        "model": reply_model,
-                        "tool_calls": agent_result.tool_calls_made,
-                        "llm_call_ids": [str(cid) for cid in agent_result.llm_call_ids],
-                        "call_count": metrics.get("call_count", 0),
-                        "total_tokens": metrics.get("total_tokens_total", 0),
-                        "cost_usd_total": metrics.get("cost_usd_total", 0.0),
-                    },
-                    ensure_ascii=False,
-                ),
-                error=None,
+            logger.info(
+                "process_session_response_sent task_id=%s session_id=%s",
+                task_id,
+                session_id,
             )
-        )
-        db.commit()
 
-        # Send reply
-        try:
-            telegram_message_id = send_message(
-                chat_id=db_session.chat_id, text=reply_text, settings=settings
-            )
         except Exception as exc:
             db.add(
                 ProcessingEvents(
@@ -627,48 +269,37 @@ def process_session(*, session_id: str, task_id: str | None = None) -> None:
                     at=dt.datetime.now(dt.UTC),
                     event="assistant_reply_send_failed_v0",
                     payload_json=None,
-                    error=repr(exc),
+                    error=str(exc),
                 )
             )
             db.commit()
-            raise
-
-        record_outgoing_message(
-            db=db,
-            session_id=session_uuid,
-            chat_id=db_session.chat_id,
-            kind="reply",
-            text=reply_text,
-            telegram_message_id=telegram_message_id,
-            llm_call_id=reply_llm_call_id,
-        )
-
-        # Update memory
-        _update_chat_memory(
-            db=db,
-            chat_id=db_session.chat_id,
-            session_uuid=session_uuid,
-            settings=settings,
-        )
+            raise OpenAIError(f"Failed to send response: {exc}") from exc
 
         # Close session
-        final_now = dt.datetime.now(dt.UTC)
-        db.add(
-            ProcessingEvents(
-                session_id=session_uuid,
-                at=final_now,
-                event="assistant_reply_sent_v0",
-                payload_json=None,
-                error=None,
-            )
+        _close_session(db, db_session, session_uuid)
+
+        logger.info(
+            "process_session_completed task_id=%s session_id=%s",
+            task_id,
+            session_id,
         )
+
+
+def _close_session(
+    db: DBSession,
+    db_session: TelegramSessions,
+    session_uuid: uuid.UUID,
+) -> None:
+    """Close the session."""
+    now = dt.datetime.now(dt.UTC)
+    if db_session.status != "closed":
         db_session.status = "closed"
         if db_session.closed_at is None:
-            db_session.closed_at = final_now
+            db_session.closed_at = now
         db.add(
             ProcessingEvents(
                 session_id=session_uuid,
-                at=final_now,
+                at=now,
                 event="session_processed_v0",
                 payload_json=None,
                 error=None,

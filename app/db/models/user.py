@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import datetime as dt
-from sqlalchemy import BigInteger, Boolean, DateTime, String, func
+from typing import Any, ClassVar
+
+from sqlalchemy import BigInteger, Boolean, DateTime, JSON, String, func
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
-from typing import ClassVar
 
 
 class User(Base):
@@ -22,6 +24,13 @@ class User(Base):
 
     state: Mapped[str | None] = mapped_column(
         String(50), nullable=True, server_default="IDLE"
+    )
+
+    # JSON field for storing conversation context (active operation, collected params, etc.)
+    state_data: Mapped[dict[str, Any] | None] = mapped_column(
+        JSON().with_variant(JSONB, "postgresql"),
+        nullable=True,
+        server_default=None,
     )
 
     created_at: Mapped[dt.datetime] = mapped_column(
