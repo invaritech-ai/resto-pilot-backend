@@ -170,14 +170,51 @@ def handle_update_v2(update: dict, db: Session, settings: Settings) -> None:
 
     # Handle /start command (onboarding) - use existing processor
     if command == "/start":
+        # Process /start (creates user if needed, handles invite codes)
         response = process_start_command(update=update, session=db, settings=settings)
-        if response:
+
+        # Get the user after processing (may have been created)
+        start_user = db.scalar(select(User).where(User.telegram_id == telegram_id))
+
+        # Create session and record incoming message for telemetry
+        if start_user is not None:
             try:
-                send_message(
-                    chat_id=response.get("chat_id"),
-                    text=response.get("text"),
+                start_session, _start_message = _create_session_and_message(
+                    db=db,
+                    parsed=parsed,
+                    user=start_user,
+                )
+                db.commit()
+            except IntegrityError:
+                db.rollback()
+                start_session = None
+        else:
+            start_session = None
+
+        # Send response and record outgoing
+        if response:
+            response_text = response.get("text", "")
+            response_chat_id = response.get("chat_id", parsed.chat_id)
+            try:
+                telegram_message_id = send_message(
+                    chat_id=response_chat_id,
+                    text=response_text,
                     settings=settings,
                 )
+
+                # Record outgoing message for telemetry
+                if start_session is not None:
+                    record_outgoing_message(
+                        db=db,
+                        session_id=start_session.id,
+                        chat_id=response_chat_id,
+                        kind="start_reply",
+                        text=response_text,
+                        telegram_message_id=telegram_message_id,
+                        llm_call_id=None,
+                    )
+                    db.commit()
+
             except Exception as exc:
                 logger.exception(
                     "handle_update_v2_start_reply_failed",
