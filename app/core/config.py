@@ -17,9 +17,6 @@ class Settings(BaseSettings):
     telegram_bot_token: str = ""
     telegram_webhook_secret_token: str = ""
     telegram_superuser_ids: list[int] = []
-    telegram_batching_enabled: bool = False
-    telegram_batch_idle_seconds: int = 30
-    telegram_batch_max_seconds: int = 180
 
     # Optional AWS profile name for local dev.
     # If set, the app will use this profile for AWS SDK calls (including Celery SQS broker)
@@ -39,13 +36,11 @@ class Settings(BaseSettings):
     telegram_webapp_auth_max_age_seconds: int = 60 * 60 * 24  # 24h
 
     openai_api_key: str = ""
-    openai_model: str = "gpt-5-mini"
-    # Optional overrides for dedicated "cheap" models.
-    openai_ack_model: str = ""
+    openai_model: str = "gpt-4o-mini"
+    # Model for intent classification and file type detection
     openai_gate_model: str = ""
     openai_base_url: str = "https://api.openai.com/v1"
     # This primarily controls the HTTP read timeout (how long we wait for the model response).
-    # "Thinking" models can take 60-120s+, so keep this comfortably above expected latency.
     openai_timeout_seconds: float = 120.0
     openai_max_retries: int = 2
     openai_retry_initial_seconds: float = 0.5
@@ -57,15 +52,6 @@ class Settings(BaseSettings):
     vision_model: str = ""  # Model name, e.g., "gpt-4-vision-preview"
     vision_api_key: str = ""  # Optional, defaults to openai_api_key if empty
     vision_base_url: str = ""  # Optional, defaults to openai_base_url if empty
-
-    # JSON mapping of model -> {input_per_million, output_per_million}
-    # Used for local cost estimation from token usage.
-    model_prices_json: str = ""
-
-    # Comma-separated enabled capabilities for the main processing bot.
-    # db_engine allows natural language database queries with role-based access control.
-    # Note: inventory capability is not yet implemented, only db_engine tables are available.
-    enabled_capabilities_csv: str = "db_engine"
 
     model_config = SettingsConfigDict(
         env_file=".env", env_prefix="APP_", extra="ignore"
