@@ -3,15 +3,6 @@ Base utilities and main tool factory for database tools.
 
 This module provides shared utilities and the main create_db_tools function
 that assembles all tools from different modules.
-
-Architecture:
-- Tools = Capabilities (what operations can be performed)
-- Policies = Filtering (who can perform those operations)
-
-See docs/db-tools-patterns.md for:
-- When to use direct checks vs policy checks
-- Patterns for simple vs complex tools
-- How to add new tools with proper permission handling
 """
 
 from __future__ import annotations
@@ -24,12 +15,6 @@ from sqlalchemy.orm import Session
 
 from app.ai.tools import Tool
 from app.db.models.restaurant_user import RestaurantUser
-from app.policies.db_allowlist import (
-    DB_ALLOWLIST,
-    ROLE_OWNER,
-    SCOPE_RESTAURANT_MEMBER,
-    SCOPE_RESTAURANT_OWNER,
-)
 
 
 def format_date(dt_value: dt.datetime | None) -> str | None:
@@ -68,80 +53,11 @@ def has_restaurant_access(
     return membership is not None
 
 
-def check_policy_permission(
-    *,
-    table: str,
-    crud: str,  # "read", "create", "update", "delete"
-    actor_role: str,
-    restaurant_id: str | None = None,
-    restaurant_roles: dict[str, str] | None = None,
-) -> tuple[bool, str | None]:
-    """
-    Check if an action is allowed by policy allowlist.
-
-    This provides a way for tools to cross-reference with the policy system.
-    Use this for complex tables where you want centralized policy management.
-
-    Example usage in a tool:
-        allowed, error = check_policy_permission(
-            table="inventory_items",
-            crud="update",
-            actor_role=actor_role,
-            restaurant_id=str(restaurant_id),
-            restaurant_roles=restaurant_roles,
-        )
-        if not allowed:
-            return f"Error: {error}"
-
-    Args:
-        table: Table name (e.g., "restaurants", "restaurant_users", "inventory_items")
-        crud: Operation type ("read", "create", "update", "delete")
-        actor_role: User's role ("owner" or "staff")
-        restaurant_id: Restaurant ID if operation is scoped to a restaurant
-        restaurant_roles: Map of restaurant_id -> role for the user
-
-    Returns:
-        (allowed: bool, error_message: str | None)
-        If allowed=False, error_message explains why (for user-facing errors)
-    """
-    restaurant_roles = restaurant_roles or {}
-
-    # Get allowlist for this role
-    role_allowlist = DB_ALLOWLIST.get(actor_role, {})
-    table_allowlist = role_allowlist.get(table)
-
-    if not table_allowlist:
-        return False, f"Table '{table}' is not accessible for {actor_role} role"
-
-    # Get CRUD operation allowlist
-    action_allow = table_allowlist.get(crud)
-    if not action_allow:
-        return (
-            False,
-            f"{crud} operation on '{table}' is not allowed for {actor_role} role",
-        )
-
-    # Check scope if restaurant-scoped
-    scope = action_allow.get("scope")
-    if scope in {SCOPE_RESTAURANT_OWNER, SCOPE_RESTAURANT_MEMBER}:
-        if not restaurant_id:
-            return False, f"Restaurant ID required for {table} operations"
-
-        user_role_for_restaurant = restaurant_roles.get(restaurant_id)
-        if not user_role_for_restaurant:
-            return False, f"You don't have access to restaurant {restaurant_id}"
-
-        if scope == SCOPE_RESTAURANT_OWNER and user_role_for_restaurant != ROLE_OWNER:
-            return False, f"Only restaurant owners can perform {crud} on {table}"
-
-    return True, None
-
-
 def create_db_tools(
     *,
     db: Session,
     user_id: uuid.UUID,
-    actor_role: str,  # User's highest role (for policy checks)
+    actor_role: str,  # User's highest role (for permission checks)
     restaurant_roles: dict[str, str],  # Map of restaurant_id -> role
     chat_id: int | None = None,  # Telegram chat_id for file processing tools
     session_id: uuid.UUID | None = None,  # Session ID for file processing tools
@@ -151,12 +67,6 @@ def create_db_tools(
 
     Each tool is named after user intent, not database operations.
     Permission checks happen inside each tool.
-
-    Tools can use check_policy_permission() to cross-reference with the policy allowlist
-    for centralized permission management, especially useful for complex tables.
-
-    Note: products and product_aliases tools have been removed as they are not
-    part of the simplified intent-driven bot requirements.
     """
     # Import tool factories from each module (inside function to avoid circular imports)
     from . import (
@@ -169,7 +79,7 @@ def create_db_tools(
         suppliers,
     )
 
-    # Pass actor_role and restaurant_roles so tools can use policy checks if needed
+    # Pass actor_role and restaurant_roles so tools can use permission checks if needed
     profile_tools = profile.create_profile_tools(
         db=db, user_id=user_id, actor_role=actor_role, restaurant_roles=restaurant_roles
     )
