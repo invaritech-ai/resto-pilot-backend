@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import uuid
 from typing import Any
 
@@ -9,11 +10,14 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.ai.db_schema import get_table_schema
-from app.ai.openai_client import OpenAIError, chat_completions_create
+from app.ai.openai_client import OpenAIError, chat_completions_create_with_http_info
+from app.ai.openrouter_generation import extract_openrouter_generation_id
+from app.ai.openrouter_usage import extract_openrouter_usage
 from app.ai.vision_client import process_document_with_vision, VisionDocumentResult
 from app.core.config import Settings
 from app.db.models.products import Products
 from app.db.models.product_aliases import ProductAliases
+from app.workers.telemetry import record_llm_call, schedule_openrouter_cost_backfill
 
 logger = logging.getLogger(__name__)
 
@@ -140,10 +144,16 @@ def extract_invoice_data(
 IMPORTANT: Map extracted data to the exact database column names shown above.
 
 Required fields (must not be null):
-- supplier_name: The name of the supplier/vendor (required)
+- supplier_name: The company name of the supplier/vendor (required)
 - invoice_number: The invoice number or reference (required)
 - invoice_date: Invoice date in ISO format YYYY-MM-DD (required)
-- currency: Currency code e.g., USD, EUR (required)
+- currency: Currency code e.g., USD, EUR, HKD (required)
+
+Supplier contact information (optional but extract if visible):
+- contact_name: Name of contact person (e.g., "Teresa Leung", "John Smith")
+- contact_email: Email address if visible
+- contact_phone: Phone number if visible
+
 - line_items: Array of line items, each with:
   - description_raw: Full description of the item as shown (required, maps to invoice_line_items.description_raw)
   - quantity: Numeric quantity (required, Numeric type)
@@ -271,8 +281,14 @@ def extract_price_list_data(
 IMPORTANT: Map extracted data to the exact database column names shown above.
 
 Required fields (must not be null):
-- supplier_name: The name of the supplier/vendor (required)
-- currency: Currency code e.g., USD, EUR (required)
+- supplier_name: The company name of the supplier/vendor (required)
+- currency: Currency code e.g., USD, EUR, HKD (required)
+
+Supplier contact information (optional but extract if visible):
+- contact_name: Name of contact person (e.g., "Teresa Leung", "John Smith")
+- contact_email: Email address if visible
+- contact_phone: Phone number if visible
+
 - items: Array of items, each with:
   - supplier_name_raw: Product name as shown in the document (required, maps to supplier_items.supplier_name_raw)
   - price: Price per unit (required, Numeric type, maps to supplier_prices.price)
@@ -466,6 +482,8 @@ def match_product_aliases(
     supplier_names: list[str],
     db: Session,
     settings: Settings,
+    session_id: uuid.UUID | None = None,
+    chat_id: int | None = None,
 ) -> dict[str, Any]:
     """
     Match supplier product names to existing products using LLM.
@@ -585,7 +603,8 @@ Return ONLY valid JSON, no other text."""
 
     try:
         messages = [{"role": "user", "content": prompt}]
-        response = chat_completions_create(
+        start_time = time.time()
+        response, headers, latency_ms = chat_completions_create_with_http_info(
             settings=settings,
             messages=messages,
             temperature=0.2,
@@ -593,6 +612,47 @@ Return ONLY valid JSON, no other text."""
         content = response.get("choices", [{}])[0].get("message", {}).get("content")
         if not isinstance(content, str):
             raise OpenAIError(f"Unexpected LLM response: {response}")
+
+        # Extract telemetry data
+        generation_id = extract_openrouter_generation_id(headers)
+        usage = extract_openrouter_usage(response)
+        model = settings.openai_model
+
+        # Record telemetry if session_id is available
+        if session_id:
+            try:
+                llm_call_id = record_llm_call(
+                    db=db,
+                    session_id=session_id,
+                    chat_id=chat_id,
+                    purpose="product_alias_matching",
+                    model=model,
+                    openrouter_generation_id=generation_id,
+                    upstream_id=response.get("id")
+                    if isinstance(response.get("id"), str)
+                    else None,
+                    provider_name=response.get("provider")
+                    if isinstance(response.get("provider"), str)
+                    else None,
+                    usage=usage,
+                    latency_ms=int(latency_ms),
+                    error=None,
+                )
+                db.commit()
+
+                # Schedule cost backfill if generation ID exists
+                if generation_id:
+                    try:
+                        schedule_openrouter_cost_backfill(
+                            llm_call_id=llm_call_id, delay_seconds=120
+                        )
+                    except Exception:
+                        logger.exception(
+                            "product_alias_matching_cost_backfill_schedule_failed"
+                        )
+            except Exception:
+                logger.exception("product_alias_matching_telemetry_failed")
+                # Don't fail the function if telemetry fails
 
         # Parse JSON
         content = content.strip()

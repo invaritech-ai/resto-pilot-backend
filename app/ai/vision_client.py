@@ -49,6 +49,10 @@ def _get_vision_settings(settings: Settings) -> tuple[str, str, str]:
     api_key = settings.vision_api_key or settings.openai_api_key
     base_url = settings.vision_base_url or settings.openai_base_url
 
+    print(
+        f"[VISION] _get_vision_settings: model={model}, base_url={base_url}, api_key={'***' + api_key[-4:] if api_key else 'NONE'}"
+    )
+
     if not api_key:
         raise OpenAIError(
             "Vision API key is not configured (APP_VISION_API_KEY or APP_OPENAI_API_KEY)"
@@ -72,7 +76,13 @@ def process_image_with_vision(
     Returns:
         VisionCallResult with extracted content and telemetry data
     """
+    print(
+        f"[VISION] process_image_with_vision: starting, image_size={len(file_bytes):,} bytes, mime={mime_type}"
+    )
     model, api_key, base_url = _get_vision_settings(settings)
+    print(
+        f"[VISION] process_image_with_vision: using model={model}, base_url={base_url}"
+    )
     start_time = time.time()
 
     # Encode image as base64
@@ -209,13 +219,17 @@ def _is_text_based_pdf(file_bytes: bytes) -> bool:
     Returns:
         True if text-based, False if image-based
     """
+    print(f"[VISION] _is_text_based_pdf: checking PDF type...")
     try:
         from pypdf import PdfReader
 
         pdf_reader = PdfReader(io.BytesIO(file_bytes))
+        total_pages = len(pdf_reader.pages)
+        print(f"[VISION] _is_text_based_pdf: PDF has {total_pages} pages")
+
         # Check first few pages for extractable text
         text_length = 0
-        pages_to_check = min(3, len(pdf_reader.pages))
+        pages_to_check = min(3, total_pages)
         for i in range(pages_to_check):
             try:
                 page_text = pdf_reader.pages[i].extract_text()
@@ -224,12 +238,19 @@ def _is_text_based_pdf(file_bytes: bytes) -> bool:
             except Exception:
                 pass
 
-        # If we can extract substantial text, it's text-based
-        return text_length > 100
+        is_text_based = text_length > 100
+        print(
+            f"[VISION] _is_text_based_pdf: extracted {text_length} chars from first {pages_to_check} pages -> {'text-based' if is_text_based else 'image-based'}"
+        )
+        return is_text_based
     except ImportError:
+        print(
+            "[VISION] _is_text_based_pdf: pypdf not available, assuming image-based PDF"
+        )
         logger.warning("pypdf not available, assuming image-based PDF")
         return False
     except Exception as e:
+        print(f"[VISION] _is_text_based_pdf: Error: {e}, assuming image-based")
         logger.warning(f"Error checking PDF type: {e}, assuming image-based")
         return False
 
@@ -244,22 +265,41 @@ def _extract_text_from_pdf_pages(file_bytes: bytes) -> list[tuple[int, str]]:
     Returns:
         List of (page_number, text) tuples (1-indexed)
     """
+    print("[VISION] _extract_text_from_pdf_pages: starting text extraction...")
     try:
         from pypdf import PdfReader
 
         pdf_reader = PdfReader(io.BytesIO(file_bytes))
+        total_pages = len(pdf_reader.pages)
+        print(
+            f"[VISION] _extract_text_from_pdf_pages: extracting text from {total_pages} pages"
+        )
+
         pages = []
         for i, page in enumerate(pdf_reader.pages, start=1):
             try:
                 text = page.extract_text()
+                char_count = len(text) if text else 0
+                print(
+                    f"[VISION] _extract_text_from_pdf_pages: page {i}/{total_pages} - {char_count} chars"
+                )
                 pages.append((i, text))
             except Exception as e:
+                print(
+                    f"[VISION] _extract_text_from_pdf_pages: page {i}/{total_pages} - ERROR: {e}"
+                )
                 logger.warning(f"Error extracting text from page {i}: {e}")
                 pages.append((i, ""))
+
+        print(
+            f"[VISION] _extract_text_from_pdf_pages: completed, {len(pages)} pages extracted"
+        )
         return pages
     except ImportError:
+        print("[VISION] _extract_text_from_pdf_pages: pypdf not available!")
         raise OpenAIError("pypdf is required for text-based PDF extraction")
     except Exception as e:
+        print(f"[VISION] _extract_text_from_pdf_pages: FAILED: {e}")
         raise OpenAIError(f"Failed to extract text from PDF: {e}") from e
 
 
@@ -273,22 +313,41 @@ def _convert_pdf_pages_to_images(file_bytes: bytes) -> list[tuple[int, bytes]]:
     Returns:
         List of (page_number, image_bytes) tuples (1-indexed)
     """
+    print("[VISION] _convert_pdf_pages_to_images: starting PDF to image conversion...")
     try:
         from pdf2image import convert_from_bytes
 
+        print(
+            "[VISION] _convert_pdf_pages_to_images: converting pages (this may take a while)..."
+        )
         images = convert_from_bytes(file_bytes)
+        total_pages = len(images)
+        print(
+            f"[VISION] _convert_pdf_pages_to_images: converted {total_pages} pages to images"
+        )
+
         pages = []
         for i, img in enumerate(images, start=1):
             # Convert PIL Image to bytes
             img_bytes_io = io.BytesIO()
             img.save(img_bytes_io, format="PNG")
+            img_size = len(img_bytes_io.getvalue())
+            print(
+                f"[VISION] _convert_pdf_pages_to_images: page {i}/{total_pages} - {img_size:,} bytes"
+            )
             pages.append((i, img_bytes_io.getvalue()))
+
+        print(
+            f"[VISION] _convert_pdf_pages_to_images: completed, {len(pages)} images ready"
+        )
         return pages
     except ImportError:
+        print("[VISION] _convert_pdf_pages_to_images: pdf2image not available!")
         raise OpenAIError(
             "pdf2image and Pillow are required for image-based PDF processing"
         )
     except Exception as e:
+        print(f"[VISION] _convert_pdf_pages_to_images: FAILED: {e}")
         raise OpenAIError(f"Failed to convert PDF pages to images: {e}") from e
 
 
@@ -312,6 +371,12 @@ def process_pdf_with_vision(
     Returns:
         VisionDocumentResult with consolidated content and telemetry for all pages
     """
+    print(f"\n[VISION] process_pdf_with_vision: starting...")
+    print(
+        f"[VISION] process_pdf_with_vision: filename={filename}, page_by_page={page_by_page}"
+    )
+    print(f"[VISION] process_pdf_with_vision: file_size={len(file_bytes):,} bytes")
+
     if not page_by_page:
         # Original behavior: process entire PDF at once
         result = _process_pdf_single(file_bytes, filename, prompt, settings)
@@ -327,12 +392,23 @@ def process_pdf_with_vision(
 
     if is_text_based:
         # Extract text from each page - use vision_model for text extraction
+        print(
+            f"[VISION] process_pdf_with_vision: PDF is TEXT-BASED, extracting text..."
+        )
         pages = _extract_text_from_pdf_pages(file_bytes)
+        total_pages = len(pages)
         page_results = []
 
         for page_num, page_text in pages:
             if not page_text.strip():
+                print(
+                    f"[VISION] process_pdf_with_vision: page {page_num}/{total_pages} - SKIPPED (empty)"
+                )
                 continue
+
+            print(
+                f"[VISION] process_pdf_with_vision: page {page_num}/{total_pages} - sending to LLM ({len(page_text)} chars)..."
+            )
 
             # Process text with vision model via chat API
             system_prompt = "You are a helpful assistant that extracts structured data from text. Return ONLY valid JSON, no other text."
@@ -345,6 +421,9 @@ def process_pdf_with_vision(
                 # Use vision model for extraction (via raw httpx to control model)
                 _, api_key, base_url = _get_vision_settings(settings)
                 url = f"{base_url.rstrip('/')}/chat/completions"
+                print(
+                    f"[VISION] process_pdf_with_vision: page {page_num} - calling {url} with model={model}"
+                )
                 headers = {
                     "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json",
@@ -373,6 +452,9 @@ def process_pdf_with_vision(
                 resp.raise_for_status()
                 end_time = time.time()
                 latency_ms = int((end_time - start_time) * 1000)
+                print(
+                    f"[VISION] process_pdf_with_vision: page {page_num} - response received in {latency_ms}ms"
+                )
 
                 response = resp.json()
                 content = (
@@ -380,6 +462,10 @@ def process_pdf_with_vision(
                 )
                 if not isinstance(content, str):
                     raise OpenAIError(f"Unexpected LLM response: {response}")
+
+                print(
+                    f"[VISION] process_pdf_with_vision: page {page_num} - extracted {len(content)} chars"
+                )
 
                 # Extract telemetry
                 from app.ai.openrouter_generation import (
@@ -404,7 +490,11 @@ def process_pdf_with_vision(
                 )
                 telemetry_results.append(telemetry_result)
                 page_results.append((page_num, content))
+                print(f"[VISION] process_pdf_with_vision: page {page_num} - ✓ SUCCESS")
             except Exception as e:
+                print(
+                    f"[VISION] process_pdf_with_vision: page {page_num} - ✗ ERROR: {e}"
+                )
                 logger.warning(f"Error processing page {page_num}: {e}")
                 end_time = time.time()
                 latency_ms = (
@@ -427,10 +517,17 @@ def process_pdf_with_vision(
 
     else:
         # Convert pages to images and process with vision API
+        print(
+            f"[VISION] process_pdf_with_vision: PDF is IMAGE-BASED, converting to images..."
+        )
         pages = _convert_pdf_pages_to_images(file_bytes)
+        total_pages = len(pages)
         page_results = []
 
         for page_num, page_image_bytes in pages:
+            print(
+                f"[VISION] process_pdf_with_vision: page {page_num}/{total_pages} - sending image ({len(page_image_bytes):,} bytes) to vision API..."
+            )
             start_time = time.time()
             try:
                 result = process_image_with_vision(
@@ -438,7 +535,13 @@ def process_pdf_with_vision(
                 )
                 telemetry_results.append(result)
                 page_results.append((page_num, result.content))
+                print(
+                    f"[VISION] process_pdf_with_vision: page {page_num}/{total_pages} - ✓ SUCCESS ({result.latency_ms}ms)"
+                )
             except Exception as e:
+                print(
+                    f"[VISION] process_pdf_with_vision: page {page_num}/{total_pages} - ✗ ERROR: {e}"
+                )
                 logger.warning(f"Error processing page {page_num}: {e}")
                 end_time = time.time()
                 latency_ms = int((end_time - start_time) * 1000)
@@ -457,7 +560,13 @@ def process_pdf_with_vision(
                 continue
 
     # Consolidate results
+    print(
+        f"[VISION] process_pdf_with_vision: consolidating {len(page_results)} page results..."
+    )
     consolidated_content = _consolidate_pdf_page_results(page_results, prompt, settings)
+    print(
+        f"[VISION] process_pdf_with_vision: ✓ consolidation complete, {len(consolidated_content)} chars"
+    )
     return VisionDocumentResult(
         content=consolidated_content,
         telemetry_results=telemetry_results,
@@ -859,8 +968,14 @@ def process_document_with_vision(
     Returns:
         VisionDocumentResult with extracted content and telemetry data
     """
+    print(f"\n[VISION] ========== process_document_with_vision ==========")
+    print(f"[VISION] mime_type: {mime_type}")
+    print(f"[VISION] filename: {filename}")
+    print(f"[VISION] file_size: {len(file_bytes):,} bytes")
+
     # For images, use the image processing function
     if mime_type.startswith("image/"):
+        print(f"[VISION] -> Processing as IMAGE")
         result = process_image_with_vision(file_bytes, prompt, settings, mime_type)
         return VisionDocumentResult(
             content=result.content,
@@ -869,6 +984,7 @@ def process_document_with_vision(
 
     # For PDFs, use page-by-page processing
     if mime_type == "application/pdf":
+        print(f"[VISION] -> Processing as PDF (page-by-page)")
         return process_pdf_with_vision(
             file_bytes, filename, prompt, settings, page_by_page=True
         )

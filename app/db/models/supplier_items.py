@@ -16,8 +16,8 @@ class SupplierItems(Base):
     supplier_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("suppliers.id", ondelete="CASCADE"), nullable=False
     )
-    product_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("products.id", ondelete="CASCADE"), nullable=False
+    product_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("products.id", ondelete="CASCADE"), nullable=True
     )
     supplier_sku: Mapped[str | None] = mapped_column(String, nullable=True)
     supplier_name_raw: Mapped[str] = mapped_column(String, nullable=False)

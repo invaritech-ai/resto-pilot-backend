@@ -20,7 +20,6 @@ from app.processing.file_processor import (
     extract_inventory_data,
     extract_invoice_data,
     extract_price_list_data,
-    match_product_aliases,
 )
 from app.telegram.bot_api import get_file_bytes, send_message
 from app.workers.celery_app import celery_app
@@ -32,7 +31,6 @@ logger = logging.getLogger(__name__)
 
 
 def _record_vision_telemetry(
-    db: Session,
     session_uuid: uuid.UUID | None,
     chat_id: int,
     telemetry_results: list,
@@ -40,10 +38,12 @@ def _record_vision_telemetry(
     processing_type: str,
 ) -> None:
     """
-    Record telemetry for vision model calls.
+    Record telemetry for vision model calls using a FRESH database session.
+
+    This function creates its own session to avoid idle-in-transaction timeout
+    issues that occur when the main session sits idle during long LLM processing.
 
     Args:
-        db: Database session
         session_uuid: Session UUID (if None, logs warning and skips)
         chat_id: Chat ID
         telemetry_results: List of VisionCallResult objects
@@ -57,65 +57,67 @@ def _record_vision_telemetry(
         )
         return
 
-    for idx, result in enumerate(telemetry_results):
-        # Determine purpose with page index if applicable
-        if len(telemetry_results) > 1:
-            purpose = f"{purpose_base}_page_{idx + 1}"
-        else:
-            purpose = f"{purpose_base}_page"
+    # Use a fresh session for telemetry to avoid idle-in-transaction timeout
+    with worker_db_session() as db:
+        for idx, result in enumerate(telemetry_results):
+            # Determine purpose with page index if applicable
+            if len(telemetry_results) > 1:
+                purpose = f"{purpose_base}_page_{idx + 1}"
+            else:
+                purpose = f"{purpose_base}_page"
 
-        # Build metadata with page index
-        generation_json = {}
-        if result.response_data:
-            generation_json = result.response_data.copy()
-        if len(telemetry_results) > 1:
-            generation_json["page_index"] = idx + 1
-        generation_json["processing_type"] = processing_type
+            # Build metadata with page index
+            generation_json = {}
+            if result.response_data:
+                generation_json = result.response_data.copy()
+            if len(telemetry_results) > 1:
+                generation_json["page_index"] = idx + 1
+            generation_json["processing_type"] = processing_type
 
-        try:
-            llm_call_id = record_llm_call(
-                db=db,
-                session_id=session_uuid,
-                chat_id=chat_id,
-                purpose=purpose,
-                model=result.model,
-                openrouter_generation_id=result.openrouter_generation_id,
-                upstream_id=result.response_data.get("id")
-                if isinstance(result.response_data.get("id"), str)
-                else None,
-                provider_name=result.response_data.get("provider")
-                if isinstance(result.response_data.get("provider"), str)
-                else None,
-                usage=result.usage,
-                latency_ms=result.latency_ms,
-                openrouter_generation_json=generation_json if generation_json else None,
-                error=result.error,
-            )
-            db.commit()
+            try:
+                llm_call_id = record_llm_call(
+                    db=db,
+                    session_id=session_uuid,
+                    chat_id=chat_id,
+                    purpose=purpose,
+                    model=result.model,
+                    openrouter_generation_id=result.openrouter_generation_id,
+                    upstream_id=result.response_data.get("id")
+                    if isinstance(result.response_data.get("id"), str)
+                    else None,
+                    provider_name=result.response_data.get("provider")
+                    if isinstance(result.response_data.get("provider"), str)
+                    else None,
+                    usage=result.usage,
+                    latency_ms=result.latency_ms,
+                    openrouter_generation_json=generation_json if generation_json else None,
+                    error=result.error,
+                )
+                db.commit()
 
-            # Schedule cost backfill if generation ID exists
-            if result.openrouter_generation_id:
-                try:
-                    schedule_openrouter_cost_backfill(
-                        llm_call_id=llm_call_id, delay_seconds=120
-                    )
-                except Exception:
-                    logger.exception(
-                        "vision_cost_backfill_schedule_failed",
-                        extra={
-                            "llm_call_id": str(llm_call_id),
-                            "generation_id": result.openrouter_generation_id,
-                        },
-                    )
-        except Exception:
-            logger.exception(
-                "vision_telemetry_record_failed",
-                extra={
-                    "purpose": purpose,
-                    "model": result.model,
-                    "error": result.error,
-                },
-            )
+                # Schedule cost backfill if generation ID exists
+                if result.openrouter_generation_id:
+                    try:
+                        schedule_openrouter_cost_backfill(
+                            llm_call_id=llm_call_id, delay_seconds=120
+                        )
+                    except Exception:
+                        logger.exception(
+                            "vision_cost_backfill_schedule_failed",
+                            extra={
+                                "llm_call_id": str(llm_call_id),
+                                "generation_id": result.openrouter_generation_id,
+                            },
+                        )
+            except Exception:
+                logger.exception(
+                    "vision_telemetry_record_failed",
+                    extra={
+                        "purpose": purpose,
+                        "model": result.model,
+                        "error": result.error,
+                    },
+                )
 
 
 @celery_app.task(name="process_invoice_file_task")
@@ -163,11 +165,10 @@ def process_invoice_file_task(
             try:
                 extracted_data = extract_invoice_data(file_bytes, mime_type, settings, db, filename)
 
-                # Record telemetry for vision calls
+                # Record telemetry for vision calls (uses fresh session internally)
                 telemetry_results = extracted_data.pop("_telemetry_results", [])
                 if telemetry_results:
                     _record_vision_telemetry(
-                        db=db,
                         session_uuid=session_uuid,
                         chat_id=chat_id,
                         telemetry_results=telemetry_results,
@@ -175,7 +176,7 @@ def process_invoice_file_task(
                         processing_type="invoice",
                     )
             except Exception as exc:
-                # Record error telemetry if possible
+                # Record error telemetry if possible (uses fresh session internally)
                 if session_uuid:
                     try:
                         model, _, _ = _get_vision_settings(settings)
@@ -190,7 +191,6 @@ def process_invoice_file_task(
                             error=f"Invoice extraction failed: {exc}",
                         )
                         _record_vision_telemetry(
-                            db=db,
                             session_uuid=session_uuid,
                             chat_id=chat_id,
                             telemetry_results=[error_result],
@@ -220,12 +220,8 @@ def process_invoice_file_task(
                 if supplier:
                     supplier_uuid = supplier.id
 
-            # Match product aliases for line items
-            supplier_names = [
-                item.get("description_raw", item.get("description", ""))
-                for item in extracted_data.get("line_items", [])
-            ]
-            alias_matches = match_product_aliases(restaurant_uuid, supplier_names, db, settings)
+            # No longer matching product aliases - we store raw names and search when user asks
+            alias_matches = {}
 
             # Create document record
             document = Documents(
@@ -272,31 +268,52 @@ def process_invoice_file_task(
                     settings=settings,
                 )
             else:
-                # Format and send preview message
-                lines = ["📄 Invoice Preview:\n"]
-                supplier_display = supplier_name or "⚠️ MISSING"
-                currency_display = currency or "⚠️ MISSING"
-                lines.append(f"Supplier: {supplier_display}")
-                lines.append(f"Invoice Number: {extracted_data.get('invoice_number', 'N/A')}")
-                lines.append(f"Date: {extracted_data.get('invoice_date', 'N/A')}")
-                lines.append(f"Currency: {currency_display}")
-                lines.append(f"Total: {extracted_data.get('total', 'N/A')}")
-                lines.append("\nLine Items:")
-                for i, item in enumerate(extracted_data.get("line_items", []), 1):
-                    desc = item.get("description_raw", item.get("description", "N/A"))
-                    qty = item.get("quantity", "N/A")
-                    unit = item.get("unit", "")
-                    price = item.get("unit_price", "N/A")
-                    total = item.get("line_total", "N/A")
-                    source_info = ""
-                    if item.get("source_page"):
-                        source_info = f" [Page {item['source_page']}]"
-                    lines.append(
-                        f"  {i}. {desc} - {qty} {unit} @ {price} = {total}{source_info}"
-                    )
-                lines.append(
-                    "\n\nReview the data above. Tell me if anything needs changing, or say /confirm to save."
-                )
+                # Format and send preview message with summary
+                line_items = extracted_data.get("line_items", [])
+                total_items = len(line_items)
+                
+                lines = ["📄 **Invoice Extracted**\n"]
+                lines.append(f"**Supplier:** {supplier_name}")
+                
+                # Show contact info if available
+                contact_name = extracted_data.get("contact_name")
+                contact_email = extracted_data.get("contact_email")
+                contact_phone = extracted_data.get("contact_phone")
+                if contact_name:
+                    lines.append(f"**Contact:** {contact_name}")
+                if contact_email:
+                    lines.append(f"**Email:** {contact_email}")
+                if contact_phone:
+                    lines.append(f"**Phone:** {contact_phone}")
+                
+                lines.append(f"**Invoice #:** {extracted_data.get('invoice_number', 'N/A')}")
+                lines.append(f"**Date:** {extracted_data.get('invoice_date', 'N/A')}")
+                due_date = extracted_data.get('due_date')
+                if due_date:
+                    lines.append(f"**Due Date:** {due_date}")
+                lines.append(f"**Currency:** {currency}")
+                lines.append(f"**Total:** {currency} {extracted_data.get('total', 'N/A')}")
+                lines.append(f"**Line Items:** {total_items}")
+                
+                # Show sample of line items (first 10 for invoices)
+                sample_size = min(10, total_items)
+                if sample_size > 0:
+                    lines.append(f"\n**Line Items ({sample_size} of {total_items}):**")
+                    for i, item in enumerate(line_items[:sample_size], 1):
+                        desc = item.get("description_raw", item.get("description", "N/A"))
+                        qty = item.get("quantity", "N/A")
+                        unit = item.get("unit", "")
+                        total = item.get("line_total", "N/A")
+                        lines.append(f"  {i}. {desc} - {qty} {unit} = {currency} {total}")
+                    
+                    if total_items > sample_size:
+                        lines.append(f"  ... and {total_items - sample_size} more items")
+                
+                lines.append("\n---")
+                lines.append("✅ Say **/confirm** to save this invoice")
+                lines.append("❓ Ask to see all line items if needed")
+                lines.append("✏️ Tell me if anything needs correcting")
+                
                 preview_text = "\n".join(lines)
                 send_message(chat_id=chat_id, text=preview_text, settings=settings)
 
@@ -381,11 +398,10 @@ def process_price_list_file_task(
             try:
                 extracted_data = extract_price_list_data(file_bytes, mime_type, settings, db, filename)
 
-                # Record telemetry for vision calls
+                # Record telemetry for vision calls (uses fresh session internally)
                 telemetry_results = extracted_data.pop("_telemetry_results", [])
                 if telemetry_results:
                     _record_vision_telemetry(
-                        db=db,
                         session_uuid=session_uuid,
                         chat_id=chat_id,
                         telemetry_results=telemetry_results,
@@ -393,7 +409,7 @@ def process_price_list_file_task(
                         processing_type="price_list",
                     )
             except Exception as exc:
-                # Record error telemetry if possible
+                # Record error telemetry if possible (uses fresh session internally)
                 if session_uuid:
                     try:
                         model, _, _ = _get_vision_settings(settings)
@@ -408,7 +424,6 @@ def process_price_list_file_task(
                             error=f"Price list extraction failed: {exc}",
                         )
                         _record_vision_telemetry(
-                            db=db,
                             session_uuid=session_uuid,
                             chat_id=chat_id,
                             telemetry_results=[error_result],
@@ -438,12 +453,8 @@ def process_price_list_file_task(
                 if supplier:
                     supplier_uuid = supplier.id
 
-            # Match product aliases for items
-            supplier_names = [
-                item.get("supplier_name_raw", item.get("name", ""))
-                for item in extracted_data.get("items", [])
-            ]
-            alias_matches = match_product_aliases(restaurant_uuid, supplier_names, db, settings)
+            # No longer matching product aliases - we store raw names and search when user asks
+            alias_matches = {}
 
             # Create document record
             document = Documents(
@@ -490,37 +501,55 @@ def process_price_list_file_task(
                     settings=settings,
                 )
             else:
-                # Format and send preview message
-                lines = ["📋 Price List Preview:\n"]
-                supplier_display = supplier_name or "⚠️ MISSING"
-                currency_display = currency or "⚠️ MISSING"
-                lines.append(f"Supplier: {supplier_display}")
-                lines.append(f"Currency: {currency_display}")
-                lines.append(f"Items: {len(extracted_data.get('items', []))}")
-                lines.append("\nItems:")
-                for i, item in enumerate(extracted_data.get("items", []), 1):
-                    name = item.get("supplier_name_raw", item.get("name", "N/A"))
-                    price = item.get("price", "N/A")
-                    item_currency = item.get("currency", currency_display)
-                    unit_basis = item.get("unit_basis", "")
-                    pack_size = item.get("pack_size_text", "")
-                    min_order_qty = item.get("min_order_qty")
-                    source_info = ""
-                    if item.get("source_page"):
-                        source_info = f" [Page {item['source_page']}]"
+                # Format and send preview message with summary (not all items)
+                items = extracted_data.get("items", [])
+                total_items = len(items)
+                
+                lines = ["📋 **Price List Extracted**\n"]
+                lines.append(f"**Supplier:** {supplier_name}")
+                
+                # Show contact info if available
+                contact_name = extracted_data.get("contact_name")
+                contact_email = extracted_data.get("contact_email")
+                contact_phone = extracted_data.get("contact_phone")
+                if contact_name:
+                    lines.append(f"**Contact:** {contact_name}")
+                if contact_email:
+                    lines.append(f"**Email:** {contact_email}")
+                if contact_phone:
+                    lines.append(f"**Phone:** {contact_phone}")
+                
+                lines.append(f"**Currency:** {currency}")
+                lines.append(f"**Total Items:** {total_items}")
+                
+                # Show effective date if available
+                effective_date = extracted_data.get("effective_date")
+                if effective_date:
+                    lines.append(f"**Effective Date:** {effective_date}")
+                
+                # Show sample of first 5 items
+                sample_size = min(5, total_items)
+                if sample_size > 0:
+                    lines.append(f"\n**Sample Items (first {sample_size} of {total_items}):**")
+                    for i, item in enumerate(items[:sample_size], 1):
+                        name = item.get("supplier_name_raw", item.get("name", "N/A"))
+                        price = item.get("price", "N/A")
+                        pack_size = item.get("pack_size_text", "")
+                        
+                        item_line = f"  {i}. {name}"
+                        if pack_size:
+                            item_line += f" ({pack_size})"
+                        item_line += f" - {currency} {price}"
+                        lines.append(item_line)
                     
-                    item_line = f"  {i}. {name}"
-                    if pack_size:
-                        item_line += f" (pack_size_text: {pack_size})"
-                    if unit_basis:
-                        item_line += f" (unit_basis: {unit_basis})"
-                    if min_order_qty is not None:
-                        item_line += f" (min_order_qty: {min_order_qty})"
-                    item_line += f" - {price} {item_currency}{source_info}"
-                    lines.append(item_line)
-                lines.append(
-                    "\n\nReview the data above. Tell me if anything needs changing, or say /confirm to save."
-                )
+                    if total_items > sample_size:
+                        lines.append(f"  ... and {total_items - sample_size} more items")
+                
+                lines.append("\n---")
+                lines.append("✅ Say **/confirm** to save all items to your database")
+                lines.append("❓ Ask me to show specific items or categories")
+                lines.append("✏️ Tell me if anything needs correcting")
+                
                 preview_text = "\n".join(lines)
                 send_message(chat_id=chat_id, text=preview_text, settings=settings)
 
@@ -604,11 +633,10 @@ def process_inventory_photo_task(
             try:
                 extracted_data = extract_inventory_data(file_bytes, mime_type, settings, db, filename)
 
-                # Record telemetry for vision calls
+                # Record telemetry for vision calls (uses fresh session internally)
                 telemetry_results = extracted_data.pop("_telemetry_results", [])
                 if telemetry_results:
                     _record_vision_telemetry(
-                        db=db,
                         session_uuid=session_uuid,
                         chat_id=chat_id,
                         telemetry_results=telemetry_results,
@@ -616,7 +644,7 @@ def process_inventory_photo_task(
                         processing_type="inventory",
                     )
             except Exception as exc:
-                # Record error telemetry if possible
+                # Record error telemetry if possible (uses fresh session internally)
                 if session_uuid:
                     try:
                         model, _, _ = _get_vision_settings(settings)
@@ -631,7 +659,6 @@ def process_inventory_photo_task(
                             error=f"Inventory extraction failed: {exc}",
                         )
                         _record_vision_telemetry(
-                            db=db,
                             session_uuid=session_uuid,
                             chat_id=chat_id,
                             telemetry_results=[error_result],
@@ -642,11 +669,8 @@ def process_inventory_photo_task(
                         logger.exception("failed_to_record_error_telemetry")
                 raise
 
-            # Match product aliases for detected items
-            supplier_names = [
-                item.get("product_name", "") for item in extracted_data.get("items", [])
-            ]
-            alias_matches = match_product_aliases(restaurant_uuid, supplier_names, db, settings)
+            # No longer matching product aliases - we store raw names and search when user asks
+            alias_matches = {}
 
             # Create staging record (no document for inventory photos)
             staging = FileProcessingStaging(
@@ -661,30 +685,31 @@ def process_inventory_photo_task(
             db.add(staging)
             db.commit()
 
-            # Format and send preview message
-            lines = ["📸 Inventory Photo Preview:\n"]
-            lines.append(f"Items Detected: {len(extracted_data.get('items', []))}")
-            lines.append("\nItems:")
-            for i, item in enumerate(extracted_data.get("items", []), 1):
-                product_name = item.get("product_name", "N/A")
-                quantity = item.get("quantity", "N/A")
-                unit = item.get("unit", "")
-                unit_cost = item.get("unit_cost")
-                status_val = item.get("status")
-                source_info = ""
-                if item.get("source_page"):
-                    source_info = f" [Page {item['source_page']}]"
+            # Format and send preview message with summary
+            items = extracted_data.get("items", [])
+            total_items = len(items)
+            
+            lines = ["📸 **Inventory Extracted**\n"]
+            lines.append(f"**Items Detected:** {total_items}")
+            
+            # Show sample of items (first 10 for inventory)
+            sample_size = min(10, total_items)
+            if sample_size > 0:
+                lines.append(f"\n**Items ({sample_size} of {total_items}):**")
+                for i, item in enumerate(items[:sample_size], 1):
+                    product_name = item.get("product_name", "N/A")
+                    quantity = item.get("quantity", "N/A")
+                    unit = item.get("unit", "")
+                    lines.append(f"  {i}. {product_name} - {quantity} {unit}")
                 
-                item_line = f"  {i}. {product_name} - {quantity} {unit}"
-                if unit_cost is not None:
-                    item_line += f" (unit_cost: {unit_cost})"
-                if status_val:
-                    item_line += f" (status: {status_val})"
-                item_line += source_info
-                lines.append(item_line)
-            lines.append(
-                "\n\nReview the data above. Tell me if anything needs changing, or say /confirm to save."
-            )
+                if total_items > sample_size:
+                    lines.append(f"  ... and {total_items - sample_size} more items")
+            
+            lines.append("\n---")
+            lines.append("✅ Say **/confirm** to save inventory counts")
+            lines.append("❓ Ask to see all items if needed")
+            lines.append("✏️ Tell me if anything needs correcting")
+            
             preview_text = "\n".join(lines)
             send_message(chat_id=chat_id, text=preview_text, settings=settings)
 
