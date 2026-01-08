@@ -15,7 +15,6 @@ from app.ai.openai_client import (
     OpenAIError,
     _is_retryable_exception,
     _is_retryable_status,
-    chat_completions_create,
 )
 from app.core.config import Settings
 
@@ -327,7 +326,7 @@ def process_pdf_with_vision(
     telemetry_results: list[VisionCallResult] = []
 
     if is_text_based:
-        # Extract text from each page
+        # Extract text from each page - use vision_model for text extraction
         pages = _extract_text_from_pdf_pages(file_bytes)
         page_results = []
 
@@ -335,7 +334,7 @@ def process_pdf_with_vision(
             if not page_text.strip():
                 continue
 
-            # Process text with LLM
+            # Process text with vision model via chat API
             system_prompt = "You are a helpful assistant that extracts structured data from text. Return ONLY valid JSON, no other text."
             user_prompt = (
                 f"{prompt}\n\nExtracted text from page {page_num}:\n{page_text}"
@@ -343,17 +342,39 @@ def process_pdf_with_vision(
 
             try:
                 start_time = time.time()
-                response = chat_completions_create(
-                    settings=settings,
-                    messages=[
+                # Use vision model for extraction (via raw httpx to control model)
+                _, api_key, base_url = _get_vision_settings(settings)
+                url = f"{base_url.rstrip('/')}/chat/completions"
+                headers = {
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                }
+                if settings.openrouter_http_referer:
+                    headers["HTTP-Referer"] = settings.openrouter_http_referer
+                if settings.openrouter_title:
+                    headers["X-Title"] = settings.openrouter_title
+
+                payload = {
+                    "model": model,  # vision_model
+                    "messages": [
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_prompt},
                     ],
-                    temperature=0.2,
+                    "temperature": 0.2,
+                }
+
+                timeout = httpx.Timeout(
+                    connect=10.0,
+                    read=float(settings.openai_timeout_seconds),
+                    write=10.0,
+                    pool=10.0,
                 )
+                resp = httpx.post(url, headers=headers, json=payload, timeout=timeout)
+                resp.raise_for_status()
                 end_time = time.time()
                 latency_ms = int((end_time - start_time) * 1000)
 
+                response = resp.json()
                 content = (
                     response.get("choices", [{}])[0].get("message", {}).get("content")
                 )
@@ -366,16 +387,18 @@ def process_pdf_with_vision(
                 )
                 from app.ai.openrouter_usage import extract_openrouter_usage
 
-                generation_id = extract_openrouter_generation_id(data=response)
+                generation_id = extract_openrouter_generation_id(
+                    headers=dict(resp.headers), data=response
+                )
                 usage = extract_openrouter_usage(response)
 
                 telemetry_result = VisionCallResult(
                     content=content,
-                    model=model,
+                    model=model,  # vision_model
                     latency_ms=latency_ms,
                     usage=usage,
                     openrouter_generation_id=generation_id,
-                    response_headers={},
+                    response_headers=dict(resp.headers),
                     response_data=response,
                     error=None,
                 )
@@ -408,6 +431,7 @@ def process_pdf_with_vision(
         page_results = []
 
         for page_num, page_image_bytes in pages:
+            start_time = time.time()
             try:
                 result = process_image_with_vision(
                     page_image_bytes, prompt, settings, "image/png"
@@ -416,7 +440,20 @@ def process_pdf_with_vision(
                 page_results.append((page_num, result.content))
             except Exception as e:
                 logger.warning(f"Error processing page {page_num}: {e}")
-                # Error telemetry already recorded in process_image_with_vision
+                end_time = time.time()
+                latency_ms = int((end_time - start_time) * 1000)
+                # Record error telemetry for this page
+                error_result = VisionCallResult(
+                    content="",
+                    model=model,
+                    latency_ms=latency_ms,
+                    usage=None,
+                    openrouter_generation_id=None,
+                    response_headers={},
+                    response_data={},
+                    error=f"Error processing page {page_num}: {e}",
+                )
+                telemetry_results.append(error_result)
                 continue
 
     # Consolidate results
@@ -858,25 +895,44 @@ def process_document_with_vision(
         extracted_text = extract_text_from_file(file_bytes, mime_type, filename)
 
         # Send extracted text to LLM for structured extraction
-        from app.ai.openai_client import chat_completions_create
         from app.ai.openrouter_generation import extract_openrouter_generation_id
         from app.ai.openrouter_usage import extract_openrouter_usage
 
         system_prompt = "You are a helpful assistant that extracts structured data from text. Return ONLY valid JSON, no other text."
         user_prompt = f"{prompt}\n\nExtracted text:\n{extracted_text}"
 
-        model = settings.vision_model or settings.openai_model
+        # Use vision_model for text file extraction
+        model, api_key, base_url = _get_vision_settings(settings)
         start_time = time.time()
         try:
-            response = chat_completions_create(
-                model=model,
-                messages=[
+            url = f"{base_url.rstrip('/')}/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            }
+            if settings.openrouter_http_referer:
+                headers["HTTP-Referer"] = settings.openrouter_http_referer
+            if settings.openrouter_title:
+                headers["X-Title"] = settings.openrouter_title
+
+            payload = {
+                "model": model,
+                "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
-                temperature=0.2,
-                settings=settings,
+                "temperature": 0.2,
+            }
+
+            timeout = httpx.Timeout(
+                connect=10.0,
+                read=float(settings.openai_timeout_seconds),
+                write=10.0,
+                pool=10.0,
             )
+            resp = httpx.post(url, headers=headers, json=payload, timeout=timeout)
+            resp.raise_for_status()
+            response = resp.json()
             end_time = time.time()
             latency_ms = int((end_time - start_time) * 1000)
 
@@ -884,7 +940,9 @@ def process_document_with_vision(
             if not isinstance(content, str):
                 raise OpenAIError(f"Unexpected LLM response: {response}")
 
-            generation_id = extract_openrouter_generation_id(data=response)
+            generation_id = extract_openrouter_generation_id(
+                headers=dict(resp.headers), data=response
+            )
             usage = extract_openrouter_usage(response)
 
             telemetry_result = VisionCallResult(
@@ -893,7 +951,7 @@ def process_document_with_vision(
                 latency_ms=latency_ms,
                 usage=usage,
                 openrouter_generation_id=generation_id,
-                response_headers={},
+                response_headers=dict(resp.headers),
                 response_data=response,
                 error=None,
             )
