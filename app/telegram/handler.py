@@ -221,7 +221,10 @@ def handle_update_v2(update: dict, db: Session, settings: Settings) -> None:
             chat_id=parsed.chat_id,
             settings=settings,
             has_file=has_file,
+            db=db,
+            session_id=session.id,
         )
+        db.commit()
 
     # Process the message
     try:

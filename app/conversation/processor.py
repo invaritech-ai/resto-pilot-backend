@@ -344,15 +344,34 @@ def send_ack_message(
     chat_id: int,
     settings: Settings,
     has_file: bool = False,
+    # Optional telemetry params
+    db: Session | None = None,
+    session_id: uuid.UUID | None = None,
 ) -> int | None:
     """
     Send instant acknowledgment message.
+
+    If db and session_id are provided, records the ACK in telegram_outgoing_messages.
 
     Returns the Telegram message ID or None if sending failed.
     """
     text = responses.ACK_FILE_PROCESSING if has_file else responses.ACK_PROCESSING
     try:
-        return send_message(chat_id=chat_id, text=text, settings=settings)
+        telegram_message_id = send_message(chat_id=chat_id, text=text, settings=settings)
+
+        # Record ACK for telemetry if db session provided
+        if db is not None and session_id is not None and telegram_message_id is not None:
+            record_outgoing_message(
+                db=db,
+                session_id=session_id,
+                chat_id=chat_id,
+                kind="ack",
+                text=text,
+                telegram_message_id=telegram_message_id,
+                llm_call_id=None,
+            )
+
+        return telegram_message_id
     except Exception as e:
         logger.warning(
             "ack_send_failed",
