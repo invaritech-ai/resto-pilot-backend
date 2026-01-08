@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 
 def extract_invoice_data(
-    file_bytes: bytes, mime_type: str, settings: Settings
+    file_bytes: bytes, mime_type: str, settings: Settings, filename: str | None = None
 ) -> dict[str, Any]:
     """
     Extract structured invoice data from a file using vision model.
@@ -73,7 +73,7 @@ Include:
 Return ONLY valid JSON, no other text."""
 
     try:
-        extracted_text = process_document_with_vision(file_bytes, mime_type, prompt, settings)
+        extracted_text = process_document_with_vision(file_bytes, mime_type, prompt, settings, filename)
         # Parse JSON from response
         # The model might return JSON wrapped in markdown code blocks
         extracted_text = extracted_text.strip()
@@ -96,7 +96,7 @@ Return ONLY valid JSON, no other text."""
 
 
 def extract_price_list_data(
-    file_bytes: bytes, mime_type: str, settings: Settings
+    file_bytes: bytes, mime_type: str, settings: Settings, filename: str | None = None
 ) -> dict[str, Any]:
     """
     Extract structured price list data from a file using vision model.
@@ -141,7 +141,7 @@ Include:
 Return ONLY valid JSON, no other text."""
 
     try:
-        extracted_text = process_document_with_vision(file_bytes, mime_type, prompt, settings)
+        extracted_text = process_document_with_vision(file_bytes, mime_type, prompt, settings, filename)
         # Parse JSON from response
         extracted_text = extracted_text.strip()
         if extracted_text.startswith("```"):
@@ -162,7 +162,7 @@ Return ONLY valid JSON, no other text."""
 
 
 def extract_inventory_data(
-    file_bytes: bytes, mime_type: str, settings: Settings
+    file_bytes: bytes, mime_type: str, settings: Settings, filename: str | None = None
 ) -> dict[str, Any]:
     """
     Extract structured inventory data from a photo using vision model.
@@ -199,7 +199,7 @@ Return the data as JSON with:
 Return ONLY valid JSON, no other text."""
 
     try:
-        extracted_text = process_document_with_vision(file_bytes, mime_type, prompt, settings)
+        extracted_text = process_document_with_vision(file_bytes, mime_type, prompt, settings, filename)
         # Parse JSON from response
         extracted_text = extracted_text.strip()
         if extracted_text.startswith("```"):

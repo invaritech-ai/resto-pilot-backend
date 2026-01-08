@@ -928,12 +928,24 @@ def process_invoice_file_task(
             from app.telegram.bot_api import get_file_bytes
 
             file_bytes = get_file_bytes(file_id=file_id, settings=settings)
-            mime_type = "image/jpeg"  # TODO: Get actual mime type from Telegram
+            
+            # Get actual mime type and filename from Telegram message
+            from sqlalchemy import select
+            telegram_msg = db.scalar(
+                select(TelegramMessages)
+                .where(TelegramMessages.file_id == file_id)
+                .order_by(TelegramMessages.received_at.desc())
+                .limit(1)
+            )
+            mime_type = telegram_msg.mime if telegram_msg and telegram_msg.mime else "image/jpeg"
+            if not mime_type:
+                mime_type = "image/jpeg"  # Fallback
+            filename = telegram_msg.filename if telegram_msg else None
 
             # Extract invoice data
             from app.processing.file_processor import extract_invoice_data, match_product_aliases
 
-            extracted_data = extract_invoice_data(file_bytes, mime_type, settings)
+            extracted_data = extract_invoice_data(file_bytes, mime_type, settings, filename)
 
             # Find or create supplier if not provided
             supplier_uuid = None
@@ -1081,12 +1093,24 @@ def process_price_list_file_task(
             from app.telegram.bot_api import get_file_bytes
 
             file_bytes = get_file_bytes(file_id=file_id, settings=settings)
-            mime_type = "image/jpeg"  # TODO: Get actual mime type from Telegram
+            
+            # Get actual mime type and filename from Telegram message
+            from sqlalchemy import select
+            telegram_msg = db.scalar(
+                select(TelegramMessages)
+                .where(TelegramMessages.file_id == file_id)
+                .order_by(TelegramMessages.received_at.desc())
+                .limit(1)
+            )
+            mime_type = telegram_msg.mime if telegram_msg and telegram_msg.mime else "image/jpeg"
+            if not mime_type:
+                mime_type = "image/jpeg"  # Fallback
+            filename = telegram_msg.filename if telegram_msg else None
 
             # Extract price list data
             from app.processing.file_processor import extract_price_list_data, match_product_aliases
 
-            extracted_data = extract_price_list_data(file_bytes, mime_type, settings)
+            extracted_data = extract_price_list_data(file_bytes, mime_type, settings, filename)
 
             # Find or create supplier if not provided
             supplier_uuid = None
@@ -1228,12 +1252,24 @@ def process_inventory_photo_task(
             from app.telegram.bot_api import get_file_bytes
 
             file_bytes = get_file_bytes(file_id=file_id, settings=settings)
-            mime_type = "image/jpeg"  # TODO: Get actual mime type from Telegram
+            
+            # Get actual mime type and filename from Telegram message
+            from sqlalchemy import select
+            telegram_msg = db.scalar(
+                select(TelegramMessages)
+                .where(TelegramMessages.file_id == file_id)
+                .order_by(TelegramMessages.received_at.desc())
+                .limit(1)
+            )
+            mime_type = telegram_msg.mime if telegram_msg and telegram_msg.mime else "image/jpeg"
+            if not mime_type:
+                mime_type = "image/jpeg"  # Fallback
+            filename = telegram_msg.filename if telegram_msg else None
 
             # Extract inventory data
             from app.processing.file_processor import extract_inventory_data, match_product_aliases
 
-            extracted_data = extract_inventory_data(file_bytes, mime_type, settings)
+            extracted_data = extract_inventory_data(file_bytes, mime_type, settings, filename)
 
             # Match product aliases for detected items
             supplier_names = [
