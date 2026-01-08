@@ -130,7 +130,15 @@ def process_invoice_file_task(
     user_id: str,
     session_id: str | None = None,
 ) -> None:
-    """Process an invoice file: extract data, match products, store in staging."""
+    """Process an invoice file: extract data, match products, store in staging.
+
+    IMPORTANT: This task is structured to avoid idle-in-transaction timeout.
+    1. Query Telegram message metadata (short-lived session, closes immediately)
+    2. Download file (no DB needed)
+    3. Extract data via LLM (no DB needed - can take minutes)
+    4. Record telemetry (uses its own session)
+    5. Write to DB (new session, opened only when ready to write)
+    """
     task_id = _get_task_id()
     logger.info(
         "celery_task_started name=process_invoice_file_task task_id=%s restaurant_id=%s file_id=%s",
@@ -145,11 +153,8 @@ def process_invoice_file_task(
     session_uuid = _parse_uuid(session_id) if session_id else None
 
     try:
+        # --- PHASE 1: Get file metadata (short-lived session) ---
         with worker_db_session() as db:
-            # Download file
-            file_bytes = get_file_bytes(file_id=file_id, settings=settings)
-            
-            # Get actual mime type and filename from Telegram message
             telegram_msg = db.scalar(
                 select(TelegramMessages)
                 .where(TelegramMessages.file_id == file_id)
@@ -160,51 +165,57 @@ def process_invoice_file_task(
             if not mime_type:
                 mime_type = "image/jpeg"  # Fallback
             filename = telegram_msg.filename if telegram_msg else None
+        # Session closed here - no transaction held during LLM processing
 
-            # Extract invoice data (with DB-aware extraction)
-            try:
-                extracted_data = extract_invoice_data(file_bytes, mime_type, settings, db, filename)
+        # --- PHASE 2: Download file (no DB needed) ---
+        file_bytes = get_file_bytes(file_id=file_id, settings=settings)
 
-                # Record telemetry for vision calls (uses fresh session internally)
-                telemetry_results = extracted_data.pop("_telemetry_results", [])
-                if telemetry_results:
+        # --- PHASE 3: Extract data via LLM (no DB needed, can take minutes) ---
+        try:
+            extracted_data = extract_invoice_data(file_bytes, mime_type, settings, filename)
+
+            # Record telemetry for vision calls (uses fresh session internally)
+            telemetry_results = extracted_data.pop("_telemetry_results", [])
+            if telemetry_results:
+                _record_vision_telemetry(
+                    session_uuid=session_uuid,
+                    chat_id=chat_id,
+                    telemetry_results=telemetry_results,
+                    purpose_base="vision_invoice",
+                    processing_type="invoice",
+                )
+        except Exception as exc:
+            # Record error telemetry if possible (uses fresh session internally)
+            if session_uuid:
+                try:
+                    model, _, _ = _get_vision_settings(settings)
+                    error_result = VisionCallResult(
+                        content="",
+                        model=model,
+                        latency_ms=0,
+                        usage=None,
+                        openrouter_generation_id=None,
+                        response_headers={},
+                        response_data={},
+                        error=f"Invoice extraction failed: {exc}",
+                    )
                     _record_vision_telemetry(
                         session_uuid=session_uuid,
                         chat_id=chat_id,
-                        telemetry_results=telemetry_results,
+                        telemetry_results=[error_result],
                         purpose_base="vision_invoice",
                         processing_type="invoice",
                     )
-            except Exception as exc:
-                # Record error telemetry if possible (uses fresh session internally)
-                if session_uuid:
-                    try:
-                        model, _, _ = _get_vision_settings(settings)
-                        error_result = VisionCallResult(
-                            content="",
-                            model=model,
-                            latency_ms=0,
-                            usage=None,
-                            openrouter_generation_id=None,
-                            response_headers={},
-                            response_data={},
-                            error=f"Invoice extraction failed: {exc}",
-                        )
-                        _record_vision_telemetry(
-                            session_uuid=session_uuid,
-                            chat_id=chat_id,
-                            telemetry_results=[error_result],
-                            purpose_base="vision_invoice",
-                            processing_type="invoice",
-                        )
-                    except Exception:
-                        logger.exception("failed_to_record_error_telemetry")
-                raise
+                except Exception:
+                    logger.exception("failed_to_record_error_telemetry")
+            raise
 
-            # Check for missing required fields
-            supplier_name = extracted_data.get("supplier_name", "").strip() if extracted_data.get("supplier_name") else ""
-            currency = extracted_data.get("currency", "").strip() if extracted_data.get("currency") else ""
+        # --- PHASE 4: Write to DB (new session, opened only when ready) ---
+        # Check for missing required fields
+        supplier_name = extracted_data.get("supplier_name", "").strip() if extracted_data.get("supplier_name") else ""
+        currency = extracted_data.get("currency", "").strip() if extracted_data.get("currency") else ""
 
+        with worker_db_session() as db:
             # Find or create supplier if not provided
             supplier_uuid = None
             if supplier_id:
@@ -252,70 +263,6 @@ def process_invoice_file_task(
                 status=status,
             )
             db.add(staging)
-            db.commit()
-
-            # Send message based on status
-            if status == "awaiting_supplier":
-                send_message(
-                    chat_id=chat_id,
-                    text="What supplier is this invoice from?",
-                    settings=settings,
-                )
-            elif status == "awaiting_currency":
-                send_message(
-                    chat_id=chat_id,
-                    text="What currency is this invoice in? (e.g., USD, EUR)",
-                    settings=settings,
-                )
-            else:
-                # Format and send preview message with summary
-                line_items = extracted_data.get("line_items", [])
-                total_items = len(line_items)
-                
-                lines = ["📄 **Invoice Extracted**\n"]
-                lines.append(f"**Supplier:** {supplier_name}")
-                
-                # Show contact info if available
-                contact_name = extracted_data.get("contact_name")
-                contact_email = extracted_data.get("contact_email")
-                contact_phone = extracted_data.get("contact_phone")
-                if contact_name:
-                    lines.append(f"**Contact:** {contact_name}")
-                if contact_email:
-                    lines.append(f"**Email:** {contact_email}")
-                if contact_phone:
-                    lines.append(f"**Phone:** {contact_phone}")
-                
-                lines.append(f"**Invoice #:** {extracted_data.get('invoice_number', 'N/A')}")
-                lines.append(f"**Date:** {extracted_data.get('invoice_date', 'N/A')}")
-                due_date = extracted_data.get('due_date')
-                if due_date:
-                    lines.append(f"**Due Date:** {due_date}")
-                lines.append(f"**Currency:** {currency}")
-                lines.append(f"**Total:** {currency} {extracted_data.get('total', 'N/A')}")
-                lines.append(f"**Line Items:** {total_items}")
-                
-                # Show sample of line items (first 10 for invoices)
-                sample_size = min(10, total_items)
-                if sample_size > 0:
-                    lines.append(f"\n**Line Items ({sample_size} of {total_items}):**")
-                    for i, item in enumerate(line_items[:sample_size], 1):
-                        desc = item.get("description_raw", item.get("description", "N/A"))
-                        qty = item.get("quantity", "N/A")
-                        unit = item.get("unit", "")
-                        total = item.get("line_total", "N/A")
-                        lines.append(f"  {i}. {desc} - {qty} {unit} = {currency} {total}")
-                    
-                    if total_items > sample_size:
-                        lines.append(f"  ... and {total_items - sample_size} more items")
-                
-                lines.append("\n---")
-                lines.append("✅ Say **/confirm** to save this invoice")
-                lines.append("❓ Ask to see all line items if needed")
-                lines.append("✏️ Tell me if anything needs correcting")
-                
-                preview_text = "\n".join(lines)
-                send_message(chat_id=chat_id, text=preview_text, settings=settings)
 
             # Record processing event
             db.add(
@@ -330,6 +277,69 @@ def process_invoice_file_task(
                 )
             )
             db.commit()
+
+        # --- PHASE 5: Send response message (after DB committed) ---
+        if status == "awaiting_supplier":
+            send_message(
+                chat_id=chat_id,
+                text="What supplier is this invoice from?",
+                settings=settings,
+            )
+        elif status == "awaiting_currency":
+            send_message(
+                chat_id=chat_id,
+                text="What currency is this invoice in? (e.g., USD, EUR)",
+                settings=settings,
+            )
+        else:
+            # Format and send preview message with summary
+            line_items = extracted_data.get("line_items", [])
+            total_items = len(line_items)
+
+            lines = ["📄 **Invoice Extracted**\n"]
+            lines.append(f"**Supplier:** {supplier_name}")
+
+            # Show contact info if available
+            contact_name = extracted_data.get("contact_name")
+            contact_email = extracted_data.get("contact_email")
+            contact_phone = extracted_data.get("contact_phone")
+            if contact_name:
+                lines.append(f"**Contact:** {contact_name}")
+            if contact_email:
+                lines.append(f"**Email:** {contact_email}")
+            if contact_phone:
+                lines.append(f"**Phone:** {contact_phone}")
+
+            lines.append(f"**Invoice #:** {extracted_data.get('invoice_number', 'N/A')}")
+            lines.append(f"**Date:** {extracted_data.get('invoice_date', 'N/A')}")
+            due_date = extracted_data.get('due_date')
+            if due_date:
+                lines.append(f"**Due Date:** {due_date}")
+            lines.append(f"**Currency:** {currency}")
+            lines.append(f"**Total:** {currency} {extracted_data.get('total', 'N/A')}")
+            lines.append(f"**Line Items:** {total_items}")
+
+            # Show sample of line items (first 10 for invoices)
+            sample_size = min(10, total_items)
+            if sample_size > 0:
+                lines.append(f"\n**Line Items ({sample_size} of {total_items}):**")
+                for i, item in enumerate(line_items[:sample_size], 1):
+                    desc = item.get("description_raw", item.get("description", "N/A"))
+                    qty = item.get("quantity", "N/A")
+                    unit = item.get("unit", "")
+                    total = item.get("line_total", "N/A")
+                    lines.append(f"  {i}. {desc} - {qty} {unit} = {currency} {total}")
+
+                if total_items > sample_size:
+                    lines.append(f"  ... and {total_items - sample_size} more items")
+
+            lines.append("\n---")
+            lines.append("✅ Say **/confirm** to save this invoice")
+            lines.append("❓ Ask to see all line items if needed")
+            lines.append("✏️ Tell me if anything needs correcting")
+
+            preview_text = "\n".join(lines)
+            send_message(chat_id=chat_id, text=preview_text, settings=settings)
 
     except Exception as exc:
         logger.exception(
@@ -363,7 +373,15 @@ def process_price_list_file_task(
     user_id: str,
     session_id: str | None = None,
 ) -> None:
-    """Process a price list file: extract data, match products, store in staging."""
+    """Process a price list file: extract data, match products, store in staging.
+
+    IMPORTANT: This task is structured to avoid idle-in-transaction timeout.
+    1. Query Telegram message metadata (short-lived session, closes immediately)
+    2. Download file (no DB needed)
+    3. Extract data via LLM (no DB needed - can take minutes)
+    4. Record telemetry (uses its own session)
+    5. Write to DB (new session, opened only when ready to write)
+    """
     task_id = _get_task_id()
     logger.info(
         "celery_task_started name=process_price_list_file_task task_id=%s restaurant_id=%s file_id=%s",
@@ -378,11 +396,8 @@ def process_price_list_file_task(
     session_uuid = _parse_uuid(session_id) if session_id else None
 
     try:
+        # --- PHASE 1: Get file metadata (short-lived session) ---
         with worker_db_session() as db:
-            # Download file
-            file_bytes = get_file_bytes(file_id=file_id, settings=settings)
-            
-            # Get actual mime type and filename from Telegram message
             telegram_msg = db.scalar(
                 select(TelegramMessages)
                 .where(TelegramMessages.file_id == file_id)
@@ -393,51 +408,57 @@ def process_price_list_file_task(
             if not mime_type:
                 mime_type = "image/jpeg"  # Fallback
             filename = telegram_msg.filename if telegram_msg else None
+        # Session closed here - no transaction held during LLM processing
 
-            # Extract price list data (with DB-aware extraction)
-            try:
-                extracted_data = extract_price_list_data(file_bytes, mime_type, settings, db, filename)
+        # --- PHASE 2: Download file (no DB needed) ---
+        file_bytes = get_file_bytes(file_id=file_id, settings=settings)
 
-                # Record telemetry for vision calls (uses fresh session internally)
-                telemetry_results = extracted_data.pop("_telemetry_results", [])
-                if telemetry_results:
+        # --- PHASE 3: Extract data via LLM (no DB needed, can take minutes) ---
+        try:
+            extracted_data = extract_price_list_data(file_bytes, mime_type, settings, filename)
+
+            # Record telemetry for vision calls (uses fresh session internally)
+            telemetry_results = extracted_data.pop("_telemetry_results", [])
+            if telemetry_results:
+                _record_vision_telemetry(
+                    session_uuid=session_uuid,
+                    chat_id=chat_id,
+                    telemetry_results=telemetry_results,
+                    purpose_base="vision_price_list",
+                    processing_type="price_list",
+                )
+        except Exception as exc:
+            # Record error telemetry if possible (uses fresh session internally)
+            if session_uuid:
+                try:
+                    model, _, _ = _get_vision_settings(settings)
+                    error_result = VisionCallResult(
+                        content="",
+                        model=model,
+                        latency_ms=0,
+                        usage=None,
+                        openrouter_generation_id=None,
+                        response_headers={},
+                        response_data={},
+                        error=f"Price list extraction failed: {exc}",
+                    )
                     _record_vision_telemetry(
                         session_uuid=session_uuid,
                         chat_id=chat_id,
-                        telemetry_results=telemetry_results,
+                        telemetry_results=[error_result],
                         purpose_base="vision_price_list",
                         processing_type="price_list",
                     )
-            except Exception as exc:
-                # Record error telemetry if possible (uses fresh session internally)
-                if session_uuid:
-                    try:
-                        model, _, _ = _get_vision_settings(settings)
-                        error_result = VisionCallResult(
-                            content="",
-                            model=model,
-                            latency_ms=0,
-                            usage=None,
-                            openrouter_generation_id=None,
-                            response_headers={},
-                            response_data={},
-                            error=f"Price list extraction failed: {exc}",
-                        )
-                        _record_vision_telemetry(
-                            session_uuid=session_uuid,
-                            chat_id=chat_id,
-                            telemetry_results=[error_result],
-                            purpose_base="vision_price_list",
-                            processing_type="price_list",
-                        )
-                    except Exception:
-                        logger.exception("failed_to_record_error_telemetry")
-                raise
+                except Exception:
+                    logger.exception("failed_to_record_error_telemetry")
+            raise
 
-            # Check for missing required fields
-            supplier_name = extracted_data.get("supplier_name", "").strip() if extracted_data.get("supplier_name") else ""
-            currency = extracted_data.get("currency", "").strip() if extracted_data.get("currency") else ""
+        # --- PHASE 4: Write to DB (new session, opened only when ready) ---
+        # Check for missing required fields
+        supplier_name = extracted_data.get("supplier_name", "").strip() if extracted_data.get("supplier_name") else ""
+        currency = extracted_data.get("currency", "").strip() if extracted_data.get("currency") else ""
 
+        with worker_db_session() as db:
             # Find or create supplier if not provided
             supplier_uuid = None
             if supplier_id:
@@ -485,73 +506,6 @@ def process_price_list_file_task(
                 status=status,
             )
             db.add(staging)
-            db.commit()
-
-            # Send message based on status
-            if status == "awaiting_supplier":
-                send_message(
-                    chat_id=chat_id,
-                    text="What supplier is this price list from?",
-                    settings=settings,
-                )
-            elif status == "awaiting_currency":
-                send_message(
-                    chat_id=chat_id,
-                    text="What currency is this price list in? (e.g., USD, EUR)",
-                    settings=settings,
-                )
-            else:
-                # Format and send preview message with summary (not all items)
-                items = extracted_data.get("items", [])
-                total_items = len(items)
-                
-                lines = ["📋 **Price List Extracted**\n"]
-                lines.append(f"**Supplier:** {supplier_name}")
-                
-                # Show contact info if available
-                contact_name = extracted_data.get("contact_name")
-                contact_email = extracted_data.get("contact_email")
-                contact_phone = extracted_data.get("contact_phone")
-                if contact_name:
-                    lines.append(f"**Contact:** {contact_name}")
-                if contact_email:
-                    lines.append(f"**Email:** {contact_email}")
-                if contact_phone:
-                    lines.append(f"**Phone:** {contact_phone}")
-                
-                lines.append(f"**Currency:** {currency}")
-                lines.append(f"**Total Items:** {total_items}")
-                
-                # Show effective date if available
-                effective_date = extracted_data.get("effective_date")
-                if effective_date:
-                    lines.append(f"**Effective Date:** {effective_date}")
-                
-                # Show sample of first 5 items
-                sample_size = min(5, total_items)
-                if sample_size > 0:
-                    lines.append(f"\n**Sample Items (first {sample_size} of {total_items}):**")
-                    for i, item in enumerate(items[:sample_size], 1):
-                        name = item.get("supplier_name_raw", item.get("name", "N/A"))
-                        price = item.get("price", "N/A")
-                        pack_size = item.get("pack_size_text", "")
-                        
-                        item_line = f"  {i}. {name}"
-                        if pack_size:
-                            item_line += f" ({pack_size})"
-                        item_line += f" - {currency} {price}"
-                        lines.append(item_line)
-                    
-                    if total_items > sample_size:
-                        lines.append(f"  ... and {total_items - sample_size} more items")
-                
-                lines.append("\n---")
-                lines.append("✅ Say **/confirm** to save all items to your database")
-                lines.append("❓ Ask me to show specific items or categories")
-                lines.append("✏️ Tell me if anything needs correcting")
-                
-                preview_text = "\n".join(lines)
-                send_message(chat_id=chat_id, text=preview_text, settings=settings)
 
             # Record processing event
             db.add(
@@ -566,6 +520,72 @@ def process_price_list_file_task(
                 )
             )
             db.commit()
+
+        # --- PHASE 5: Send response message (after DB committed) ---
+        if status == "awaiting_supplier":
+            send_message(
+                chat_id=chat_id,
+                text="What supplier is this price list from?",
+                settings=settings,
+            )
+        elif status == "awaiting_currency":
+            send_message(
+                chat_id=chat_id,
+                text="What currency is this price list in? (e.g., USD, EUR)",
+                settings=settings,
+            )
+        else:
+            # Format and send preview message with summary (not all items)
+            items = extracted_data.get("items", [])
+            total_items = len(items)
+
+            lines = ["📋 **Price List Extracted**\n"]
+            lines.append(f"**Supplier:** {supplier_name}")
+
+            # Show contact info if available
+            contact_name = extracted_data.get("contact_name")
+            contact_email = extracted_data.get("contact_email")
+            contact_phone = extracted_data.get("contact_phone")
+            if contact_name:
+                lines.append(f"**Contact:** {contact_name}")
+            if contact_email:
+                lines.append(f"**Email:** {contact_email}")
+            if contact_phone:
+                lines.append(f"**Phone:** {contact_phone}")
+
+            lines.append(f"**Currency:** {currency}")
+            lines.append(f"**Total Items:** {total_items}")
+
+            # Show effective date if available
+            effective_date = extracted_data.get("effective_date")
+            if effective_date:
+                lines.append(f"**Effective Date:** {effective_date}")
+
+            # Show sample of first 5 items
+            sample_size = min(5, total_items)
+            if sample_size > 0:
+                lines.append(f"\n**Sample Items (first {sample_size} of {total_items}):**")
+                for i, item in enumerate(items[:sample_size], 1):
+                    name = item.get("supplier_name_raw", item.get("name", "N/A"))
+                    price = item.get("price", "N/A")
+                    pack_size = item.get("pack_size_text", "")
+
+                    item_line = f"  {i}. {name}"
+                    if pack_size:
+                        item_line += f" ({pack_size})"
+                    item_line += f" - {currency} {price}"
+                    lines.append(item_line)
+
+                if total_items > sample_size:
+                    lines.append(f"  ... and {total_items - sample_size} more items")
+
+            lines.append("\n---")
+            lines.append("✅ Say **/confirm** to save all items to your database")
+            lines.append("❓ Ask me to show specific items or categories")
+            lines.append("✏️ Tell me if anything needs correcting")
+
+            preview_text = "\n".join(lines)
+            send_message(chat_id=chat_id, text=preview_text, settings=settings)
 
     except Exception as exc:
         logger.exception(
@@ -598,7 +618,15 @@ def process_inventory_photo_task(
     user_id: str,
     session_id: str | None = None,
 ) -> None:
-    """Process an inventory photo: extract data, match products, store in staging."""
+    """Process an inventory photo: extract data, match products, store in staging.
+
+    IMPORTANT: This task is structured to avoid idle-in-transaction timeout.
+    1. Query Telegram message metadata (short-lived session, closes immediately)
+    2. Download file (no DB needed)
+    3. Extract data via LLM (no DB needed - can take minutes)
+    4. Record telemetry (uses its own session)
+    5. Write to DB (new session, opened only when ready to write)
+    """
     task_id = _get_task_id()
     logger.info(
         "celery_task_started name=process_inventory_photo_task task_id=%s restaurant_id=%s file_id=%s",
@@ -613,11 +641,8 @@ def process_inventory_photo_task(
     session_uuid = _parse_uuid(session_id) if session_id else None
 
     try:
+        # --- PHASE 1: Get file metadata (short-lived session) ---
         with worker_db_session() as db:
-            # Download file
-            file_bytes = get_file_bytes(file_id=file_id, settings=settings)
-            
-            # Get actual mime type and filename from Telegram message
             telegram_msg = db.scalar(
                 select(TelegramMessages)
                 .where(TelegramMessages.file_id == file_id)
@@ -628,50 +653,56 @@ def process_inventory_photo_task(
             if not mime_type:
                 mime_type = "image/jpeg"  # Fallback
             filename = telegram_msg.filename if telegram_msg else None
+        # Session closed here - no transaction held during LLM processing
 
-            # Extract inventory data (with DB-aware extraction)
-            try:
-                extracted_data = extract_inventory_data(file_bytes, mime_type, settings, db, filename)
+        # --- PHASE 2: Download file (no DB needed) ---
+        file_bytes = get_file_bytes(file_id=file_id, settings=settings)
 
-                # Record telemetry for vision calls (uses fresh session internally)
-                telemetry_results = extracted_data.pop("_telemetry_results", [])
-                if telemetry_results:
+        # --- PHASE 3: Extract data via LLM (no DB needed, can take minutes) ---
+        try:
+            extracted_data = extract_inventory_data(file_bytes, mime_type, settings, filename)
+
+            # Record telemetry for vision calls (uses fresh session internally)
+            telemetry_results = extracted_data.pop("_telemetry_results", [])
+            if telemetry_results:
+                _record_vision_telemetry(
+                    session_uuid=session_uuid,
+                    chat_id=chat_id,
+                    telemetry_results=telemetry_results,
+                    purpose_base="vision_inventory",
+                    processing_type="inventory",
+                )
+        except Exception as exc:
+            # Record error telemetry if possible (uses fresh session internally)
+            if session_uuid:
+                try:
+                    model, _, _ = _get_vision_settings(settings)
+                    error_result = VisionCallResult(
+                        content="",
+                        model=model,
+                        latency_ms=0,
+                        usage=None,
+                        openrouter_generation_id=None,
+                        response_headers={},
+                        response_data={},
+                        error=f"Inventory extraction failed: {exc}",
+                    )
                     _record_vision_telemetry(
                         session_uuid=session_uuid,
                         chat_id=chat_id,
-                        telemetry_results=telemetry_results,
+                        telemetry_results=[error_result],
                         purpose_base="vision_inventory",
                         processing_type="inventory",
                     )
-            except Exception as exc:
-                # Record error telemetry if possible (uses fresh session internally)
-                if session_uuid:
-                    try:
-                        model, _, _ = _get_vision_settings(settings)
-                        error_result = VisionCallResult(
-                            content="",
-                            model=model,
-                            latency_ms=0,
-                            usage=None,
-                            openrouter_generation_id=None,
-                            response_headers={},
-                            response_data={},
-                            error=f"Inventory extraction failed: {exc}",
-                        )
-                        _record_vision_telemetry(
-                            session_uuid=session_uuid,
-                            chat_id=chat_id,
-                            telemetry_results=[error_result],
-                            purpose_base="vision_inventory",
-                            processing_type="inventory",
-                        )
-                    except Exception:
-                        logger.exception("failed_to_record_error_telemetry")
-                raise
+                except Exception:
+                    logger.exception("failed_to_record_error_telemetry")
+            raise
 
-            # No longer matching product aliases - we store raw names and search when user asks
-            alias_matches = {}
+        # --- PHASE 4: Write to DB (new session, opened only when ready) ---
+        # No longer matching product aliases - we store raw names and search when user asks
+        alias_matches = {}
 
+        with worker_db_session() as db:
             # Create staging record (no document for inventory photos)
             staging = FileProcessingStaging(
                 restaurant_id=restaurant_uuid,
@@ -683,35 +714,6 @@ def process_inventory_photo_task(
                 status="pending_review",
             )
             db.add(staging)
-            db.commit()
-
-            # Format and send preview message with summary
-            items = extracted_data.get("items", [])
-            total_items = len(items)
-            
-            lines = ["📸 **Inventory Extracted**\n"]
-            lines.append(f"**Items Detected:** {total_items}")
-            
-            # Show sample of items (first 10 for inventory)
-            sample_size = min(10, total_items)
-            if sample_size > 0:
-                lines.append(f"\n**Items ({sample_size} of {total_items}):**")
-                for i, item in enumerate(items[:sample_size], 1):
-                    product_name = item.get("product_name", "N/A")
-                    quantity = item.get("quantity", "N/A")
-                    unit = item.get("unit", "")
-                    lines.append(f"  {i}. {product_name} - {quantity} {unit}")
-                
-                if total_items > sample_size:
-                    lines.append(f"  ... and {total_items - sample_size} more items")
-            
-            lines.append("\n---")
-            lines.append("✅ Say **/confirm** to save inventory counts")
-            lines.append("❓ Ask to see all items if needed")
-            lines.append("✏️ Tell me if anything needs correcting")
-            
-            preview_text = "\n".join(lines)
-            send_message(chat_id=chat_id, text=preview_text, settings=settings)
 
             # Record processing event
             db.add(
@@ -726,6 +728,34 @@ def process_inventory_photo_task(
                 )
             )
             db.commit()
+
+        # --- PHASE 5: Send response message (after DB committed) ---
+        items = extracted_data.get("items", [])
+        total_items = len(items)
+
+        lines = ["📸 **Inventory Extracted**\n"]
+        lines.append(f"**Items Detected:** {total_items}")
+
+        # Show sample of items (first 10 for inventory)
+        sample_size = min(10, total_items)
+        if sample_size > 0:
+            lines.append(f"\n**Items ({sample_size} of {total_items}):**")
+            for i, item in enumerate(items[:sample_size], 1):
+                product_name = item.get("product_name", "N/A")
+                quantity = item.get("quantity", "N/A")
+                unit = item.get("unit", "")
+                lines.append(f"  {i}. {product_name} - {quantity} {unit}")
+
+            if total_items > sample_size:
+                lines.append(f"  ... and {total_items - sample_size} more items")
+
+        lines.append("\n---")
+        lines.append("✅ Say **/confirm** to save inventory counts")
+        lines.append("❓ Ask to see all items if needed")
+        lines.append("✏️ Tell me if anything needs correcting")
+
+        preview_text = "\n".join(lines)
+        send_message(chat_id=chat_id, text=preview_text, settings=settings)
 
     except Exception as exc:
         logger.exception(

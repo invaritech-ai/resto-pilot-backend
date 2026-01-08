@@ -10,6 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.ai.db_schema import get_table_schema
+# Note: Session import kept for match_product_aliases which still uses db
 from app.ai.openai_client import OpenAIError, chat_completions_create_with_http_info
 from app.ai.openrouter_generation import extract_openrouter_generation_id
 from app.ai.openrouter_usage import extract_openrouter_usage
@@ -92,18 +93,19 @@ def extract_invoice_data(
     file_bytes: bytes,
     mime_type: str,
     settings: Settings,
-    db: Session,
     filename: str | None = None,
     source_page: int | None = None,
 ) -> dict[str, Any]:
     """
     Extract structured invoice data from a file using vision model.
 
+    This function does NOT require a database session - schema info is read
+    from SQLAlchemy model metadata, not from the database.
+
     Args:
         file_bytes: File bytes (image or PDF)
         mime_type: MIME type of the file
         settings: Application settings
-        db: Database session for schema access
         filename: Optional filename
         source_page: Optional page number (for multi-page PDFs)
 
@@ -230,18 +232,19 @@ def extract_price_list_data(
     file_bytes: bytes,
     mime_type: str,
     settings: Settings,
-    db: Session,
     filename: str | None = None,
     source_page: int | None = None,
 ) -> dict[str, Any]:
     """
     Extract structured price list data from a file using vision model.
 
+    This function does NOT require a database session - schema info is read
+    from SQLAlchemy model metadata, not from the database.
+
     Args:
         file_bytes: File bytes (image, PDF, CSV, XLSX)
         mime_type: MIME type of the file
         settings: Application settings
-        db: Database session for schema access
         filename: Optional filename
         source_page: Optional page number (for multi-page PDFs)
 
@@ -370,18 +373,19 @@ def extract_inventory_data(
     file_bytes: bytes,
     mime_type: str,
     settings: Settings,
-    db: Session,
     filename: str | None = None,
     source_page: int | None = None,
 ) -> dict[str, Any]:
     """
     Extract structured inventory data from a photo using vision model.
 
+    This function does NOT require a database session - schema info is read
+    from SQLAlchemy model metadata, not from the database.
+
     Args:
         file_bytes: Image file bytes
         mime_type: MIME type of the file
         settings: Application settings
-        db: Database session for schema access
         filename: Optional filename
         source_page: Optional page number (for multi-page PDFs)
 
