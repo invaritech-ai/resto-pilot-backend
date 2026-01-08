@@ -14,13 +14,12 @@ This doc captures the current agreed direction for ingesting Telegram messages/f
 - `chat_id` equals the user’s `telegram_id` for private chats; session key is effectively per-user.
 - We are not fixating on “sending files back” yet; but workers will send simple status messages (e.g., “processing now”).
 - Celery is the worker system; the broker can be Redis/Upstash or AWS SQS.
+- Vision model configuration uses `APP_VISION_MODEL`/`APP_VISION_API_KEY`/`APP_VISION_BASE_URL`.
 
 ## Supported upload types (expected)
-- Images (photo/document)
-- PDFs
-- CSV
-- XLS/XLSX
-- TXT
+- Images (photo/document) - supported now
+- PDFs - not yet supported by vision processing (needs PDF -> image conversion)
+- CSV/XLS/XLSX/TXT - planned (parser stage not implemented yet)
 
 Examples of user intent (non-exhaustive):
 - Inventory photos (walk-in/freezer for item detection)
@@ -42,7 +41,7 @@ Workers obtain bytes by:
 2) GET `https://api.telegram.org/file/bot<TOKEN>/<file_path>` to download bytes
 
 ## User “extra details” and commands
-Free text is always supported. Optional, fast “session hint” commands are allowed and sticky within the current session:
+Free text is always supported. Optional “session hint” commands are allowed and sticky within the current session:
 - `/invoice` (invoices/receipts/delivery notes)
 - `/inventory` (inventory scene photos)
 - `/prices` (vendor price lists: pdf/csv/xls/xlsx)
@@ -105,6 +104,11 @@ Two core task types:
 - Execute processing sequentially per file or as mini-batches based on router output.
 - Persist processing results and status transitions.
 
+Current file-processing tasks (implemented):
+- `process_invoice_file_task`: extracts invoice data, creates `documents` + `file_processing_staging`, sends preview
+- `process_price_list_file_task`: extracts price list data, creates `documents` + `file_processing_staging`, sends preview
+- `process_inventory_photo_task`: extracts inventory data, creates `file_processing_staging`, sends preview
+
 ## Reserved (“instant”) commands
 Some commands should bypass batching and trigger immediate behavior (currently: `/start`, `/respond`, `/done`).
 These commands are still persisted in `telegram_messages` for auditability, but they do not wait for the normal idle flush window.
@@ -122,13 +126,16 @@ Output: “RoutingPlan”
 
 ## Processing pipeline sketch (by category)
 Invoice/delivery docs:
-- Download → normalize (orientation/format) → OCR → extract structured fields → persist
+- Download → vision extract → write `documents` + `file_processing_staging` → preview → confirm → write to `invoices` + `invoice_line_items`
+  - Review is member-accessible; confirm is owner-only.
 
 Inventory scene photos:
-- Download → normalize → object/item detection → persist detections + confidence
+- Download → vision extract → write `file_processing_staging` → preview → confirm → write to inventory tables (planned)
+  - Review is member-accessible; confirm is owner-only.
 
 Vendor price lists (pdf/csv/xls/xlsx/txt):
-- Download → parse/normalize to table → map columns → persist vendor catalog updates
+- Download → vision extract (images only) → write `documents` + `file_processing_staging` → preview → confirm → write supplier catalog updates (planned)
+  - Review is member-accessible; confirm is owner-only.
 
 Recipes/menu:
 - Download → OCR/extract → structured recipe/menu candidates → persist (likely needs review)

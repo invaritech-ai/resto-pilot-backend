@@ -4,8 +4,8 @@
 
 The database tools system provides intent-based operations for the AI agent. It follows a clear separation:
 
-- **Tools = Capabilities**: What operations can be performed (create restaurant, list staff, etc.)
-- **Policies = Filtering**: Who can perform those operations (owners vs staff, restaurant-scoped access, etc.)
+- **Tools = Operations**: What can be done (create restaurant, list staff, etc.)
+- **Policies = Filtering**: Who can do it (owners vs staff, restaurant-scoped access, etc.)
 
 ## Architecture
 
@@ -32,7 +32,7 @@ The database tools system provides intent-based operations for the AI agent. It 
 - Complex tables with multiple permission levels
 - When you want centralized policy management in `db_allowlist.py`
 - When permissions might change frequently or have complex scoping
-- Examples: Future `inventory_items`, `suppliers`, `pricing`, `costs`, `wastage`
+- Examples: `suppliers`, `supplier_prices`, `inventory_batches`, `file_processing_staging`
 
 ## Current Tool Structure
 
@@ -43,7 +43,12 @@ app/ai/db_tools/
 ├── profile.py           # Profile tools (uses direct checks)
 ├── restaurants.py       # Restaurant tools (uses direct checks)
 ├── staff.py             # Staff management (uses direct checks)
-└── invites.py           # Invite codes (uses direct checks)
+├── invites.py           # Invite codes (uses direct checks)
+├── products.py          # Product catalog tools
+├── suppliers.py         # Supplier tools
+├── inventory.py         # Inventory batches + movements
+├── product_aliases.py   # Alias management + match confirmation
+└── file_processing.py   # Invoice/price list/inventory file processing
 ```
 
 ## Pattern: Simple Tool (Direct Checks)
@@ -75,13 +80,13 @@ For complex tables, use policy checks for centralized management:
 # app/ai/db_tools/inventory.py
 from .base import check_policy_permission
 
-def update_inventory_item(args: dict[str, Any]) -> str:
+def update_inventory_batch(args: dict[str, Any]) -> str:
     restaurant_id_str = args.get("restaurant_id", "").strip()
     # ... validation ...
     
-    # Policy check: Is this role allowed to update inventory?
+    # Policy check: Is this role allowed to update inventory batches?
     allowed, error = check_policy_permission(
-        table="inventory_items",
+        table="inventory_batches",
         crud="update",
         actor_role=actor_role,
         restaurant_id=restaurant_id_str,
@@ -94,6 +99,9 @@ def update_inventory_item(args: dict[str, Any]) -> str:
 ```
 
 **When to use**: Complex permissions, multiple roles, centralized policy management.
+
+Note: Some existing tools still use direct checks even for complex tables. Use
+policy checks when you want centralized control via `db_allowlist.py`.
 
 ## Adding New Tools
 
@@ -128,15 +136,15 @@ def create_inventory_tools(
 ) -> dict[str, Tool]:
     """Create inventory management tools."""
 
-    def list_inventory_items(args: dict[str, Any]) -> str:
-        """List inventory items for a restaurant."""
+    def list_inventory(args: dict[str, Any]) -> str:
+        """List inventory batches for a restaurant."""
         restaurant_id_str = args.get("restaurant_id", "").strip()
         if not restaurant_id_str:
             return "Error: restaurant_id is required."
         
         # Check policy
         allowed, error = check_policy_permission(
-            table="inventory_items",
+            table="inventory_batches",
             crud="read",
             actor_role=actor_role or "staff",
             restaurant_id=restaurant_id_str,
@@ -149,11 +157,11 @@ def create_inventory_tools(
         return json.dumps([...], indent=2)
 
     return {
-        "list_inventory_items": Tool(
-            name="list_inventory_items",
-            description="List inventory items for a restaurant.",
+        "list_inventory": Tool(
+            name="list_inventory",
+            description="List inventory batches for a restaurant.",
             parameters={...},
-            handler=list_inventory_items,
+            handler=list_inventory,
         ),
     }
 ```
@@ -165,22 +173,22 @@ Update `app/policies/db_allowlist.py`:
 ```python
 ROLE_OWNER: {
     # ... existing tables ...
-    "inventory_items": {
+    "inventory_batches": {
         "read": {
-            "columns": ["id", "name", "quantity", "unit", "restaurant_id"],
-            "scope": SCOPE_RESTAURANT_OWNER,
+            "columns": ["id", "restaurant_id", "product_id", "quantity", "unit", "status"],
+            "scope": SCOPE_RESTAURANT_MEMBER,
         },
         "update": {
-            "columns": ["name", "quantity", "unit"],
-            "scope": SCOPE_RESTAURANT_OWNER,
+            "columns": ["quantity", "status"],
+            "scope": SCOPE_RESTAURANT_MEMBER,
         },
     },
 },
 ROLE_STAFF: {
     # ... existing tables ...
-    "inventory_items": {
+    "inventory_batches": {
         "read": {
-            "columns": ["id", "name", "quantity", "unit"],
+            "columns": ["id", "restaurant_id", "product_id", "quantity", "unit", "status"],
             "scope": SCOPE_RESTAURANT_MEMBER,
         },
     },
@@ -242,7 +250,7 @@ if not is_restaurant_owner(db, user_id, restaurant_id):
 ```python
 # Policy automatically handles role-based access
 allowed, error = check_policy_permission(
-    table="inventory_items",
+    table="inventory_batches",
     crud="update",  # Policy will check if staff can update
     actor_role=actor_role,
     restaurant_id=restaurant_id_str,
@@ -284,27 +292,50 @@ allowed, error = check_policy_permission(
 | `get_my_profile` | Direct (self-scoped) | Simple, always self |
 | `update_my_profile` | Direct (self-scoped) | Simple, always self |
 | `list_my_restaurants` | Direct | Simple membership check |
+| `find_restaurant_by_name` | Direct | Simple membership check |
 | `create_restaurant` | Direct | Anyone can create |
+| `get_restaurant` | Direct (`has_restaurant_access`) | Simple membership check |
 | `update_restaurant` | Direct (`is_restaurant_owner`) | Simple ownership check |
 | `list_staff` | Direct (`has_restaurant_access`) | Simple membership check |
 | `revoke_staff_access` | Direct (`is_restaurant_owner`) | Simple ownership check |
 | `create_invite_code` | Direct (`is_restaurant_owner`) | Simple ownership check |
+| `list_invite_codes` | Direct (`is_restaurant_owner`) | Simple ownership check |
+| `delete_invite_code` | Direct (`is_restaurant_owner`) | Simple ownership check |
+| `list_products` | Direct (`has_restaurant_access`) | Simple membership check |
+| `create_product` | Direct (`is_restaurant_owner`) | Simple ownership check |
+| `update_product` | Direct (`is_restaurant_owner`) | Simple ownership check |
+| `find_product_by_name` | Direct (`has_restaurant_access`) | Simple membership check |
+| `list_suppliers` | Direct (`has_restaurant_access`) | Simple membership check |
+| `create_supplier` | Direct (`is_restaurant_owner`) | Simple ownership check |
+| `get_supplier` | Direct (`has_restaurant_access`) | Simple membership check |
+| `update_supplier` | Direct (`is_restaurant_owner`) | Simple ownership check |
+| `list_inventory` | Direct (`has_restaurant_access`) | Simple membership check |
+| `get_inventory_batch` | Direct (`has_restaurant_access`) | Simple membership check |
+| `create_inventory_movement` | Direct (`has_restaurant_access`) | Simple membership check |
+| `list_product_aliases` | Direct (`has_restaurant_access`) | Simple membership check |
+| `create_product_alias` | Direct (`is_restaurant_owner`) | Simple ownership check |
+| `confirm_product_alias_match` | Direct (`has_restaurant_access`) | Simple membership check |
+| `process_invoice_file` | Direct (`has_restaurant_access`) | Async processing, member access |
+| `process_price_list_file` | Direct (`has_restaurant_access`) | Async processing, member access |
+| `process_inventory_photo` | Direct (`has_restaurant_access`) | Async processing, member access |
+| `review_file_processing` | Direct (`has_restaurant_access`) | Review extracted data |
+| `update_file_processing_data` | Direct (`has_restaurant_access`) | Edit staging before confirm |
+| `confirm_file_processing` | Direct (`is_restaurant_owner`) | Owner-only confirmation |
 
 ## Future Tools (Recommended Patterns)
 
 | Tool | Recommended Pattern | Reason |
 |------|---------------------|--------|
-| `inventory_items` | Policy check | Complex, multiple roles, centralized management |
-| `suppliers` | Policy check | Complex relationships, restaurant-scoped |
-| `pricing` | Policy check | Complex business rules, role-based access |
-| `costs` | Policy check | Financial data, strict permissions |
-| `wastage` | Policy check | Analytics, role-based reporting |
+| `supplier_prices` | Policy check | Complex business rules, role-based access |
+| `price_comparisons` | Policy check | Cross-table pricing validation |
+| `supplier_disputes` | Policy check | Dispute workflows, role-based access |
+| `invoices` | Policy check | Financial data, strict permissions |
+| `file_processing_staging` | Policy check | Review/confirm workflows |
 
 ## Summary
 
-- **Tools define capabilities** (what can be done)
+- **Tools define operations** (what can be done)
 - **Policies define filtering** (who can do it)
 - **Direct checks** for simple operations
 - **Policy checks** for complex, centralized management
 - Both systems work together - choose the right tool for the job
-

@@ -17,7 +17,7 @@ This document verifies that **every LLM generation is tracked** for cost attribu
 
 **Status**: ✅ **FULLY TRACKED**
 
-- **Every round** of the agent loop (up to 8 rounds) is recorded individually
+- **Every round** of the agent loop (up to 8 rounds by default) is recorded individually
 - **Purpose**: `agent_round_N_tool` or `agent_round_N_final` (where N is round number)
 - **Tracking**: 
   - Each LLM call recorded via `record_llm_call()` at line 231
@@ -137,6 +137,15 @@ if generation_id:
 - **Coverage**: 100% - tracks both cases (silence and actual ack)
 
 **Code Pattern**: Same as session ack above, with `purpose="ack_message"`
+
+### ⚠️ 6. Vision File Processing (`app/ai/vision_client.py`)
+
+**Location**: `process_document_with_vision()` / `process_image_with_vision()`
+
+**Status**: ⚠️ **NOT TRACKED**
+
+Vision extraction calls used by invoice/price list/inventory processing are not currently
+recorded in `llm_calls`. If cost attribution is required, add telemetry around these calls.
 
 ## Cost Backfill Coverage
 
@@ -288,4 +297,3 @@ ORDER BY total_cost_usd DESC;
 - [x] All calls have purpose field
 - [x] All calls have usage/token data
 - [x] Error cases handled correctly (no tracking for failed calls)
-
