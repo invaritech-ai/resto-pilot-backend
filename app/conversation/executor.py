@@ -51,6 +51,7 @@ class UserContext:
     pending_params: list[str] = field(default_factory=list)
     collected_params: dict[str, Any] = field(default_factory=dict)
     active_restaurant_id: str | None = None
+    active_supplier_id: str | None = None
     staging_id: str | None = None  # For file processing
 
     def to_dict(self) -> dict[str, Any]:
@@ -59,6 +60,7 @@ class UserContext:
             "pending_params": self.pending_params,
             "collected_params": self.collected_params,
             "active_restaurant_id": self.active_restaurant_id,
+            "active_supplier_id": self.active_supplier_id,
             "staging_id": self.staging_id,
         }
 
@@ -71,6 +73,7 @@ class UserContext:
             pending_params=data.get("pending_params", []),
             collected_params=data.get("collected_params", {}),
             active_restaurant_id=data.get("active_restaurant_id"),
+            active_supplier_id=data.get("active_supplier_id"),
             staging_id=data.get("staging_id"),
         )
 
@@ -307,6 +310,9 @@ def execute_intent(
     if intent == Intent.UPDATE_PHONE:
         return _execute_update_phone(db, user, params, context)
 
+    if intent == Intent.UPLOAD_PRICE_LIST:
+        return _execute_upload_price_list(db, user, params, context)
+
     # Outlet intents
     if intent == Intent.LIST_OUTLETS:
         return _execute_list_outlets(db, user)
@@ -456,6 +462,91 @@ def _execute_update_phone(
         db.rollback()
         logger.exception("update_phone_failed", extra={"error": str(e)})
         return ExecutionResult(response=responses.PROFILE_UPDATE_ERROR, success=False)
+
+
+# =============================================================================
+# FILE UPLOAD HANDLERS
+# =============================================================================
+
+
+def _execute_upload_price_list(
+    db: Session,
+    user: User,
+    params: dict[str, Any],
+    context: UserContext,
+) -> ExecutionResult:
+    supplier_id_raw = (
+        params.get("supplier_id")
+        or params.get("supplier")
+        or params.get("supplier_name")
+        or params.get("name")
+    )
+    if not supplier_id_raw and context.active_supplier_id:
+        supplier_id_raw = context.active_supplier_id
+
+    restaurant_id = context.active_restaurant_id
+    if not restaurant_id:
+        restaurants = _get_user_restaurants(db, user.id)
+        if len(restaurants) == 1:
+            restaurant_id = restaurants[0]["id"]
+        elif restaurants:
+            return ExecutionResult(
+                response=responses.outlet_select_prompt(restaurants),
+                needs_input=True,
+                context_update={
+                    "active_operation": Intent.UPLOAD_PRICE_LIST.value,
+                    "pending_params": ["restaurant_id"],
+                    "collected_params": params,
+                },
+            )
+
+    supplier_id: str | None = None
+    supplier_name: str | None = None
+
+    if supplier_id_raw:
+        raw_value = str(supplier_id_raw).strip()
+        if _safe_uuid(raw_value):
+            supplier_id = raw_value
+        else:
+            supplier_name = raw_value
+
+    if supplier_id is None and supplier_name and restaurant_id:
+        supplier_id = _resolve_supplier_id(db, restaurant_id, supplier_name)
+
+    supplier = None
+    if supplier_id:
+        supplier = db.get(Suppliers, uuid.UUID(supplier_id))
+        if supplier:
+            restaurant_id = str(supplier.restaurant_id)
+
+    if not supplier:
+        prompt = responses.FILE_MISSING_SUPPLIER
+        return ExecutionResult(
+            response=prompt,
+            needs_input=True,
+            context_update={
+                "active_operation": Intent.UPLOAD_PRICE_LIST.value,
+                "pending_params": ["supplier_id"],
+                "collected_params": {
+                    **params,
+                    "restaurant_id": restaurant_id,
+                },
+            },
+        )
+
+    return ExecutionResult(
+        response=responses.FILE_UPLOAD_PRICE_LIST_PROMPT.format(supplier=supplier.name),
+        needs_input=True,
+        context_update={
+            "active_operation": Intent.UPLOAD_PRICE_LIST.value,
+            "pending_params": ["file_id"],
+            "collected_params": {
+                "supplier_id": str(supplier.id),
+            },
+            "active_restaurant_id": restaurant_id,
+            "active_supplier_id": str(supplier.id),
+        },
+    )
 
 
 # =============================================================================
@@ -850,7 +941,11 @@ def _execute_add_supplier(
 
         return ExecutionResult(
             response=responses.SUPPLIER_CREATED.format(name=name),
-            context_update={"clear": True, "active_restaurant_id": restaurant_id},
+            context_update={
+                "clear": True,
+                "active_restaurant_id": restaurant_id,
+                "active_supplier_id": str(supplier.id),
+            },
         )
     except Exception as e:
         db.rollback()
@@ -865,6 +960,8 @@ def _execute_update_supplier(
     context: UserContext,
 ) -> ExecutionResult:
     supplier_id_raw = params.get("supplier_id", "").strip() if params.get("supplier_id") else ""
+    if not supplier_id_raw and context.active_supplier_id:
+        supplier_id_raw = context.active_supplier_id
     if not supplier_id_raw:
         return ExecutionResult(
             response=get_missing_param_prompt(Intent.UPDATE_SUPPLIER, "supplier_id"),
@@ -922,7 +1019,7 @@ def _execute_update_supplier(
         db.commit()
         return ExecutionResult(
             response=responses.SUPPLIER_UPDATED.format(name=name),
-            context_update={"clear": True},
+            context_update={"clear": True, "active_supplier_id": str(supplier.id)},
         )
     except Exception as e:
         db.rollback()
@@ -937,6 +1034,8 @@ def _execute_view_supplier(
     context: UserContext,
 ) -> ExecutionResult:
     supplier_id_raw = params.get("supplier_id", "").strip() if params.get("supplier_id") else ""
+    if not supplier_id_raw and context.active_supplier_id:
+        supplier_id_raw = context.active_supplier_id
     if not supplier_id_raw:
         return ExecutionResult(
             response=get_missing_param_prompt(Intent.VIEW_SUPPLIER, "supplier_id"),
@@ -975,7 +1074,8 @@ def _execute_view_supplier(
             "currency": supplier.currency,
             "lead_time_days": supplier.lead_time_days,
             "notes": supplier.notes,
-        })
+        }),
+        context_update={"active_supplier_id": str(supplier.id)},
     )
 
 
@@ -987,6 +1087,8 @@ def _execute_view_supplier_price_list(
 ) -> ExecutionResult:
     """View supplier's current price list."""
     supplier_id_raw = params.get("supplier_id", "").strip() if params.get("supplier_id") else ""
+    if not supplier_id_raw and context.active_supplier_id:
+        supplier_id_raw = context.active_supplier_id
     if not supplier_id_raw:
         return ExecutionResult(
             response=get_missing_param_prompt(Intent.VIEW_SUPPLIER_PRICE_LIST, "supplier_id"),
@@ -1047,6 +1149,7 @@ def _execute_view_supplier_price_list(
 
     return ExecutionResult(
         response=responses.supplier_price_list(supplier.name, formatted),
+        context_update={"active_supplier_id": str(supplier.id)},
     )
 
 
@@ -1058,6 +1161,8 @@ def _execute_view_supplier_items(
 ) -> ExecutionResult:
     """View items offered by a supplier."""
     supplier_id_raw = params.get("supplier_id", "").strip() if params.get("supplier_id") else ""
+    if not supplier_id_raw and context.active_supplier_id:
+        supplier_id_raw = context.active_supplier_id
     if not supplier_id_raw:
         return ExecutionResult(
             response=get_missing_param_prompt(Intent.VIEW_SUPPLIER_ITEMS, "supplier_id"),
@@ -1109,6 +1214,7 @@ def _execute_view_supplier_items(
 
     return ExecutionResult(
         response=responses.supplier_items_list(supplier.name, formatted),
+        context_update={"active_supplier_id": str(supplier.id)},
     )
 
 

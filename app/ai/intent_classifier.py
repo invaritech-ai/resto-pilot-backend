@@ -257,6 +257,9 @@ def classify_intent(
     if text_lower in ("/confirm", "confirm", "yes", "looks good", "save", "ok"):
         return ClassifiedIntent(intent=Intent.CONFIRM_UPLOAD, confidence=1.0)
 
+    if any(kw in text_lower for kw in ("price list", "pricelist", "rate card")):
+        return ClassifiedIntent(intent=Intent.UPLOAD_PRICE_LIST, confidence=0.9)
+
     # Build user prompt with context
     user_prompt_parts = []
 

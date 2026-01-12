@@ -93,7 +93,11 @@ def update_context_from_result(
             active_restaurant_id=context_update.get(
                 "active_restaurant_id",
                 context.active_restaurant_id,
-            )
+            ),
+            active_supplier_id=context_update.get(
+                "active_supplier_id",
+                context.active_supplier_id,
+            ),
         )
         save_context(db, user, new_context)
         return new_context
@@ -107,6 +111,8 @@ def update_context_from_result(
         context.collected_params = context_update["collected_params"]
     if "active_restaurant_id" in context_update:
         context.active_restaurant_id = context_update["active_restaurant_id"]
+    if "active_supplier_id" in context_update:
+        context.active_supplier_id = context_update["active_supplier_id"]
     if "staging_id" in context_update:
         context.staging_id = context_update["staging_id"]
 
@@ -145,6 +151,20 @@ def get_context_for_classifier(
                 result["hint"] = (
                     f"User is currently working with outlet '{restaurant.name}'. Use this as restaurant_id if not specified."
                 )
+        except (ValueError, AttributeError):
+            pass
+
+    if context.active_supplier_id and db:
+        from app.db.models.suppliers import Suppliers
+        import uuid as uuid_mod
+
+        try:
+            supplier = db.get(Suppliers, uuid_mod.UUID(context.active_supplier_id))
+            if supplier:
+                result["active_supplier"] = {
+                    "id": context.active_supplier_id,
+                    "name": supplier.name,
+                }
         except (ValueError, AttributeError):
             pass
 

@@ -397,6 +397,8 @@ FILE_MISSING_SUPPLIER = "What supplier is this from?"
 
 FILE_MISSING_CURRENCY = "What currency is this in? (e.g., USD, EUR, INR)"
 
+FILE_UPLOAD_PRICE_LIST_PROMPT = "Please upload the price list file for {supplier}."
+
 
 # =============================================================================
 # ERRORS

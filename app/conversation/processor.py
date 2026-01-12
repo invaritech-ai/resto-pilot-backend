@@ -139,6 +139,9 @@ def _build_decision_candidates(
     candidates: dict[str, Any] = {"restaurants": restaurants}
 
     active_restaurant_id = context.active_restaurant_id
+    if not active_restaurant_id and len(restaurants) == 1:
+        active_restaurant_id = restaurants[0]["id"]
+
     if not active_restaurant_id:
         return candidates
 
@@ -447,6 +450,18 @@ def process_message_instant(
 
     # Handle file uploads specially - detect type with vision
     if has_file and file_id:
+        forced_type = None
+        supplier_id_override = None
+        if context.active_operation == Intent.UPLOAD_PRICE_LIST.value:
+            forced_type = "price_list"
+            supplier_id_override = (
+                context.collected_params.get("supplier_id")
+                if isinstance(context.collected_params, dict)
+                else None
+            )
+            if not supplier_id_override:
+                supplier_id_override = context.active_supplier_id
+
         upload_response, upload_intent = _handle_file_upload(
             db=db,
             user=user,
@@ -457,6 +472,8 @@ def process_message_instant(
             settings=settings,
             session_id=session_id,
             chat_id=chat_id,
+            forced_type=forced_type,
+            supplier_id=supplier_id_override,
         )
 
         rendered_text, response_llm_call_id = _render_response_with_llm(
@@ -472,6 +489,17 @@ def process_message_instant(
         final_text = rendered_text or upload_response
 
         user.last_interaction_at = dt.datetime.now(dt.UTC)
+        if context.active_operation == Intent.UPLOAD_PRICE_LIST.value:
+            context = update_context_from_result(
+                db=db,
+                user=user,
+                context=context,
+                context_update={
+                    "clear": True,
+                    "active_restaurant_id": context.active_restaurant_id,
+                    "active_supplier_id": context.active_supplier_id,
+                },
+            )
         db.add(
             ProcessingEvents(
                 session_id=session_id,
@@ -670,6 +698,8 @@ def _handle_file_upload(
     settings: Settings,
     session_id: uuid.UUID,
     chat_id: int,
+    forced_type: str | None = None,
+    supplier_id: str | None = None,
 ) -> tuple[str, Intent]:
     """
     Handle file upload with vision-based type detection.
@@ -692,14 +722,19 @@ def _handle_file_upload(
     # Determine file type from caption/context
     text_lower = (message_text or "").lower()
 
-    is_price_list = any(
+    is_price_list = forced_type == "price_list" or any(
         kw in text_lower
         for kw in ["price list", "pricelist", "prices", "rate card", "catalog"]
     )
-    is_invoice = any(
+    is_invoice = forced_type == "invoice" or any(
         kw in text_lower
         for kw in ["invoice", "bill", "receipt", "challan"]
     )
+
+    if forced_type == "price_list":
+        is_invoice = False
+    elif forced_type == "invoice":
+        is_price_list = False
 
     intent_guess = Intent.UPLOAD_PRICE_LIST if is_price_list else Intent.UPLOAD_INVOICE
 
@@ -732,7 +767,7 @@ def _handle_file_upload(
     task_kwargs = {
         "restaurant_id": restaurant_id,
         "file_id": file_id,
-        "supplier_id": None,
+        "supplier_id": supplier_id,
         "chat_id": chat_id,
         "user_id": str(user.id),
         "session_id": str(session_id),
