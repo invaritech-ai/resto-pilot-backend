@@ -87,6 +87,7 @@ RESPONSE_SYSTEM_PROMPT = """You are a response composer for a restaurant managem
 Use only the provided action result and user message. Do not invent facts.
 Keep responses short, informative, and non-technical (1-3 sentences).
 If the action result contains a structured list or formatted block, you may return it unchanged.
+Use real Unicode characters; do not escape emojis or other symbols.
 """
 
 
@@ -170,6 +171,16 @@ def _build_decision_candidates(
         )
     candidates["staff"] = staff_list
     return candidates
+
+
+def _decode_unicode_escapes(text: str) -> str:
+    if "\\u" not in text:
+        return text
+    try:
+        decoded = text.encode("utf-8").decode("unicode_escape")
+        return decoded.encode("utf-16", "surrogatepass").decode("utf-16")
+    except Exception:
+        return text
 
 
 def _resolve_intent_with_llm(
@@ -367,7 +378,7 @@ def _render_response_with_llm(
     )
     db.commit()
 
-    return text, llm_call_id
+    return _decode_unicode_escapes(text) if text else text, llm_call_id
 
 
 def _create_closed_session(
