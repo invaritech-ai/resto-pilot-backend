@@ -15,13 +15,18 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import uuid
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.conversation import responses
-from app.conversation.processor import ProcessResult, process_message_instant, send_ack_message
+from app.conversation.processor import (
+    ProcessResult,
+    process_message_instant,
+    send_ack_message,
+)
 from app.core.config import Settings
 from app.db.models.processing_events import ProcessingEvents
 from app.db.models.telegram_messages import TelegramMessages
@@ -104,7 +109,7 @@ def _load_recent_history(
 def _create_session_and_message(
     *,
     db: Session,
-    parsed: any,
+    parsed: Any,
     user: User,
 ) -> tuple[TelegramSessions, TelegramMessages]:
     """Create a session and message record for telemetry."""

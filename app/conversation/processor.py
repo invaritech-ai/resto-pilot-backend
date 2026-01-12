@@ -440,6 +440,7 @@ def process_message_instant(
         session_row = _create_closed_session(db, chat_id)
         session_id = session_row.id
         db.commit()
+    assert session_id is not None
 
     # Load user context
     context = load_context(db, user)
