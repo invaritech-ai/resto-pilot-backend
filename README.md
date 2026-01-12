@@ -31,10 +31,25 @@ worker is required for message handling and file processing tasks.
 
 This project uses the Chat Completions endpoint:
 
--   `APP_OPENAI_MODEL`: main model.
--   `APP_OPENAI_GATE_MODEL`: optional cheap model for intent classification and file type detection.
+-   `APP_OPENAI_MODEL`: main fallback model.
+-   `APP_OPENAI_INTENT_MODEL`: intent classification model (overrides gate/main).
+-   `APP_OPENAI_DECISION_MODEL`: decision/grounding model (intent resolution, entity grounding).
+-   `APP_OPENAI_RESPONSE_MODEL`: response composer model (final user-facing text).
+-   `APP_OPENAI_FILE_TYPE_MODEL`: file type detection model.
+-   `APP_OPENAI_REASONING_MODEL`: heavy reasoning model (optional).
+-   `APP_OPENAI_AUDIO_MODEL`: audio model (optional).
+-   `APP_OPENAI_VIDEO_MODEL`: video model (optional).
+-   `APP_OPENAI_GATE_MODEL`: legacy alias for intent/file type (kept for compatibility).
 
 **Telemetry & Cost Tracking**: Every LLM call is recorded in `llm_calls` with `openrouter_generation_id` for cost attribution. Cost backfill is scheduled automatically via Celery tasks to fetch actual costs from OpenRouter.
+
+### Model routing
+
+- Intent classification: `APP_OPENAI_INTENT_MODEL` (falls back to `APP_OPENAI_GATE_MODEL`, then `APP_OPENAI_MODEL`)
+- Intent resolution/grounding: `APP_OPENAI_DECISION_MODEL` (falls back to `APP_OPENAI_REASONING_MODEL`, then `APP_OPENAI_MODEL`)
+- Response generation: `APP_OPENAI_RESPONSE_MODEL` (falls back to `APP_OPENAI_MODEL`)
+- File type detection: `APP_OPENAI_FILE_TYPE_MODEL` (falls back to intent model, then main model)
+- Vision extraction: `APP_VISION_MODEL` (falls back to `APP_OPENAI_MODEL`)
 
 ## Vision model configuration (file processing)
 

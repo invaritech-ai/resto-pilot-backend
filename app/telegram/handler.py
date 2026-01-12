@@ -21,10 +21,11 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.conversation import responses
-from app.conversation.processor import process_message_instant, send_ack_message
+from app.conversation.processor import ProcessResult, process_message_instant, send_ack_message
 from app.core.config import Settings
 from app.db.models.processing_events import ProcessingEvents
 from app.db.models.telegram_messages import TelegramMessages
+from app.db.models.telegram_outgoing_messages import TelegramOutgoingMessages
 from app.db.models.telegram_session import TelegramSessions
 from app.db.models.user import User
 from app.domain.services.user_service import UserService
@@ -49,6 +50,55 @@ def _extract_command_from_update(update: dict) -> tuple[str | None, str | None]:
         message.get("caption") if isinstance(message.get("caption"), str) else None
     )
     return extract_command(text, caption)
+
+
+def _format_incoming_content(message: TelegramMessages) -> str:
+    parts = []
+    if isinstance(message.text, str) and message.text.strip():
+        parts.append(message.text.strip())
+    if isinstance(message.caption, str) and message.caption.strip():
+        parts.append(message.caption.strip())
+    return "\n".join(parts).strip()
+
+
+def _load_recent_history(
+    *,
+    db: Session,
+    chat_id: int,
+    limit: int = 20,
+    before_received_at: dt.datetime | None = None,
+) -> list[dict[str, str]]:
+    incoming_query = select(TelegramMessages).where(TelegramMessages.chat_id == chat_id)
+    if before_received_at is not None:
+        incoming_query = incoming_query.where(
+            TelegramMessages.received_at < before_received_at
+        )
+    incoming = db.scalars(
+        incoming_query.order_by(TelegramMessages.received_at.desc()).limit(limit)
+    ).all()
+
+    outgoing = db.scalars(
+        select(TelegramOutgoingMessages)
+        .where(
+            TelegramOutgoingMessages.chat_id == chat_id,
+            TelegramOutgoingMessages.kind.in_(("reply", "start_reply")),
+        )
+        .order_by(TelegramOutgoingMessages.sent_at.desc())
+        .limit(limit)
+    ).all()
+
+    items: list[tuple[dt.datetime, str, str]] = []
+    for msg in incoming:
+        content = _format_incoming_content(msg)
+        if content:
+            items.append((msg.received_at, "user", content))
+    for msg in outgoing:
+        content = msg.text.strip() if msg.text else ""
+        if content:
+            items.append((msg.sent_at, "assistant", content))
+
+    items.sort(key=lambda row: row[0])
+    return [{"role": role, "content": content} for _, role, content in items][-limit:]
 
 
 def _create_session_and_message(
@@ -250,6 +300,13 @@ def handle_update_v2(update: dict, db: Session, settings: Settings) -> None:
     # Check if message has a file
     has_file = bool(parsed.file_id)
 
+    history = _load_recent_history(
+        db=db,
+        chat_id=parsed.chat_id,
+        limit=20,
+        before_received_at=parsed.received_at,
+    )
+
     # Send instant ACK (non-blocking, best effort)
     # Skip ACK for very short interactions to reduce noise
     message_text = (parsed.text or "").strip()
@@ -265,12 +322,13 @@ def handle_update_v2(update: dict, db: Session, settings: Settings) -> None:
 
     # Process the message
     try:
-        response_text = process_message_instant(
+        process_result = process_message_instant(
             db=db,
             user=user,
             messages=[tg_message],
             settings=settings,
             session_id=session.id,
+            history=history,
         )
     except Exception as exc:
         logger.exception(
@@ -281,13 +339,13 @@ def handle_update_v2(update: dict, db: Session, settings: Settings) -> None:
                 "session_id": str(session.id),
             },
         )
-        response_text = responses.ERROR_GENERIC
+        process_result = ProcessResult(response_text=responses.ERROR_GENERIC)
 
     # Send response
     try:
         telegram_message_id = send_message(
             chat_id=parsed.chat_id,
-            text=response_text,
+            text=process_result.response_text,
             settings=settings,
         )
 
@@ -297,9 +355,9 @@ def handle_update_v2(update: dict, db: Session, settings: Settings) -> None:
             session_id=session.id,
             chat_id=parsed.chat_id,
             kind="reply",
-            text=response_text,
+            text=process_result.response_text,
             telegram_message_id=telegram_message_id,
-            llm_call_id=None,
+            llm_call_id=process_result.response_llm_call_id,
         )
         db.commit()
 

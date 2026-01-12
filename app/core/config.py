@@ -37,8 +37,16 @@ class Settings(BaseSettings):
 
     openai_api_key: str = ""
     openai_model: str = "gpt-4o-mini"
-    # Model for intent classification and file type detection
+    # Model for intent classification and file type detection (legacy alias)
     openai_gate_model: str = ""
+    # Purpose-specific models (all optional, fall back to openai_model)
+    openai_intent_model: str = ""
+    openai_decision_model: str = ""
+    openai_response_model: str = ""
+    openai_reasoning_model: str = ""
+    openai_file_type_model: str = ""
+    openai_audio_model: str = ""
+    openai_video_model: str = ""
     openai_base_url: str = "https://api.openai.com/v1"
     # This primarily controls the HTTP read timeout (how long we wait for the model response).
     openai_timeout_seconds: float = 120.0

@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-from app.ai.model_config import get_gate_model
+from app.ai.model_config import get_intent_model
 from app.ai.openai_client import (
     OpenAIError,
     chat_completions_create_with_http_info,
@@ -186,6 +186,9 @@ You will receive:
 - Current active operation context (if any)
 - Active outlet/restaurant context (if the user has selected one)
 
+**IMPORTANT**: IDs are internal identifiers. Users will not provide IDs. Never invent IDs.
+If the user mentions a name (supplier, outlet, staff), include the raw name in params.
+
 **IMPORTANT**: If the context includes an "active_outlet" with a name, use that outlet's ID as "restaurant_id" for any action that requires it, unless the user explicitly mentions a different outlet.
 
 For example:
@@ -263,7 +266,7 @@ def classify_intent(
 
     if history:
         history_lines = []
-        for msg in history[-15:]:
+        for msg in history[-20:]:
             role = msg.get("role", "")
             content = msg.get("content", "")[:200]
             if role and content:
@@ -282,10 +285,10 @@ def classify_intent(
     user_prompt = "\n\n".join(user_prompt_parts)
 
     # Get the gate/cheap model
-    gate_model = get_gate_model(settings)
+    intent_model = get_intent_model(settings)
     gate_settings = (
-        settings.model_copy(update={"openai_model": gate_model})
-        if gate_model != settings.openai_model
+        settings.model_copy(update={"openai_model": intent_model})
+        if intent_model != settings.openai_model
         else settings
     )
 
@@ -303,13 +306,13 @@ def classify_intent(
         return ClassifiedIntent(
             intent=Intent.UNKNOWN,
             confidence=0.0,
-            model=gate_model,
+            model=intent_model,
         )
 
     # Extract response
     usage = extract_openrouter_usage(data)
     generation_id = extract_openrouter_generation_id(headers=headers, data=data)
-    model_used = data.get("model", gate_model)
+    model_used = data.get("model", intent_model)
 
     content: str | None = None
     try:
@@ -345,7 +348,7 @@ def classify_intent(
             params=params if isinstance(params, dict) else {},
             confidence=confidence,
             missing_params=missing_params,
-            model=model_used if isinstance(model_used, str) else gate_model,
+            model=model_used if isinstance(model_used, str) else intent_model,
             latency_ms=latency_ms,
             generation_id=generation_id,
             usage=usage if isinstance(usage, dict) else {},
@@ -359,7 +362,7 @@ def classify_intent(
         return ClassifiedIntent(
             intent=Intent.UNKNOWN,
             confidence=0.0,
-            model=model_used if "model_used" in dir() else gate_model,
+            model=model_used if "model_used" in dir() else intent_model,
             latency_ms=latency_ms,
             generation_id=generation_id,
             usage=usage if "usage" in dir() and isinstance(usage, dict) else {},

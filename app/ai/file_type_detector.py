@@ -11,7 +11,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
-from app.ai.model_config import get_gate_model
+from app.ai.model_config import get_file_type_model
 from app.ai.openai_client import (
     OpenAIError,
     chat_completions_create_with_http_info,
@@ -117,10 +117,10 @@ def detect_file_type_from_text(
             )
 
     # Use LLM for detection
-    gate_model = get_gate_model(settings)
+    file_type_model = get_file_type_model(settings)
     gate_settings = (
-        settings.model_copy(update={"openai_model": gate_model})
-        if gate_model != settings.openai_model
+        settings.model_copy(update={"openai_model": file_type_model})
+        if file_type_model != settings.openai_model
         else settings
     )
 
@@ -149,13 +149,13 @@ def detect_file_type_from_text(
             file_type="unknown",
             confidence=0.0,
             reason=f"Detection failed: {e}",
-            model=gate_model,
+            model=file_type_model,
         )
 
     # Extract telemetry
     usage = extract_openrouter_usage(data)
     generation_id = extract_openrouter_generation_id(headers=headers, data=data)
-    model_used = data.get("model", gate_model)
+    model_used = data.get("model", file_type_model)
 
     try:
         content = data["choices"][0]["message"]["content"]
@@ -183,7 +183,7 @@ def detect_file_type_from_text(
             file_type=file_type,
             confidence=confidence,
             reason=reason,
-            model=model_used if isinstance(model_used, str) else gate_model,
+            model=model_used if isinstance(model_used, str) else file_type_model,
             latency_ms=latency_ms,
             generation_id=generation_id,
             usage=usage if isinstance(usage, dict) else None,
@@ -198,7 +198,7 @@ def detect_file_type_from_text(
             file_type="unknown",
             confidence=0.0,
             reason=f"Parse failed: {e}",
-            model=model_used if "model_used" in dir() else gate_model,
+            model=model_used if "model_used" in dir() else file_type_model,
             latency_ms=latency_ms,
             generation_id=generation_id,
             usage=usage if "usage" in dir() and isinstance(usage, dict) else None,

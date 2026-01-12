@@ -416,6 +416,7 @@ def process_pdf_with_vision(
                 f"{prompt}\n\nExtracted text from page {page_num}:\n{page_text}"
             )
 
+            start_time: float | None = None
             try:
                 start_time = time.time()
                 # Use vision model for extraction (via raw httpx to control model)
@@ -497,11 +498,7 @@ def process_pdf_with_vision(
                 )
                 logger.warning(f"Error processing page {page_num}: {e}")
                 end_time = time.time()
-                latency_ms = (
-                    int((end_time - start_time) * 1000)
-                    if "start_time" in locals()
-                    else 0
-                )
+                latency_ms = int((end_time - start_time) * 1000) if start_time else 0
                 error_result = VisionCallResult(
                     content="",
                     model=model,
