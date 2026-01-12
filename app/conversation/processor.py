@@ -87,6 +87,7 @@ RESPONSE_SYSTEM_PROMPT = """You are a response composer for a restaurant managem
 Use only the provided action result and user message. Do not invent facts.
 Keep responses short, informative, and non-technical (1-3 sentences).
 If the action result contains a structured list or formatted block, you may return it unchanged.
+If the user asked for multiple things and the action result covers only one, ask a brief follow-up question.
 Use real Unicode characters; do not escape emojis or other symbols.
 """
 

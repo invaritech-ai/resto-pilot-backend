@@ -48,6 +48,11 @@ class Intent(str, Enum):
     VIEW_SUPPLIER = "view_supplier"
     VIEW_SUPPLIER_PRICE_LIST = "view_supplier_price_list"
     VIEW_SUPPLIER_ITEMS = "view_supplier_items"
+    DEACTIVATE_SUPPLIER = "deactivate_supplier"
+
+    # Invites
+    LIST_INVITES = "list_invites"
+    MOVE_INVITE = "move_invite"
 
     # Inventory
     LIST_INVENTORY = "list_inventory"
@@ -91,6 +96,9 @@ INTENT_PARAMS: dict[Intent, list[str]] = {
     Intent.VIEW_SUPPLIER: ["supplier_id"],
     Intent.VIEW_SUPPLIER_PRICE_LIST: ["supplier_id"],
     Intent.VIEW_SUPPLIER_ITEMS: ["supplier_id"],
+    Intent.DEACTIVATE_SUPPLIER: ["supplier_id"],
+    Intent.LIST_INVITES: ["restaurant_id"],
+    Intent.MOVE_INVITE: ["restaurant_id", "invite_code"],
     Intent.LIST_INVENTORY: ["restaurant_id"],
     Intent.ADD_INVENTORY: ["restaurant_id", "product_name", "quantity", "unit"],
     Intent.UPDATE_INVENTORY: ["batch_id", "quantity"],
@@ -153,6 +161,11 @@ Your job is to:
 - view_supplier: User wants to see supplier details. Extract "supplier_id" or supplier name.
 - view_supplier_price_list: User wants to see supplier's current prices. Extract "supplier_id".
 - view_supplier_items: User wants to see items/products a supplier offers. Extract "supplier_id".
+- deactivate_supplier: User wants to delete/remove a supplier. This should deactivate, not delete. Extract "supplier_id" or supplier name.
+
+### Invites
+- list_invites: User wants to see active invite links for an outlet. Extract "restaurant_id" if mentioned.
+- move_invite: User wants to move or change an invite to a different outlet. Extract "invite_code" if provided and the target "restaurant_id".
 
 ### Inventory Management
 - list_inventory: User wants to see inventory. Extract "restaurant_id" if mentioned.
@@ -421,6 +434,11 @@ def get_missing_param_prompt(intent: Intent, missing_param: str) -> str:
             Intent.LIST_SUPPLIERS,
             "restaurant_id",
         ): "Which outlet's suppliers would you like to see?",
+        (Intent.DEACTIVATE_SUPPLIER, "supplier_id"): "Which supplier would you like to deactivate?",
+        # Invites
+        (Intent.LIST_INVITES, "restaurant_id"): "Which outlet's invites would you like to see?",
+        (Intent.MOVE_INVITE, "restaurant_id"): "Which outlet should the invite be for?",
+        (Intent.MOVE_INVITE, "invite_code"): "Which invite should I move? Paste the invite link or code.",
         # Inventory
         (
             Intent.LIST_INVENTORY,

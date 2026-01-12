@@ -134,6 +134,40 @@ STAFF_NOT_OWNER = "Only outlet owners can manage staff."
 
 
 # =============================================================================
+# INVITES
+# =============================================================================
+
+def invites_list(invites: list[dict[str, Any]], restaurant_name: str) -> str:
+    """Format invite codes list response."""
+    if not invites:
+        return f"No active invites for {restaurant_name}."
+
+    lines = [f"🔗 *Active Invites - {restaurant_name}*\n"]
+    for invite in invites:
+        role = invite.get("role", "staff")
+        expires = invite.get("expires_at", "Never")
+        link = invite.get("link", "")
+        code = invite.get("code", "")
+        lines.append(f"{role.title()} • Expires: {expires}")
+        if code:
+            lines.append(f"Code: {code}")
+        if link:
+            lines.append(link)
+    return "\n".join(lines)
+
+
+INVITE_MOVE_NEED_CODE = "Which invite should I move? Paste the invite link or code."
+
+INVITE_MOVE_NOT_ACTIVE = "That invite is not active anymore."
+
+INVITE_MOVE_ALREADY_TARGET = "That invite already belongs to {restaurant}."
+
+INVITE_MOVE_NOT_OWNER = "Only outlet owners can move invites."
+
+INVITE_MOVE_SUCCESS = "Moved invite {code} to {restaurant}."
+
+
+# =============================================================================
 # SUPPLIERS
 # =============================================================================
 
@@ -155,6 +189,10 @@ SUPPLIER_UPDATED = "Updated supplier '{name}'."
 SUPPLIER_CREATE_ERROR = "Couldn't add the supplier. Please try again."
 
 SUPPLIER_NOT_FOUND = "Supplier not found."
+
+SUPPLIER_DEACTIVATED = "Deactivated supplier '{name}'."
+
+SUPPLIER_ALREADY_INACTIVE = "Supplier '{name}' is already inactive."
 
 
 def supplier_details(supplier: dict[str, Any]) -> str:

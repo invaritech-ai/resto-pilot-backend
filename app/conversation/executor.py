@@ -7,9 +7,11 @@ context-aware parameter handling and template responses.
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import logging
 import uuid
+from urllib.parse import parse_qs, urlparse
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -256,6 +258,23 @@ def _safe_uuid(value: str | None) -> uuid.UUID | None:
         return None
 
 
+def _extract_invite_code(value: str) -> str:
+    """Extract invite code from a raw code or Telegram deep link."""
+    raw = value.strip()
+    if not raw:
+        return ""
+    if "://" in raw:
+        try:
+            parsed = urlparse(raw)
+            query = parse_qs(parsed.query)
+            start_vals = query.get("start")
+            if start_vals:
+                return start_vals[0].strip()
+        except Exception:
+            return raw
+    return raw
+
+
 def execute_intent(
     *,
     classified: ClassifiedIntent,
@@ -351,6 +370,16 @@ def execute_intent(
 
     if intent == Intent.VIEW_SUPPLIER_ITEMS:
         return _execute_view_supplier_items(db, user, params, context)
+
+    if intent == Intent.DEACTIVATE_SUPPLIER:
+        return _execute_deactivate_supplier(db, user, params, context)
+
+    # Invite intents
+    if intent == Intent.LIST_INVITES:
+        return _execute_list_invites(db, user, params, context, settings)
+
+    if intent == Intent.MOVE_INVITE:
+        return _execute_move_invite(db, user, params, context)
 
     # Invoice intents
     if intent == Intent.LIST_INVOICES:
@@ -848,6 +877,154 @@ def _execute_revoke_staff(
 
 
 # =============================================================================
+# INVITE HANDLERS
+# =============================================================================
+
+
+def _execute_list_invites(
+    db: Session,
+    user: User,
+    params: dict[str, Any],
+    context: UserContext,
+    settings: Settings,
+) -> ExecutionResult:
+    restaurant_id, error = _resolve_restaurant_id(db, user.id, context, params)
+    if error:
+        return ExecutionResult(response=error, success=False)
+
+    if not restaurant_id:
+        restaurants = _get_user_restaurants(db, user.id)
+        return ExecutionResult(
+            response=responses.outlet_select_prompt(restaurants),
+            needs_input=True,
+            context_update={
+                "active_operation": Intent.LIST_INVITES.value,
+                "pending_params": ["restaurant_id"],
+                "collected_params": params,
+            },
+        )
+
+    if not _is_restaurant_owner(db, user.id, uuid.UUID(restaurant_id)):
+        return ExecutionResult(response=responses.STAFF_NOT_OWNER, success=False)
+
+    from app.db.models.invite_codes import InviteCodes
+
+    now = dt.datetime.now(dt.UTC)
+    invites = db.scalars(
+        select(InviteCodes).where(InviteCodes.restaurant_id == uuid.UUID(restaurant_id))
+    ).all()
+
+    active_invites = []
+    for invite in invites:
+        if invite.used_at is not None:
+            continue
+        if invite.expires_at is not None and invite.expires_at <= now:
+            continue
+        deep_link = InviteCodeService.deep_link(
+            bot_username=settings.telegram_bot_username,
+            code=invite.code,
+        )
+        active_invites.append(
+            {
+                "code": invite.code,
+                "role": invite.role,
+                "expires_at": invite.expires_at.strftime("%Y-%m-%d") if invite.expires_at else "Never",
+                "link": deep_link,
+            }
+        )
+
+    restaurant = db.get(Restaurant, uuid.UUID(restaurant_id))
+    restaurant_name = restaurant.name if restaurant else "outlet"
+
+    return ExecutionResult(
+        response=responses.invites_list(active_invites, restaurant_name),
+        context_update={"active_restaurant_id": restaurant_id},
+    )
+
+
+def _execute_move_invite(
+    db: Session,
+    user: User,
+    params: dict[str, Any],
+    context: UserContext,
+) -> ExecutionResult:
+    restaurant_id, error = _resolve_restaurant_id(db, user.id, context, params)
+    if error:
+        return ExecutionResult(response=error, success=False)
+
+    if not restaurant_id:
+        restaurants = _get_user_restaurants(db, user.id)
+        return ExecutionResult(
+            response=responses.outlet_select_prompt(restaurants),
+            needs_input=True,
+            context_update={
+                "active_operation": Intent.MOVE_INVITE.value,
+                "pending_params": ["restaurant_id"],
+                "collected_params": params,
+            },
+        )
+
+    invite_code_raw = (
+        params.get("invite_code")
+        or params.get("code")
+        or params.get("invite")
+        or params.get("invite_link")
+    )
+    invite_code = _extract_invite_code(str(invite_code_raw)) if invite_code_raw else ""
+    if not invite_code:
+        return ExecutionResult(
+            response=responses.INVITE_MOVE_NEED_CODE,
+            needs_input=True,
+            context_update={
+                "active_operation": Intent.MOVE_INVITE.value,
+                "pending_params": ["invite_code"],
+                "collected_params": {**params, "restaurant_id": restaurant_id},
+            },
+        )
+
+    from app.db.models.invite_codes import InviteCodes
+
+    invite = db.scalar(select(InviteCodes).where(InviteCodes.code == invite_code))
+    if not invite:
+        return ExecutionResult(response=responses.INVITE_MOVE_NOT_ACTIVE, success=False)
+
+    now = dt.datetime.now(dt.UTC)
+    if invite.used_at is not None or (
+        invite.expires_at is not None and invite.expires_at <= now
+    ):
+        return ExecutionResult(response=responses.INVITE_MOVE_NOT_ACTIVE, success=False)
+
+    if not _is_restaurant_owner(db, user.id, invite.restaurant_id) or not _is_restaurant_owner(
+        db, user.id, uuid.UUID(restaurant_id)
+    ):
+        return ExecutionResult(response=responses.INVITE_MOVE_NOT_OWNER, success=False)
+
+    if str(invite.restaurant_id) == restaurant_id:
+        restaurant = db.get(Restaurant, uuid.UUID(restaurant_id))
+        restaurant_name = restaurant.name if restaurant else "this outlet"
+        return ExecutionResult(
+            response=responses.INVITE_MOVE_ALREADY_TARGET.format(restaurant=restaurant_name),
+            context_update={"active_restaurant_id": restaurant_id},
+        )
+
+    try:
+        invite.restaurant_id = uuid.UUID(restaurant_id)
+        db.commit()
+        restaurant = db.get(Restaurant, uuid.UUID(restaurant_id))
+        restaurant_name = restaurant.name if restaurant else "the outlet"
+        return ExecutionResult(
+            response=responses.INVITE_MOVE_SUCCESS.format(
+                code=invite.code, restaurant=restaurant_name
+            ),
+            context_update={"active_restaurant_id": restaurant_id},
+        )
+    except Exception as e:
+        db.rollback()
+        logger.exception("move_invite_failed", extra={"error": str(e)})
+        return ExecutionResult(response=responses.ERROR_GENERIC, success=False)
+
+
+# =============================================================================
 # SUPPLIER HANDLERS
 # =============================================================================
 
@@ -951,6 +1128,73 @@ def _execute_add_supplier(
         db.rollback()
         logger.exception("add_supplier_failed", extra={"error": str(e)})
         return ExecutionResult(response=responses.SUPPLIER_CREATE_ERROR, success=False)
+
+
+def _execute_deactivate_supplier(
+    db: Session,
+    user: User,
+    params: dict[str, Any],
+    context: UserContext,
+) -> ExecutionResult:
+    supplier_id_raw = params.get("supplier_id", "").strip() if params.get("supplier_id") else ""
+    if not supplier_id_raw and context.active_supplier_id:
+        supplier_id_raw = context.active_supplier_id
+    if not supplier_id_raw:
+        return ExecutionResult(
+            response=get_missing_param_prompt(Intent.DEACTIVATE_SUPPLIER, "supplier_id"),
+            needs_input=True,
+            context_update={
+                "active_operation": Intent.DEACTIVATE_SUPPLIER.value,
+                "pending_params": ["supplier_id"],
+                "collected_params": params,
+            },
+        )
+
+    restaurant_id = context.active_restaurant_id
+    if not restaurant_id:
+        restaurants = _get_user_restaurants(db, user.id)
+        if len(restaurants) == 1:
+            restaurant_id = restaurants[0]["id"]
+
+    supplier_id = None
+    if restaurant_id:
+        supplier_id = _resolve_supplier_id(db, restaurant_id, supplier_id_raw)
+    if not supplier_id:
+        supplier_id = supplier_id_raw if _safe_uuid(supplier_id_raw) else None
+    if not supplier_id:
+        return ExecutionResult(response=responses.SUPPLIER_NOT_FOUND, success=False)
+
+    supplier = db.get(Suppliers, uuid.UUID(supplier_id))
+    if not supplier:
+        return ExecutionResult(response=responses.SUPPLIER_NOT_FOUND, success=False)
+
+    if not _is_restaurant_owner(db, user.id, supplier.restaurant_id):
+        return ExecutionResult(
+            response="Only outlet owners can deactivate suppliers.",
+            success=False,
+        )
+
+    if not supplier.is_active:
+        return ExecutionResult(
+            response=responses.SUPPLIER_ALREADY_INACTIVE.format(name=supplier.name),
+            context_update={"active_supplier_id": str(supplier.id)},
+        )
+
+    try:
+        supplier.is_active = False
+        db.commit()
+        return ExecutionResult(
+            response=responses.SUPPLIER_DEACTIVATED.format(name=supplier.name),
+            context_update={
+                "clear": True,
+                "active_restaurant_id": str(supplier.restaurant_id),
+                "active_supplier_id": str(supplier.id),
+            },
+        )
+    except Exception as e:
+        db.rollback()
+        logger.exception("deactivate_supplier_failed", extra={"error": str(e)})
+        return ExecutionResult(response=responses.ERROR_GENERIC, success=False)
 
 
 def _execute_update_supplier(
