@@ -10,6 +10,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
+import re
 import uuid
 from urllib.parse import parse_qs, urlparse
 from dataclasses import dataclass, field
@@ -103,6 +104,12 @@ def _match_by_name_or_number(
     """
     Match an item by name, partial name, or list number.
     
+    Uses prioritized matching:
+    1. Number match (1-indexed)
+    2. Exact name match (case-insensitive)
+    3. Word-boundary match (matches whole words at word boundaries)
+    4. Substring match (fallback)
+    
     Args:
         search_value: User's input (name, partial name, or number like "1", "2")
         items: List of dicts with at least name_key and id_key
@@ -116,24 +123,85 @@ def _match_by_name_or_number(
         return None
     
     search_value = search_value.strip()
+    logger.debug(
+        "Matching search_value=%r against %d items",
+        search_value,
+        len(items),
+    )
     
     # Try to match by number (1, 2, 3, etc) - 1-indexed
     if search_value.isdigit():
         idx = int(search_value) - 1
         if 0 <= idx < len(items):
-            return items[idx][id_key]
+            matched_item = items[idx]
+            logger.debug(
+                "Matched by number: %d -> %s (%s)",
+                idx + 1,
+                matched_item.get(name_key),
+                matched_item.get(id_key),
+            )
+            return matched_item[id_key]
     
-    # Try exact name match (case-insensitive)
     search_lower = search_value.lower()
-    for item in items:
-        if item[name_key].lower() == search_lower:
-            return item[id_key]
     
-    # Try partial name match
-    for item in items:
-        if search_lower in item[name_key].lower():
-            return item[id_key]
+    # Collect all matches with their priority
+    exact_matches = []
+    word_boundary_matches = []
+    substring_matches = []
     
+    for item in items:
+        item_name = item[name_key]
+        item_name_lower = item_name.lower()
+        
+        # Priority 1: Exact match (case-insensitive)
+        if item_name_lower == search_lower:
+            exact_matches.append(item)
+            continue
+        
+        # Priority 2: Word-boundary match
+        # Check if search term matches the start of any word in the item name
+        # Split by whitespace and check if any word starts with the search term
+        words = re.split(r'\s+', item_name_lower)
+        if any(word.startswith(search_lower) for word in words):
+            word_boundary_matches.append(item)
+            continue
+        
+        # Priority 3: Substring match (fallback)
+        if search_lower in item_name_lower:
+            substring_matches.append(item)
+    
+    # Return the best match (prioritize exact > word-boundary > substring)
+    if exact_matches:
+        matched_item = exact_matches[0]
+        logger.debug(
+            "Matched by exact name: %r -> %s (%s)",
+            search_value,
+            matched_item.get(name_key),
+            matched_item.get(id_key),
+        )
+        return matched_item[id_key]
+    
+    if word_boundary_matches:
+        matched_item = word_boundary_matches[0]
+        logger.debug(
+            "Matched by word boundary: %r -> %s (%s)",
+            search_value,
+            matched_item.get(name_key),
+            matched_item.get(id_key),
+        )
+        return matched_item[id_key]
+    
+    if substring_matches:
+        matched_item = substring_matches[0]
+        logger.debug(
+            "Matched by substring: %r -> %s (%s)",
+            search_value,
+            matched_item.get(name_key),
+            matched_item.get(id_key),
+        )
+        return matched_item[id_key]
+    
+    logger.debug("No match found for %r", search_value)
     return None
 
 
@@ -148,8 +216,8 @@ def _resolve_restaurant_id(
     Returns (restaurant_id, error_message).
     
     Handles multiple input formats:
-    - Valid UUID string
-    - Restaurant name (fuzzy match)
+    - Valid UUID string (preferred - from LLM selection)
+    - Restaurant name (fuzzy match - fallback)
     - Number (1, 2, 3) referring to list position
     """
     restaurants = _get_user_restaurants(db, user_id)
@@ -160,23 +228,33 @@ def _resolve_restaurant_id(
     param_value = params.get("restaurant_id", "").strip() if params.get("restaurant_id") else ""
     
     if param_value:
-        # Try to parse as UUID first
+        # Priority 1: Try to parse as UUID first (LLM should return this)
         try:
             uuid.UUID(param_value)
             # Valid UUID - verify user has access
             if any(r["id"] == param_value for r in restaurants):
+                logger.debug(
+                    "Resolved restaurant_id from LLM selection: %s",
+                    param_value,
+                )
                 return param_value, None
             else:
+                logger.warning(
+                    "LLM selected restaurant_id %s but user doesn't have access",
+                    param_value,
+                )
                 return None, responses.OUTLET_NO_ACCESS
         except ValueError:
-            pass
-        
-        # Try to match by name or number
-        matched_id = _match_by_name_or_number(param_value, restaurants)
-        if matched_id:
-            return matched_id, None
-        
-        # No match found - will prompt for selection
+            # Not a UUID - LLM didn't resolve it, fall back to string matching
+            logger.debug(
+                "LLM didn't resolve restaurant_id (got %r), falling back to string matching",
+                param_value,
+            )
+            matched_id = _match_by_name_or_number(param_value, restaurants)
+            if matched_id:
+                return matched_id, None
+            
+            # No match found - will prompt for selection
 
     # Check context
     if context.active_restaurant_id:

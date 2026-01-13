@@ -83,6 +83,19 @@ Rules:
 - Choose one intent from the allowed list provided in the user prompt.
 - IDs are internal; users will not provide them. Never ask for IDs.
 - Use candidate entities to map names to IDs when possible.
+
+**Restaurant/Outlet Selection:**
+- When the user mentions a restaurant/outlet name (even with typos, spacing, or partial names),
+  look it up in the "restaurants" array in Entity candidates.
+- Match flexibly: handle typos ("oyful" → "Joyful"), spacing ("joy ful" → "Joyful"), 
+  partial names ("joyful" → "Joyful banquet"), and case variations.
+- Use the exact "id" field (UUID) from the matched restaurant as the restaurant_id parameter.
+- If the user's mention is ambiguous or unclear, keep the raw name in params and explain in reason.
+
+**Supplier Selection:**
+- Similarly, match supplier names flexibly from the "suppliers" array when available.
+- Use the exact "id" field (UUID) from the matched supplier.
+
 - If you cannot resolve an entity, keep the raw name in params and ask for clarification in reason.
 - Use "help" only when the user asks about options or capabilities (help/menu/what can you do).
 - For price list questions, prefer "view_supplier_price_list" over "help".
