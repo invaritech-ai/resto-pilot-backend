@@ -323,6 +323,10 @@ def execute_intent(
     if intent == Intent.VIEW_PROFILE:
         return _execute_view_profile(user)
 
+    if intent == Intent.HELP:
+        topic = params.get("topic") if isinstance(params, dict) else None
+        return ExecutionResult(response=responses.help_topic(topic))
+
     if intent == Intent.UPDATE_NAME:
         return _execute_update_name(db, user, params, context)
 

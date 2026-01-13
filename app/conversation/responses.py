@@ -42,6 +42,61 @@ ACK_FILE_PROCESSING = "Processing your file..."
 
 
 # =============================================================================
+# HELP
+# =============================================================================
+
+HELP_PROFILE = """📋 *Profile* lets you view or update your name and phone.
+Try: "show my profile" or "update my phone to +1 415 555 0101"."""
+
+HELP_OUTLETS = """🏪 *Outlets* lets you list, add, or rename restaurants.
+Try: "list outlets" or "add outlet Little Italy"."""
+
+HELP_STAFF = """👥 *Staff* lets you list, invite, or remove team members.
+Try: "list staff" or "invite staff to Main"."""
+
+HELP_SUPPLIERS = """📦 *Suppliers* lets you list, add, view, update, or deactivate vendors.
+Try: "list suppliers" or "view supplier price list"."""
+
+HELP_INVOICES = """📄 *Invoices* lets you list invoices or view one.
+Try: "list invoices"."""
+
+HELP_INVENTORY = """📊 *Inventory* lets you list stock/locations, add items, or log usage.
+Try: "list inventory" or "log 2kg usage"."""
+
+HELP_FILES = """📤 *Files* lets you upload price lists or invoices.
+Try: "upload invoice" and send the file."""
+
+HELP_INVITES = """✉️ *Invites* lets you list active invite links or move an invite.
+Try: "list invites"."""
+
+
+def help_topic(topic: str | None) -> str:
+    """Return help text for a specific topic or the main menu."""
+    if not isinstance(topic, str):
+        return MAIN_MENU
+
+    normalized = topic.strip().lower()
+    mapping = {
+        "profile": HELP_PROFILE,
+        "outlets": HELP_OUTLETS,
+        "outlet": HELP_OUTLETS,
+        "restaurants": HELP_OUTLETS,
+        "restaurant": HELP_OUTLETS,
+        "staff": HELP_STAFF,
+        "suppliers": HELP_SUPPLIERS,
+        "supplier": HELP_SUPPLIERS,
+        "invoices": HELP_INVOICES,
+        "invoice": HELP_INVOICES,
+        "inventory": HELP_INVENTORY,
+        "files": HELP_FILES,
+        "file": HELP_FILES,
+        "invites": HELP_INVITES,
+        "invite": HELP_INVITES,
+    }
+    return mapping.get(normalized, MAIN_MENU)
+
+
+# =============================================================================
 # PROFILE
 # =============================================================================
 

@@ -74,6 +74,7 @@ class Intent(str, Enum):
     # Navigation
     SHOW_MENU = "show_menu"
     CANCEL = "cancel"
+    HELP = "help"
 
     # Unknown / Can't help
     UNKNOWN = "unknown"
@@ -112,6 +113,7 @@ INTENT_PARAMS: dict[Intent, list[str]] = {
     Intent.CONFIRM_UPLOAD: ["staging_id"],
     Intent.SHOW_MENU: [],
     Intent.CANCEL: [],
+    Intent.HELP: [],
     Intent.UNKNOWN: [],
 }
 
@@ -187,6 +189,7 @@ Your job is to:
 ### Navigation
 - show_menu: User greets or wants to see available options ("hi", "hello", "menu", "help", "what can you do")
 - cancel: User wants to cancel current operation ("cancel", "nevermind", "/cancel")
+- help: User asks what options are available in a specific area (profile, suppliers, staff, outlets, inventory, invoices, files, invites). Return optional "topic".
 
 ### Unknown
 - unknown: Message doesn't match any supported intent. Use this for off-topic requests.
@@ -223,8 +226,42 @@ Return ONLY valid JSON:
 
 - confidence: 0.0 to 1.0, how confident you are
 - params: only include parameters you can extract from the message
+- For help intent, include "topic" when the user asks about a specific area.
 - For unknown intent, return {"intent": "unknown", "params": {}, "confidence": 0.9}
 """
+
+
+def _detect_help_topic(text_lower: str) -> str | None:
+    if not any(
+        phrase in text_lower
+        for phrase in (
+            "what can you do",
+            "what can i do",
+            "options",
+            "help",
+            "capabilities",
+            "functions",
+            "what is",
+        )
+    ):
+        return None
+
+    topics = {
+        "profile": ("profile", "account"),
+        "outlets": ("outlet", "outlets", "restaurant", "restaurants", "store", "stores"),
+        "staff": ("staff", "team", "teams", "employee", "employees"),
+        "suppliers": ("supplier", "suppliers", "vendor", "vendors"),
+        "invoices": ("invoice", "invoices", "bill", "bills"),
+        "inventory": ("inventory", "stock", "stocks"),
+        "files": ("file", "files", "upload", "uploads"),
+        "invites": ("invite", "invites"),
+    }
+
+    for topic, keywords in topics.items():
+        if any(keyword in text_lower for keyword in keywords):
+            return topic
+
+    return None
 
 
 def classify_intent(
@@ -263,6 +300,14 @@ def classify_intent(
         "hi there", "hello there", "hey there",
     ):
         return ClassifiedIntent(intent=Intent.SHOW_MENU, confidence=1.0)
+
+    help_topic = _detect_help_topic(text_lower)
+    if help_topic:
+        return ClassifiedIntent(
+            intent=Intent.HELP,
+            confidence=1.0,
+            params={"topic": help_topic},
+        )
 
     if text_lower in ("/cancel", "cancel", "nevermind", "stop"):
         return ClassifiedIntent(intent=Intent.CANCEL, confidence=1.0)

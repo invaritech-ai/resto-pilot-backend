@@ -60,6 +60,7 @@ def chat_completions_create(
     tool_choice: str | dict[str, Any] | None = None,
     temperature: float = 0.2,
     extra_headers: dict[str, str] | None = None,
+    extra_body: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if not settings.openai_api_key:
         raise OpenAIError("OpenAI API key is not configured (APP_OPENAI_API_KEY)")
@@ -85,6 +86,8 @@ def chat_completions_create(
         payload["tools"] = tools
     if tool_choice is not None:
         payload["tool_choice"] = tool_choice
+    if extra_body:
+        payload.update(extra_body)
     _apply_reasoning_policy(payload, settings, settings.openai_base_url)
 
     # Use a longer read timeout for "thinking" responses without inflating connect/pool timeouts.
@@ -148,6 +151,7 @@ def chat_completions_create_with_http_info(
     tool_choice: str | dict[str, Any] | None = None,
     temperature: float = 0.2,
     extra_headers: dict[str, str] | None = None,
+    extra_body: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, str], int]:
     if not settings.openai_api_key:
         raise OpenAIError("OpenAI API key is not configured (APP_OPENAI_API_KEY)")
@@ -173,6 +177,8 @@ def chat_completions_create_with_http_info(
         payload["tools"] = tools
     if tool_choice is not None:
         payload["tool_choice"] = tool_choice
+    if extra_body:
+        payload.update(extra_body)
     _apply_reasoning_policy(payload, settings, settings.openai_base_url)
 
     timeout = httpx.Timeout(

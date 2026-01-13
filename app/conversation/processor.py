@@ -25,7 +25,11 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.ai.intent_classifier import Intent, ClassifiedIntent, classify_intent
-from app.ai.model_config import get_decision_model, get_response_model
+from app.ai.model_config import (
+    get_decision_model,
+    get_intent_model,
+    get_response_model,
+)
 from app.ai.openai_client import (
     OpenAIError,
     chat_completions_create_with_http_info,
@@ -90,6 +94,11 @@ If the action result contains a structured list or formatted block, you may retu
 If the user asked for multiple things and the action result covers only one, ask a brief follow-up question.
 Use real Unicode characters; do not escape emojis or other symbols.
 """
+
+ACK_SYSTEM_PROMPT = """You are an acknowledgment generator for a restaurant management bot.
+Return a single short sentence (max 12 words). No emojis, no markdown.
+If has_file is true, mention that the file is being processed.
+Do not answer the user or provide options. Just acknowledge and signal you're working."""
 
 
 def _get_message_text(messages: list[TelegramMessages]) -> str:
@@ -185,6 +194,104 @@ def _decode_unicode_escapes(text: str) -> str:
         return decoded.encode("utf-16", "surrogatepass").decode("utf-16")
     except Exception:
         return text
+
+
+def _generate_ack_text(
+    *,
+    settings: Settings,
+    message_text: str,
+    has_file: bool = False,
+    file_kind: str | None = None,
+    db: Session | None = None,
+    session_id: uuid.UUID | None = None,
+    chat_id: int | None = None,
+) -> tuple[str | None, uuid.UUID | None]:
+    model = get_intent_model(settings)
+    ack_settings = (
+        settings.model_copy(update={"openai_model": model})
+        if model != settings.openai_model
+        else settings
+    )
+    ack_settings = ack_settings.model_copy(
+        update={
+            "openai_timeout_seconds": min(ack_settings.openai_timeout_seconds, 6.0)
+        }
+    )
+    user_prompt = json.dumps(
+        {
+            "message": message_text,
+            "has_file": has_file,
+            "file_kind": file_kind,
+        },
+        ensure_ascii=True,
+    )
+
+    try:
+        data, headers, latency_ms = chat_completions_create_with_http_info(
+            settings=ack_settings,
+            messages=[
+                {"role": "system", "content": ACK_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.2,
+            extra_body={"max_tokens": 40},
+        )
+    except OpenAIError as exc:
+        logger.exception("ack_generation_failed", extra={"error": str(exc)})
+        if db is not None and session_id is not None:
+            llm_call_id = record_llm_call(
+                db=db,
+                session_id=session_id,
+                chat_id=chat_id,
+                purpose="ack_generation",
+                model=model,
+                error=str(exc),
+            )
+            db.commit()
+            return None, llm_call_id
+        return None, None
+
+    usage = extract_openrouter_usage(data)
+    generation_id = extract_openrouter_generation_id(headers=headers, data=data)
+    model_used = data.get("model", model)
+
+    content: str | None = None
+    try:
+        content = data["choices"][0]["message"]["content"]
+        if not isinstance(content, str):
+            raise ValueError("Empty content")
+        content = content.strip()
+        if content.startswith("```"):
+            lines = content.split("\n")
+            content = "\n".join(line for line in lines if not line.startswith("```"))
+        content = " ".join(content.splitlines()).strip()
+        if not content:
+            raise ValueError("Empty content")
+        if len(content) > 140:
+            content = content[:137].rstrip() + "..."
+    except (KeyError, TypeError, ValueError) as exc:
+        logger.warning(
+            "ack_generation_parse_failed",
+            extra={"error": str(exc), "content": content},
+        )
+        content = None
+
+    llm_call_id = None
+    if db is not None and session_id is not None:
+        llm_call_id = record_llm_call(
+            db=db,
+            session_id=session_id,
+            chat_id=chat_id,
+            purpose="ack_generation",
+            model=model_used if isinstance(model_used, str) else model,
+            openrouter_generation_id=generation_id,
+            usage=usage,
+            latency_ms=latency_ms,
+            error=None if content else "ack_generation_empty",
+        )
+        db.commit()
+
+    return _decode_unicode_escapes(content) if content else None, llm_call_id
 
 
 def _resolve_intent_with_llm(
@@ -823,6 +930,8 @@ def send_ack_message(
     chat_id: int,
     settings: Settings,
     has_file: bool = False,
+    file_kind: str | None = None,
+    message_text: str = "",
     # Optional telemetry params
     db: Session | None = None,
     session_id: uuid.UUID | None = None,
@@ -834,7 +943,20 @@ def send_ack_message(
 
     Returns the Telegram message ID or None if sending failed.
     """
+    llm_call_id: uuid.UUID | None = None
     text = responses.ACK_FILE_PROCESSING if has_file else responses.ACK_PROCESSING
+    if message_text.strip() or has_file:
+        ack_text, llm_call_id = _generate_ack_text(
+            settings=settings,
+            message_text=message_text,
+            has_file=has_file,
+            file_kind=file_kind,
+            db=db,
+            session_id=session_id,
+            chat_id=chat_id,
+        )
+        if ack_text:
+            text = ack_text
     try:
         telegram_message_id = send_message(chat_id=chat_id, text=text, settings=settings)
 
@@ -847,7 +969,7 @@ def send_ack_message(
                 kind="ack",
                 text=text,
                 telegram_message_id=telegram_message_id,
-                llm_call_id=None,
+                llm_call_id=llm_call_id,
             )
 
         return telegram_message_id

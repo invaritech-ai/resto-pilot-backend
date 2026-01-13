@@ -314,12 +314,14 @@ def handle_update_v2(update: dict, db: Session, settings: Settings) -> None:
 
     # Send instant ACK (non-blocking, best effort)
     # Skip ACK for very short interactions to reduce noise
-    message_text = (parsed.text or "").strip()
+    message_text = (parsed.text or parsed.caption or "").strip()
     if len(message_text) > 10 or has_file:
         send_ack_message(
             chat_id=parsed.chat_id,
             settings=settings,
             has_file=has_file,
+            file_kind=parsed.file_kind,
+            message_text=message_text,
             db=db,
             session_id=session.id,
         )

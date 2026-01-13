@@ -8,6 +8,7 @@ It reflects current behavior in `app/ai/intent_classifier.py` and `app/conversat
 - Onboarding: `/start` registers a user; if phone is missing, the bot prompts for it.
 - Invites: `/start CODE` accepts invite codes and joins a restaurant.
 - Navigation: `/menu` or `/help` shows the menu. `/cancel` cancels an active operation.
+- Topic help: "what can you do in profile/suppliers/etc?" returns a short help message.
 - File confirmation: `/confirm` confirms a pending file upload.
 - Fallback: unknown requests return "I can't help with that."
 
@@ -47,6 +48,7 @@ It reflects current behavior in `app/ai/intent_classifier.py` and `app/conversat
 ### Navigation
 - `show_menu`
 - `cancel`
+- `help` (`topic`, optional)
 - `unknown`
 
 Note: outlet/supplier/staff selection does not currently resolve names or menu numbers to IDs.
@@ -65,6 +67,10 @@ Manual tests should pass explicit IDs or implement selection mapping.
 ### Profile: view
 1) User: "show my profile"
 2) Bot responds with name, phone, and username.
+
+### Help: topic
+1) User: "what can you do in profile?"
+2) Bot responds with profile options (view/update name/phone).
 
 ### Profile: update name
 1) User: "update my name"
