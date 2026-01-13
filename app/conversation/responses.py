@@ -265,7 +265,10 @@ def supplier_details(supplier: dict[str, Any]) -> str:
 def supplier_price_list(supplier_name: str, items: list[dict[str, Any]]) -> str:
     """Format supplier price list response."""
     if not items:
-        return f"No price list found for {supplier_name}."
+        return (
+            f"No price list found for {supplier_name}. "
+            f"Would you like to upload one?"
+        )
     
     lines = [f"💰 *{supplier_name} - Price List*\n"]
     for item in items[:30]:

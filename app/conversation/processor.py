@@ -84,6 +84,8 @@ Rules:
 - IDs are internal; users will not provide them. Never ask for IDs.
 - Use candidate entities to map names to IDs when possible.
 - If you cannot resolve an entity, keep the raw name in params and ask for clarification in reason.
+- Use "help" only when the user asks about options or capabilities (help/menu/what can you do).
+- For price list questions, prefer "view_supplier_price_list" over "help".
 - Return ONLY valid JSON with: intent, params, confidence, reason.
 """
 

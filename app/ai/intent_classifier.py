@@ -231,7 +231,50 @@ Return ONLY valid JSON:
 """
 
 
+def _detect_price_list_intent(
+    text_lower: str,
+    has_file: bool,
+    context: dict[str, Any] | None,
+) -> Intent | None:
+    price_markers = (
+        "price list",
+        "price lists",
+        "pricelist",
+        "rate card",
+        "supplier prices",
+        "supplier price",
+    )
+    is_price_request = any(marker in text_lower for marker in price_markers) or (
+        "prices" in text_lower
+        and any(keyword in text_lower for keyword in ("supplier", "suppliers", "vendor", "vendors"))
+    )
+
+    if not is_price_request and "on file" in text_lower and context:
+        if context.get("active_supplier") or context.get("active_supplier_id"):
+            is_price_request = True
+
+    if not is_price_request:
+        return None
+
+    if has_file or any(
+        phrase in text_lower
+        for phrase in ("upload", "send", "attach", "attached", "here is", "here's")
+    ):
+        return Intent.UPLOAD_PRICE_LIST
+
+    return Intent.VIEW_SUPPLIER_PRICE_LIST
+
+
 def _detect_help_topic(text_lower: str) -> str | None:
+    if any(
+        marker in text_lower
+        for marker in ("price list", "price lists", "pricelist", "supplier prices", "on file")
+    ):
+        return None
+    if "prices" in text_lower and any(
+        keyword in text_lower for keyword in ("supplier", "suppliers", "vendor", "vendors")
+    ):
+        return None
     if not any(
         phrase in text_lower
         for phrase in (
@@ -301,6 +344,10 @@ def classify_intent(
     ):
         return ClassifiedIntent(intent=Intent.SHOW_MENU, confidence=1.0)
 
+    price_intent = _detect_price_list_intent(text_lower, has_file, context)
+    if price_intent is not None:
+        return ClassifiedIntent(intent=price_intent, confidence=0.95)
+
     help_topic = _detect_help_topic(text_lower)
     if help_topic:
         return ClassifiedIntent(
@@ -314,9 +361,6 @@ def classify_intent(
 
     if text_lower in ("/confirm", "confirm", "yes", "looks good", "save", "ok"):
         return ClassifiedIntent(intent=Intent.CONFIRM_UPLOAD, confidence=1.0)
-
-    if any(kw in text_lower for kw in ("price list", "pricelist", "rate card")):
-        return ClassifiedIntent(intent=Intent.UPLOAD_PRICE_LIST, confidence=0.9)
 
     # Build user prompt with context
     user_prompt_parts = []
