@@ -13,6 +13,7 @@ import httpx
 
 from app.ai.openai_client import (
     OpenAIError,
+    _apply_reasoning_policy,
     _is_retryable_exception,
     _is_retryable_status,
 )
@@ -123,6 +124,7 @@ def process_image_with_vision(
         "messages": messages,
         "temperature": 0.2,
     }
+    _apply_reasoning_policy(payload, settings, base_url)
 
     timeout = httpx.Timeout(
         connect=10.0,
@@ -442,6 +444,7 @@ def process_pdf_with_vision(
                     ],
                     "temperature": 0.2,
                 }
+                _apply_reasoning_policy(payload, settings, base_url)
 
                 timeout = httpx.Timeout(
                     connect=10.0,
@@ -624,6 +627,7 @@ def _process_pdf_single(
         "messages": messages,
         "temperature": 0.2,
     }
+    _apply_reasoning_policy(payload, settings, base_url)
 
     timeout = httpx.Timeout(
         connect=10.0,
@@ -1036,6 +1040,7 @@ def process_document_with_vision(
                 ],
                 "temperature": 0.2,
             }
+            _apply_reasoning_policy(payload, settings, base_url)
 
             timeout = httpx.Timeout(
                 connect=10.0,

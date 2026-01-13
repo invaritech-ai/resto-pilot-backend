@@ -16,6 +16,27 @@ class OpenAIError(RuntimeError):
     pass
 
 
+def _should_control_reasoning(base_url: str) -> bool:
+    return "openrouter.ai" in base_url.lower()
+
+
+def _apply_reasoning_policy(
+    payload: dict[str, Any], settings: Settings, base_url: str
+) -> None:
+    model = payload.get("model")
+    if not isinstance(model, str) or not model.strip():
+        return
+    if not _should_control_reasoning(base_url):
+        return
+
+    reasoning_model = settings.openai_reasoning_model.strip()
+    if reasoning_model and model.strip() == reasoning_model:
+        payload.setdefault("reasoning", {"enabled": True})
+        return
+
+    payload["reasoning"] = {"effort": "none"}
+
+
 def _is_retryable_status(status_code: int) -> bool:
     return status_code in {408, 409, 425, 429, 500, 502, 503, 504}
 
@@ -64,6 +85,7 @@ def chat_completions_create(
         payload["tools"] = tools
     if tool_choice is not None:
         payload["tool_choice"] = tool_choice
+    _apply_reasoning_policy(payload, settings, settings.openai_base_url)
 
     # Use a longer read timeout for "thinking" responses without inflating connect/pool timeouts.
     timeout = httpx.Timeout(
@@ -151,6 +173,7 @@ def chat_completions_create_with_http_info(
         payload["tools"] = tools
     if tool_choice is not None:
         payload["tool_choice"] = tool_choice
+    _apply_reasoning_policy(payload, settings, settings.openai_base_url)
 
     timeout = httpx.Timeout(
         connect=10.0,
