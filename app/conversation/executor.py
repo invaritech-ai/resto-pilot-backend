@@ -785,6 +785,7 @@ def _execute_list_staff(
 
     service = RestaurantService(db)
     members = service.list_members(restaurant_id=uuid.UUID(restaurant_id))
+    restaurant = db.get(Restaurant, uuid.UUID(restaurant_id))
 
     formatted = [
         {
@@ -796,7 +797,10 @@ def _execute_list_staff(
     ]
 
     return ExecutionResult(
-        response=responses.staff_list(formatted),
+        response=responses.staff_list(
+            formatted,
+            outlet_name=restaurant.name if restaurant else None,
+        ),
         context_update={"active_restaurant_id": restaurant_id},
     )
 

@@ -156,12 +156,14 @@ def outlet_select_prompt(outlets: list[dict[str, Any]]) -> str:
 # STAFF
 # =============================================================================
 
-def staff_list(members: list[dict[str, Any]]) -> str:
+def staff_list(members: list[dict[str, Any]], outlet_name: str | None = None) -> str:
     """Format staff list response."""
+    outlet_label = f" — {outlet_name}" if outlet_name else ""
     if not members:
-        return "No staff members yet. Would you like to invite someone?"
+        suffix = f" for {outlet_name}" if outlet_name else ""
+        return f"No staff members yet{suffix}. Would you like to invite someone?"
     
-    lines = ["👥 *Staff Members*\n"]
+    lines = [f"👥 *Staff Members{outlet_label}*\n"]
     for member in members:
         role_badge = "👑" if member.get("role") == "owner" else "👤"
         name = member.get("name") or "Unknown"
