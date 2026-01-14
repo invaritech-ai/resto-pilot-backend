@@ -156,6 +156,7 @@ def resolve_with_tools(
                 messages=messages,
                 tools=tool_schema,
                 temperature=0.2,
+                extra_body={"reasoning": {"effort": "low"}},
             )
         except OpenAIError as exc:
             logger.exception("tool_resolver_failed", extra={"error": str(exc)})

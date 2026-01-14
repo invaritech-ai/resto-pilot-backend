@@ -20,7 +20,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.ai.intent_classifier import Intent
-from app.ai.model_config import get_response_model
+from app.ai.model_config import get_intent_model, get_response_model
 from app.ai.openai_client import (
     OpenAIError,
     create_chat_completion_text_allow_empty_with_http_info,
@@ -144,6 +144,87 @@ def _format_tool_response_with_llm(
 
     return _decode_unicode_escapes(text) if text else text, llm_call_id
 
+
+def _generate_ack_text(
+    *,
+    settings: Settings,
+    message_text: str,
+    has_file: bool,
+    file_kind: str | None,
+    db: Session | None = None,
+    session_id: uuid.UUID | None = None,
+    chat_id: int | None = None,
+) -> tuple[str | None, uuid.UUID | None]:
+    model = get_intent_model(settings)
+    ack_settings = (
+        settings.model_copy(update={"openai_model": model})
+        if model != settings.openai_model
+        else settings
+    )
+    ack_settings = ack_settings.model_copy(
+        update={
+            "openai_timeout_seconds": min(ack_settings.openai_timeout_seconds, 6.0)
+        }
+    )
+
+    user_prompt = json.dumps(
+        {
+            "message": message_text,
+            "has_file": has_file,
+            "file_kind": file_kind,
+        },
+        ensure_ascii=True,
+    )
+
+    try:
+        text, data, headers, latency_ms = create_chat_completion_text_allow_empty_with_http_info(
+            settings=ack_settings,
+            messages=[
+                {"role": "system", "content": ACK_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.2,
+            extra_body={"max_tokens": 20},
+        )
+    except OpenAIError as exc:
+        logger.exception("ack_generation_failed", extra={"error": str(exc)})
+        if db is not None and session_id is not None:
+            llm_call_id = record_llm_call(
+                db=db,
+                session_id=session_id,
+                chat_id=chat_id,
+                purpose="ack_generation",
+                model=model,
+                error=str(exc),
+            )
+            db.commit()
+            return None, llm_call_id
+        return None, None
+
+    usage = extract_openrouter_usage(data)
+    generation_id = extract_openrouter_generation_id(headers=headers, data=data)
+    model_used = data.get("model", model)
+
+    content = text.strip() if isinstance(text, str) else None
+    if content:
+        content = " ".join(content.splitlines()).strip()
+
+    llm_call_id = None
+    if db is not None and session_id is not None:
+        llm_call_id = record_llm_call(
+            db=db,
+            session_id=session_id,
+            chat_id=chat_id,
+            purpose="ack_generation",
+            model=model_used if isinstance(model_used, str) else model,
+            openrouter_generation_id=generation_id,
+            usage=usage if isinstance(usage, dict) else {},
+            latency_ms=latency_ms,
+            error=None if content else "ack_generation_empty",
+        )
+        db.commit()
+
+    return _decode_unicode_escapes(content) if content else None, llm_call_id
 
 
 def _create_closed_session(
@@ -424,11 +505,24 @@ def send_ack_message(
     """
     Send instant acknowledgment message.
 
-    Uses static ACK messages instead of LLM generation.
+    Uses LLM generation with a short response and falls back to static ACK messages.
 
     Returns the Telegram message ID or None if sending failed.
     """
     text = responses.ACK_FILE_PROCESSING if has_file else responses.ACK_PROCESSING
+    llm_call_id: uuid.UUID | None = None
+    if message_text.strip() or has_file:
+        ack_text, llm_call_id = _generate_ack_text(
+            settings=settings,
+            message_text=message_text,
+            has_file=has_file,
+            file_kind=file_kind,
+            db=db,
+            session_id=session_id,
+            chat_id=chat_id,
+        )
+        if ack_text:
+            text = ack_text
     
     try:
         telegram_message_id = send_message(chat_id=chat_id, text=text, settings=settings)
@@ -442,7 +536,7 @@ def send_ack_message(
                 kind="ack",
                 text=text,
                 telegram_message_id=telegram_message_id,
-                llm_call_id=None,
+                llm_call_id=llm_call_id,
             )
 
         return telegram_message_id
@@ -452,6 +546,12 @@ def send_ack_message(
             extra={"chat_id": chat_id, "error": str(e)},
         )
         return None
+
+ACK_SYSTEM_PROMPT = """You are an acknowledgment generator for a restaurant management bot.
+Return a single short sentence (max 6 words). No emojis, no markdown.
+If has_file is true, mention that the file is being processed.
+Do not answer the user or provide options. Just acknowledge and signal you're working."""
+
 FINAL_RESPONSE_SYSTEM_PROMPT = """You are a response composer for a restaurant management bot.
 Use only the provided tool response and user message. Do not invent facts.
 Keep responses short, crisp, and helpful (1-3 sentences).

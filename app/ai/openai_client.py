@@ -29,14 +29,18 @@ def _apply_reasoning_policy(
     if not _should_control_reasoning(base_url):
         return
 
-    reasoning_model = settings.openai_reasoning_model.strip()
-    if reasoning_model and model.strip() == reasoning_model:
-        payload.setdefault("reasoning", {"enabled": True})
+    # If reasoning is already set (e.g., via extra_body), don't override it
+    if "reasoning" in payload:
         return
 
-    # Don't set reasoning parameter for non-reasoning models
-    # Some OpenRouter endpoints require reasoning and cannot have it disabled,
-    # so we omit the parameter entirely rather than setting {"effort": "none"}
+    reasoning_model = settings.openai_reasoning_model.strip()
+    if reasoning_model and model.strip() == reasoning_model:
+        payload["reasoning"] = {"enabled": True}
+        return
+
+    # For non-reasoning models, set effort to "low" to minimize thinking time
+    # Some endpoints require reasoning but allow low effort to reduce latency
+    payload["reasoning"] = {"effort": "low"}
 
 
 def _is_retryable_status(status_code: int) -> bool:
@@ -130,7 +134,11 @@ def chat_completions_create(
     for attempt in range(1, attempts + 1):
         try:
             resp = httpx.post(url, headers=headers, json=payload, timeout=timeout)
-            if resp.status_code >= 400 and _is_retryable_status(resp.status_code) and attempt < attempts:
+            if (
+                resp.status_code >= 400
+                and _is_retryable_status(resp.status_code)
+                and attempt < attempts
+            ):
                 logger.warning(
                     "openai_retryable_status",
                     extra={
@@ -150,7 +158,7 @@ def chat_completions_create(
                 error_msg = f"OpenAI request failed with status {resp.status_code}"
                 if response_body:
                     error_msg += f": {response_body}"
-                
+
                 # Log detailed error information
                 log_extra = {
                     "status_code": resp.status_code,
@@ -161,7 +169,7 @@ def chat_completions_create(
                     log_extra["response_body"] = response_body
                 if settings.debug:
                     log_extra["payload"] = _sanitize_payload_for_logging(payload)
-                
+
                 logger.error("openai_http_error", extra=log_extra)
                 raise OpenAIError(error_msg)
 
@@ -174,7 +182,7 @@ def chat_completions_create(
                 error_msg = f"OpenAI request failed: {exc}"
                 if response_body:
                     error_msg += f" Response: {response_body}"
-                
+
                 log_extra = {
                     "status_code": exc.response.status_code if exc.response else None,
                     "url": url,
@@ -184,10 +192,10 @@ def chat_completions_create(
                     log_extra["response_body"] = response_body
                 if settings.debug:
                     log_extra["payload"] = _sanitize_payload_for_logging(payload)
-                
+
                 logger.error("openai_http_error", extra=log_extra)
                 raise OpenAIError(error_msg) from exc
-            
+
             last_exc = exc
             if attempt < attempts and _is_retryable_exception(exc):
                 logger.warning(
@@ -304,7 +312,7 @@ def chat_completions_create_with_http_info(
                 error_msg = f"OpenAI request failed with status {resp.status_code}"
                 if response_body:
                     error_msg += f": {response_body}"
-                
+
                 # Log detailed error information
                 log_extra = {
                     "status_code": resp.status_code,
@@ -315,7 +323,7 @@ def chat_completions_create_with_http_info(
                     log_extra["response_body"] = response_body
                 if settings.debug:
                     log_extra["payload"] = _sanitize_payload_for_logging(payload)
-                
+
                 logger.error("openai_http_error", extra=log_extra)
                 raise OpenAIError(error_msg)
 
@@ -329,7 +337,7 @@ def chat_completions_create_with_http_info(
                 error_msg = f"OpenAI request failed: {exc}"
                 if response_body:
                     error_msg += f" Response: {response_body}"
-                
+
                 log_extra = {
                     "status_code": exc.response.status_code if exc.response else None,
                     "url": url,
@@ -339,10 +347,10 @@ def chat_completions_create_with_http_info(
                     log_extra["response_body"] = response_body
                 if settings.debug:
                     log_extra["payload"] = _sanitize_payload_for_logging(payload)
-                
+
                 logger.error("openai_http_error", extra=log_extra)
                 raise OpenAIError(error_msg) from exc
-            
+
             last_exc = exc
             if attempt < attempts and _is_retryable_exception(exc):
                 logger.warning(
