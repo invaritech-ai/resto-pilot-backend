@@ -20,7 +20,7 @@ from app.ai.model_config import get_response_model
 from app.ai.openai_client import OpenAIError, chat_completions_create_with_http_info
 from app.ai.openrouter_generation import extract_openrouter_generation_id
 from app.ai.openrouter_usage import extract_openrouter_usage
-from app.ai.tools import tools_to_openai_schema
+from app.ai.tools import TOOLS as BASE_TOOLS, tools_to_openai_schema
 from app.ai.db_tools import create_db_tools
 from app.conversation import responses
 from app.core.config import Settings
@@ -46,14 +46,15 @@ class ToolResolutionResult:
     tool_calls: int = 0
 
 
-RESOLVER_SYSTEM_PROMPT = f"""You are a restaurant management assistant.
+RESOLVER_SYSTEM_PROMPT = """You are a restaurant management assistant.
 Use tools to read or update data. Do NOT guess IDs.
 If you need a restaurant or supplier, call list tools first.
 If a tool returns an error, explain the issue and ask a short follow-up.
 Never reveal raw UUIDs or internal IDs.
 Keep responses short (1-3 sentences) or short bullet lists when listing items.
-When the user asks for help/menu, respond with this exact menu:
-{responses.MAIN_MENU}
+If the user asks for help about a specific topic, call get_help_topic.
+If the user asks for menu/options/paths, call get_menu_paths.
+When listing staff, include the outlet name if provided by the tool.
 """
 
 
@@ -135,7 +136,8 @@ def resolve_with_tools(
         chat_id=chat_id,
         session_id=session_id,
     )
-    tool_schema = tools_to_openai_schema(tools)
+    merged_tools = {**BASE_TOOLS, **tools}
+    tool_schema = tools_to_openai_schema(merged_tools)
 
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": RESOLVER_SYSTEM_PROMPT},
@@ -191,7 +193,7 @@ def resolve_with_tools(
                 if isinstance(args.get("supplier_id"), str):
                     last_supplier_id = args["supplier_id"].strip()
 
-                tool = tools.get(name)
+                tool = merged_tools.get(name)
                 if not tool:
                     result = "Error: Unknown tool."
                 else:

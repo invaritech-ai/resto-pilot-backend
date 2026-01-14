@@ -4,7 +4,7 @@ Instant message processor for the intent-driven bot.
 Simplified flow:
 1. Load user context
 2. Resolve intent + call tools via a single LLM loop
-3. Send final response
+3. Format final response with LLM
 4. Update context
 """
 
@@ -20,6 +20,13 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.ai.intent_classifier import Intent
+from app.ai.model_config import get_response_model
+from app.ai.openai_client import (
+    OpenAIError,
+    create_chat_completion_text_allow_empty_with_http_info,
+)
+from app.ai.openrouter_generation import extract_openrouter_generation_id
+from app.ai.openrouter_usage import extract_openrouter_usage
 from app.ai.tool_resolver import resolve_with_tools
 from app.conversation import responses
 from app.conversation.context import load_context, update_context_from_result
@@ -70,6 +77,72 @@ def _decode_unicode_escapes(text: str) -> str:
         return decoded.encode("utf-16", "surrogatepass").decode("utf-16")
     except Exception:
         return text
+
+
+def _format_tool_response_with_llm(
+    *,
+    db: Session,
+    settings: Settings,
+    session_id: uuid.UUID,
+    chat_id: int,
+    message_text: str,
+    tool_response: str,
+) -> tuple[str | None, uuid.UUID | None]:
+    model = get_response_model(settings)
+    response_settings = (
+        settings.model_copy(update={"openai_model": model})
+        if model != settings.openai_model
+        else settings
+    )
+
+    user_prompt = json.dumps(
+        {
+            "user_message": message_text,
+            "tool_response": tool_response,
+        },
+        indent=2,
+    )
+
+    try:
+        text, data, headers, latency_ms = create_chat_completion_text_allow_empty_with_http_info(
+            settings=response_settings,
+            messages=[
+                {"role": "system", "content": FINAL_RESPONSE_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.2,
+            extra_body={"max_tokens": 200},
+        )
+    except OpenAIError as exc:
+        logger.exception("final_response_failed", extra={"error": str(exc)})
+        llm_call_id = record_llm_call(
+            db=db,
+            session_id=session_id,
+            chat_id=chat_id,
+            purpose="response_generation",
+            model=model,
+            error=str(exc),
+        )
+        db.commit()
+        return None, llm_call_id
+
+    usage = extract_openrouter_usage(data)
+    generation_id = extract_openrouter_generation_id(headers=headers, data=data)
+    model_used = data.get("model", model)
+
+    llm_call_id = record_llm_call(
+        db=db,
+        session_id=session_id,
+        chat_id=chat_id,
+        purpose="response_generation",
+        model=model_used if isinstance(model_used, str) else model,
+        openrouter_generation_id=generation_id,
+        usage=usage,
+        latency_ms=latency_ms,
+    )
+    db.commit()
+
+    return _decode_unicode_escapes(text) if text else text, llm_call_id
 
 
 
@@ -218,7 +291,15 @@ def process_message_instant(
             context_update=tool_result.context_update,
         )
 
-    final_text = tool_result.response_text
+    formatted_text, response_llm_call_id = _format_tool_response_with_llm(
+        db=db,
+        settings=settings,
+        session_id=session_id,
+        chat_id=chat_id,
+        message_text=message_text,
+        tool_response=tool_result.response_text,
+    )
+    final_text = formatted_text or tool_result.response_text
 
     # Update user's last interaction time
     user.last_interaction_at = dt.datetime.now(dt.UTC)
@@ -371,3 +452,10 @@ def send_ack_message(
             extra={"chat_id": chat_id, "error": str(e)},
         )
         return None
+FINAL_RESPONSE_SYSTEM_PROMPT = """You are a response composer for a restaurant management bot.
+Use only the provided tool response and user message. Do not invent facts.
+Keep responses short, crisp, and helpful (1-3 sentences).
+If the tool response is JSON, summarize it clearly and include any restaurant_name in the header.
+If the tool response contains a structured list or formatted block, keep it.
+Use real Unicode characters; do not escape emojis or other symbols.
+"""

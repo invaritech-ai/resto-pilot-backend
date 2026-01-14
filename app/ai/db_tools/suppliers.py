@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 
 from app.ai.tools import Tool
 from app.db.models.suppliers import Suppliers
-from app.db.models.restaurant_user import RestaurantUser
+from app.db.models.restaurant import Restaurant
 
 from .base import format_date, has_restaurant_access, is_restaurant_owner
 
@@ -49,9 +49,7 @@ def create_supplier_tools(
                 Suppliers.restaurant_id == restaurant_id, Suppliers.is_active == True
             )
         ).all()
-
-        if not suppliers:
-            return "No suppliers found for this restaurant."
+        restaurant = db.get(Restaurant, restaurant_id)
 
         result = []
         for supplier in suppliers:
@@ -65,7 +63,11 @@ def create_supplier_tools(
                 }
             )
 
-        return json.dumps(result, indent=2)
+        payload = {
+            "restaurant_name": restaurant.name if restaurant else None,
+            "suppliers": result,
+        }
+        return json.dumps(payload, indent=2)
 
     def create_supplier(args: dict[str, Any]) -> str:
         """Create a new supplier. Only restaurant owners can create suppliers."""
@@ -199,7 +201,7 @@ def create_supplier_tools(
     return {
         "list_suppliers": Tool(
             name="list_suppliers",
-            description="List all suppliers for a restaurant.",
+            description="List all suppliers for a restaurant. Returns JSON with restaurant_name and suppliers.",
             parameters={
                 "type": "object",
                 "properties": {
@@ -297,4 +299,3 @@ def create_supplier_tools(
             handler=update_supplier,
         ),
     }
-

@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 from app.ai.tools import Tool
 from app.db.models.inventory_batches import InventoryBatches
 from app.db.models.inventory_movements import InventoryMovements
-from app.db.models.restaurant_user import RestaurantUser
+from app.db.models.restaurant import Restaurant
 
 from .base import format_date, has_restaurant_access, is_restaurant_owner
 
@@ -54,9 +54,7 @@ def create_inventory_tools(
             query = query.where(InventoryBatches.product_id == product_id)
 
         batches = db.scalars(query).all()
-
-        if not batches:
-            return "No inventory batches found."
+        restaurant = db.get(Restaurant, restaurant_id)
 
         result = []
         for batch in batches:
@@ -73,7 +71,11 @@ def create_inventory_tools(
                 }
             )
 
-        return json.dumps(result, indent=2)
+        payload = {
+            "restaurant_name": restaurant.name if restaurant else None,
+            "batches": result,
+        }
+        return json.dumps(payload, indent=2)
 
     def get_inventory_batch(args: dict[str, Any]) -> str:
         """Get details of a specific inventory batch."""
@@ -177,7 +179,7 @@ def create_inventory_tools(
     return {
         "list_inventory": Tool(
             name="list_inventory",
-            description="List inventory batches for a restaurant, optionally filtered by product.",
+            description="List inventory batches for a restaurant. Returns JSON with restaurant_name and batches.",
             parameters={
                 "type": "object",
                 "properties": {
@@ -241,4 +243,3 @@ def create_inventory_tools(
             handler=create_inventory_movement,
         ),
     }
-

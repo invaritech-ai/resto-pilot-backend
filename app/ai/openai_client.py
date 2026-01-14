@@ -411,12 +411,14 @@ def create_chat_completion_text_allow_empty_with_http_info(
     messages: list[dict[str, Any]],
     temperature: float = 0.2,
     extra_headers: dict[str, str] | None = None,
+    extra_body: dict[str, Any] | None = None,
 ) -> tuple[str | None, dict[str, Any], dict[str, str], int]:
     data, headers, latency_ms = chat_completions_create_with_http_info(
         settings=settings,
         messages=messages,
         temperature=temperature,
         extra_headers=extra_headers,
+        extra_body=extra_body,
     )
     try:
         content = data["choices"][0]["message"]["content"]

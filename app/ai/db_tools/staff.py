@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 
 from app.ai.tools import Tool
 from app.db.models.user import User
+from app.db.models.restaurant import Restaurant
 from app.domain.services.restaurant_service import RestaurantService
 
 from .base import format_date, has_restaurant_access, is_restaurant_owner
@@ -45,9 +46,7 @@ def create_staff_tools(
 
         service = RestaurantService(db)
         members = service.list_members(restaurant_id=restaurant_id)
-
-        if not members:
-            return "No staff members found."
+        restaurant = db.get(Restaurant, restaurant_id)
 
         result = []
         for user_obj, membership in members:
@@ -62,7 +61,11 @@ def create_staff_tools(
                 }
             )
 
-        return json.dumps(result, indent=2)
+        payload = {
+            "restaurant_name": restaurant.name if restaurant else None,
+            "members": result,
+        }
+        return json.dumps(payload, indent=2)
 
     def revoke_staff_access(args: dict[str, Any]) -> str:
         """Remove a user from restaurant staff. Only owners can do this."""
@@ -119,7 +122,7 @@ def create_staff_tools(
     return {
         "list_staff": Tool(
             name="list_staff",
-            description="List all staff members of a restaurant.",
+            description="List all staff members of a restaurant. Returns JSON with restaurant_name and members.",
             parameters={
                 "type": "object",
                 "properties": {

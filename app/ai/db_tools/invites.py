@@ -115,6 +115,7 @@ def create_invite_tools(
                 InviteCodes.used_at.is_(None),
             )
         ).all()
+        restaurant = db.get(Restaurant, restaurant_id)
 
         # Filter out expired codes
         active_invites = []
@@ -135,10 +136,11 @@ def create_invite_tools(
                     }
                 )
 
-        if not active_invites:
-            return "No active invite codes. Use create_invite_code to create one."
-
-        return json.dumps(active_invites, indent=2)
+        payload = {
+            "restaurant_name": restaurant.name if restaurant else None,
+            "invites": active_invites,
+        }
+        return json.dumps(payload, indent=2)
 
     def delete_invite_code(args: dict[str, Any]) -> str:
         """Delete/revoke an invite code. Only owners can delete."""
@@ -196,7 +198,7 @@ def create_invite_tools(
         ),
         "list_invite_codes": Tool(
             name="list_invite_codes",
-            description="List active invite codes for a restaurant. Only owners can view.",
+            description="List active invite codes for a restaurant. Returns JSON with restaurant_name and invites.",
             parameters={
                 "type": "object",
                 "properties": {
