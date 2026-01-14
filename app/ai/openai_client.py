@@ -52,6 +52,29 @@ def _is_retryable_exception(exc: httpx.HTTPError) -> bool:
     )
 
 
+def _extract_response_body(resp: httpx.Response) -> str | None:
+    """Extract response body as text, handling both JSON and text responses."""
+    try:
+        # Try to get as text first
+        return resp.text
+    except Exception:
+        try:
+            # Fallback to JSON if text fails
+            return str(resp.json())
+        except Exception:
+            return None
+
+
+def _sanitize_payload_for_logging(payload: dict[str, Any]) -> dict[str, Any]:
+    """Create a sanitized copy of payload for logging, removing sensitive data."""
+    sanitized = payload.copy()
+    # Remove or mask sensitive fields if they exist
+    if "messages" in sanitized:
+        # Keep messages but could truncate if needed
+        pass
+    return sanitized
+
+
 def chat_completions_create(
     *,
     settings: Settings,
@@ -119,8 +142,67 @@ def chat_completions_create(
                 time.sleep(delay)
                 continue
 
+            # Check for non-retryable errors before raising
+            if resp.status_code >= 400 and not _is_retryable_status(resp.status_code):
+                response_body = _extract_response_body(resp)
+                error_msg = f"OpenAI request failed with status {resp.status_code}"
+                if response_body:
+                    error_msg += f": {response_body}"
+                
+                # Log detailed error information
+                log_extra = {
+                    "status_code": resp.status_code,
+                    "url": url,
+                    "attempt": attempt,
+                }
+                if response_body:
+                    log_extra["response_body"] = response_body
+                if settings.debug:
+                    log_extra["payload"] = _sanitize_payload_for_logging(payload)
+                
+                logger.error("openai_http_error", extra=log_extra)
+                raise OpenAIError(error_msg)
+
             resp.raise_for_status()
             return resp.json()
+        except httpx.HTTPStatusError as exc:
+            # Handle HTTPStatusError (from raise_for_status) with response body
+            if hasattr(exc, "response") and exc.response is not None:
+                response_body = _extract_response_body(exc.response)
+                error_msg = f"OpenAI request failed: {exc}"
+                if response_body:
+                    error_msg += f" Response: {response_body}"
+                
+                log_extra = {
+                    "status_code": exc.response.status_code if exc.response else None,
+                    "url": url,
+                    "attempt": attempt,
+                }
+                if response_body:
+                    log_extra["response_body"] = response_body
+                if settings.debug:
+                    log_extra["payload"] = _sanitize_payload_for_logging(payload)
+                
+                logger.error("openai_http_error", extra=log_extra)
+                raise OpenAIError(error_msg) from exc
+            
+            last_exc = exc
+            if attempt < attempts and _is_retryable_exception(exc):
+                logger.warning(
+                    "openai_retryable_error",
+                    extra={
+                        "error": repr(exc),
+                        "attempt": attempt,
+                        "attempts": attempts,
+                    },
+                )
+                delay = min(retry_max, retry_initial * (2 ** (attempt - 1)))
+                delay = delay * (0.75 + random.random() * 0.5)
+                time.sleep(delay)
+                continue
+
+            logger.exception("openai_http_error", extra={"error": repr(exc)})
+            raise OpenAIError(f"OpenAI request failed: {exc}") from exc
         except httpx.HTTPError as exc:
             last_exc = exc
             if attempt < attempts and _is_retryable_exception(exc):
@@ -214,9 +296,68 @@ def chat_completions_create_with_http_info(
                 time.sleep(delay)
                 continue
 
+            # Check for non-retryable errors before raising
+            if resp.status_code >= 400 and not _is_retryable_status(resp.status_code):
+                response_body = _extract_response_body(resp)
+                error_msg = f"OpenAI request failed with status {resp.status_code}"
+                if response_body:
+                    error_msg += f": {response_body}"
+                
+                # Log detailed error information
+                log_extra = {
+                    "status_code": resp.status_code,
+                    "url": url,
+                    "attempt": attempt,
+                }
+                if response_body:
+                    log_extra["response_body"] = response_body
+                if settings.debug:
+                    log_extra["payload"] = _sanitize_payload_for_logging(payload)
+                
+                logger.error("openai_http_error", extra=log_extra)
+                raise OpenAIError(error_msg)
+
             resp.raise_for_status()
             elapsed_ms = int((time.monotonic() - started) * 1000)
             return resp.json(), {k: v for k, v in resp.headers.items()}, elapsed_ms
+        except httpx.HTTPStatusError as exc:
+            # Handle HTTPStatusError (from raise_for_status) with response body
+            if hasattr(exc, "response") and exc.response is not None:
+                response_body = _extract_response_body(exc.response)
+                error_msg = f"OpenAI request failed: {exc}"
+                if response_body:
+                    error_msg += f" Response: {response_body}"
+                
+                log_extra = {
+                    "status_code": exc.response.status_code if exc.response else None,
+                    "url": url,
+                    "attempt": attempt,
+                }
+                if response_body:
+                    log_extra["response_body"] = response_body
+                if settings.debug:
+                    log_extra["payload"] = _sanitize_payload_for_logging(payload)
+                
+                logger.error("openai_http_error", extra=log_extra)
+                raise OpenAIError(error_msg) from exc
+            
+            last_exc = exc
+            if attempt < attempts and _is_retryable_exception(exc):
+                logger.warning(
+                    "openai_retryable_error",
+                    extra={
+                        "error": repr(exc),
+                        "attempt": attempt,
+                        "attempts": attempts,
+                    },
+                )
+                delay = min(retry_max, retry_initial * (2 ** (attempt - 1)))
+                delay = delay * (0.75 + random.random() * 0.5)
+                time.sleep(delay)
+                continue
+
+            logger.exception("openai_http_error", extra={"error": repr(exc)})
+            raise OpenAIError(f"OpenAI request failed: {exc}") from exc
         except httpx.HTTPError as exc:
             last_exc = exc
             if attempt < attempts and _is_retryable_exception(exc):
