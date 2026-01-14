@@ -21,8 +21,31 @@ def create_profile_tools(
     user_id: Any,
     actor_role: str | None = None,  # For future policy checks
     restaurant_roles: dict[str, str] | None = None,  # For future policy checks
+    user_message: str | None = None,
 ) -> dict[str, Tool]:
     """Create profile management tools."""
+
+    def _should_clear(field: str, message: str | None) -> bool:
+        if not message:
+            return False
+        text = message.lower()
+        if not any(keyword in text for keyword in ("clear", "remove", "delete", "reset", "erase")):
+            return False
+        if field == "name":
+            return "name" in text
+        if field == "phone":
+            return "phone" in text or "number" in text
+        if field == "username":
+            return "username" in text or "user name" in text or "handle" in text
+        return False
+
+    def _resolve_field_update(value: Any, field: str) -> str | None:
+        wants_clear = _should_clear(field, user_message)
+        if value is None:
+            return "" if wants_clear else None
+        if isinstance(value, str) and not value.strip():
+            return "" if wants_clear else None
+        return str(value)
 
     def get_my_profile(args: dict[str, Any]) -> str:
         """Get the current user's profile information."""
@@ -53,9 +76,9 @@ def create_profile_tools(
         if not user:
             return "Error: User not found."
 
-        full_name = args.get("full_name")
-        phone = args.get("phone")
-        username = args.get("username")
+        full_name = _resolve_field_update(args.get("full_name"), "name")
+        phone = _resolve_field_update(args.get("phone"), "phone")
+        username = _resolve_field_update(args.get("username"), "username")
 
         if full_name is None and phone is None and username is None:
             return "Error: Provide at least one field to update (full_name, phone, or username)."
@@ -97,7 +120,7 @@ def create_profile_tools(
         ),
         "update_my_profile": Tool(
             name="update_my_profile",
-            description="Update your profile information. You can update name, phone, or username.",
+            description="Update your profile information. Only include fields the user explicitly provided. Use empty string only when the user asks to clear a field.",
             parameters={
                 "type": "object",
                 "properties": {

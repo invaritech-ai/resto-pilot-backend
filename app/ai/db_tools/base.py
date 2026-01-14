@@ -84,7 +84,11 @@ def create_db_tools(
 
     # Pass actor_role and restaurant_roles so tools can use permission checks if needed
     profile_tools = profile.create_profile_tools(
-        db=db, user_id=user_id, actor_role=actor_role, restaurant_roles=restaurant_roles
+        db=db,
+        user_id=user_id,
+        actor_role=actor_role,
+        restaurant_roles=restaurant_roles,
+        user_message=user_message,
     )
     restaurant_tools = restaurants.create_restaurant_tools(
         db=db, user_id=user_id, actor_role=actor_role, restaurant_roles=restaurant_roles
