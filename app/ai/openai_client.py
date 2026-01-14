@@ -34,7 +34,9 @@ def _apply_reasoning_policy(
         payload.setdefault("reasoning", {"enabled": True})
         return
 
-    payload["reasoning"] = {"effort": "none"}
+    # Don't set reasoning parameter for non-reasoning models
+    # Some OpenRouter endpoints require reasoning and cannot have it disabled,
+    # so we omit the parameter entirely rather than setting {"effort": "none"}
 
 
 def _is_retryable_status(status_code: int) -> bool:
