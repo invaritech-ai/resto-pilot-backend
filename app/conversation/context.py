@@ -7,14 +7,42 @@ Simplified version - just tracks active restaurant/supplier IDs.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy.orm import Session
 
 from app.db.models.user import User
-from app.conversation.executor import UserContext
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class UserContext:
+    """User's current context - tracks active entities and pending actions."""
+
+    active_restaurant_id: str | None = None
+    active_supplier_id: str | None = None
+    pending_action: dict[str, Any] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "active_restaurant_id": self.active_restaurant_id,
+            "active_supplier_id": self.active_supplier_id,
+        }
+        if self.pending_action:
+            result["pending_action"] = self.pending_action
+        return result
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "UserContext":
+        if not data:
+            return cls()
+        return cls(
+            active_restaurant_id=data.get("active_restaurant_id"),
+            active_supplier_id=data.get("active_supplier_id"),
+            pending_action=data.get("pending_action"),
+        )
 
 
 def load_context(db: Session, user: User) -> UserContext:
@@ -98,6 +126,7 @@ def update_context_from_result(
                 "active_supplier_id",
                 context.active_supplier_id,
             ),
+            pending_action=context_update.get("pending_action"),
         )
         save_context(db, user, new_context)
         return new_context
@@ -107,6 +136,10 @@ def update_context_from_result(
         context.active_restaurant_id = context_update["active_restaurant_id"]
     if "active_supplier_id" in context_update:
         context.active_supplier_id = context_update["active_supplier_id"]
+    if "pending_action" in context_update:
+        context.pending_action = context_update["pending_action"]
+    if context_update.get("clear_pending_action"):
+        context.pending_action = None
 
     save_context(db, user, context)
     return context

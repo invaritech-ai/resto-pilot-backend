@@ -54,6 +54,7 @@ Never reveal raw UUIDs or internal IDs.
 Keep responses short (1-3 sentences) or short bullet lists when listing items.
 If the user asks for help about a specific topic, call get_help_topic.
 If the user asks for menu/options/paths, call get_menu_paths.
+If there is a pending action and the user says yes/no, call the relevant tool to confirm or cancel.
 When listing staff, include the outlet name if provided by the tool.
 """
 
@@ -100,6 +101,7 @@ def resolve_with_tools(
     history: list[dict[str, str]] | None,
     active_restaurant_id: str | None,
     active_supplier_id: str | None,
+    pending_action: dict[str, Any] | None = None,
     settings: Settings,
     chat_id: int | None,
     session_id: uuid.UUID | None,
@@ -110,6 +112,8 @@ def resolve_with_tools(
         context_info["active_restaurant_id"] = active_restaurant_id
     if active_supplier_id:
         context_info["active_supplier_id"] = active_supplier_id
+    if pending_action:
+        context_info["pending_action"] = pending_action.get("type")
 
     user_prompt_parts: list[str] = []
     if context_info:
@@ -133,6 +137,8 @@ def resolve_with_tools(
         user_id=user.id,
         actor_role=actor_role,
         restaurant_roles=restaurant_roles,
+        pending_action=pending_action,
+        user_message=message_text,
         chat_id=chat_id,
         session_id=session_id,
     )
@@ -148,6 +154,7 @@ def resolve_with_tools(
     tool_calls_count = 0
     last_restaurant_id: str | None = None
     last_supplier_id: str | None = None
+    context_update: dict[str, Any] = {}
 
     for _ in range(max_steps):
         try:
@@ -199,6 +206,10 @@ def resolve_with_tools(
                     result = "Error: Unknown tool."
                 else:
                     result = tool.handler(args)
+                tool_payload = _parse_tool_args(result)
+                tool_context = tool_payload.get("context_update")
+                if isinstance(tool_context, dict):
+                    context_update.update(tool_context)
                 messages.append(
                     {
                         "role": "tool",
@@ -209,7 +220,6 @@ def resolve_with_tools(
             continue
 
         if isinstance(content, str) and content.strip():
-            context_update: dict[str, Any] = {}
             if last_restaurant_id:
                 context_update["active_restaurant_id"] = last_restaurant_id
             if last_supplier_id:

@@ -29,8 +29,7 @@ from app.ai.openrouter_generation import extract_openrouter_generation_id
 from app.ai.openrouter_usage import extract_openrouter_usage
 from app.ai.tool_resolver import resolve_with_tools
 from app.conversation import responses
-from app.conversation.context import load_context, update_context_from_result
-from app.conversation.executor import UserContext
+from app.conversation.context import load_context, update_context_from_result, UserContext
 from app.core.config import Settings
 from app.db.models.processing_events import ProcessingEvents
 from app.db.models.telegram_messages import TelegramMessages
@@ -344,6 +343,7 @@ def process_message_instant(
         history=history,
         active_restaurant_id=context.active_restaurant_id,
         active_supplier_id=context.active_supplier_id,
+        pending_action=context.pending_action,
         settings=settings,
         chat_id=chat_id,
         session_id=session_id,

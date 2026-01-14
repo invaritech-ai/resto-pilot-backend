@@ -241,9 +241,17 @@ def suppliers_list(suppliers: list[dict[str, Any]]) -> str:
 
 SUPPLIER_CREATED = "Added supplier '{name}'."
 
+SUPPLIER_CREATE_CONFIRMATION = "I'll add supplier '{name}' to {restaurant}. Confirm?"
+
+SUPPLIER_CREATE_CANCELLED = "Cancelled supplier creation."
+
 SUPPLIER_UPDATED = "Updated supplier '{name}'."
 
 SUPPLIER_CREATE_ERROR = "Couldn't add the supplier. Please try again."
+
+SUPPLIER_CREATE_CONFIRMATION = "I'll add supplier '{name}' to {restaurant_name}. Confirm?"
+
+SUPPLIER_CREATE_CANCELLED = "Cancelled adding supplier."
 
 SUPPLIER_NOT_FOUND = "Supplier not found."
 

@@ -13,6 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.ai.tools import Tool
+from app.conversation import responses
 from app.db.models.suppliers import Suppliers
 from app.db.models.restaurant import Restaurant
 
@@ -27,8 +28,27 @@ def create_supplier_tools(
     user_id: Any,
     actor_role: str | None = None,
     restaurant_roles: dict[str, str] | None = None,
+    pending_action: dict[str, Any] | None = None,
+    user_message: str | None = None,
 ) -> dict[str, Tool]:
     """Create supplier management tools."""
+
+    def _normalize(text: str | None) -> str:
+        return text.strip().lower() if isinstance(text, str) else ""
+
+    def _is_confirm(text: str) -> bool:
+        tokens = [token.strip(".,!?") for token in text.split()]
+        return any(
+            token in {"yes", "confirm", "ok", "okay", "proceed", "sure"}
+            for token in tokens
+        ) or "do it" in text
+
+    def _is_cancel(text: str) -> bool:
+        tokens = [token.strip(".,!?") for token in text.split()]
+        return any(
+            token in {"no", "cancel", "nevermind", "stop", "don't", "dont"}
+            for token in tokens
+        ) or "never mind" in text
 
     def list_suppliers(args: dict[str, Any]) -> str:
         """List all suppliers for a restaurant."""
@@ -71,7 +91,80 @@ def create_supplier_tools(
 
     def create_supplier(args: dict[str, Any]) -> str:
         """Create a new supplier. Only restaurant owners can create suppliers."""
+        message_lower = _normalize(user_message)
+
         restaurant_id_str = args.get("restaurant_id", "").strip()
+        name = args.get("name", "").strip()
+
+        if pending_action and pending_action.get("type") == "create_supplier":
+            if _is_cancel(message_lower):
+                return json.dumps(
+                    {
+                        "status": "cancelled",
+                        "message": responses.SUPPLIER_CREATE_CANCELLED,
+                        "context_update": {"clear_pending_action": True},
+                    },
+                    indent=2,
+                )
+            if _is_confirm(message_lower):
+                pending_restaurant_id = pending_action.get("restaurant_id")
+                pending_name = pending_action.get("name")
+                if not pending_restaurant_id or not pending_name:
+                    return "Error: Pending supplier details are incomplete."
+                try:
+                    restaurant_id = uuid.UUID(str(pending_restaurant_id))
+                except ValueError:
+                    return "Error: Invalid pending restaurant_id format."
+                name = str(pending_name).strip()
+                if not is_restaurant_owner(db, user_id, restaurant_id):
+                    return "Error: Only restaurant owners can create suppliers."
+                supplier = Suppliers(
+                    restaurant_id=restaurant_id,
+                    name=name,
+                    is_active=True,
+                )
+                db.add(supplier)
+                try:
+                    db.commit()
+                    return json.dumps(
+                        {
+                            "status": "created",
+                            "id": str(supplier.id),
+                            "name": supplier.name,
+                            "message": responses.SUPPLIER_CREATED.format(name=supplier.name),
+                            "context_update": {
+                                "clear_pending_action": True,
+                                "active_restaurant_id": str(restaurant_id),
+                                "active_supplier_id": str(supplier.id),
+                            },
+                        },
+                        indent=2,
+                    )
+                except Exception as e:
+                    db.rollback()
+                    logger.exception("create_supplier_failed")
+                    return f"Error creating supplier: {str(e)}"
+
+            if not restaurant_id_str and not name:
+                return json.dumps(
+                    {
+                        "status": "pending_confirmation",
+                        "message": responses.SUPPLIER_CREATE_CONFIRMATION.format(
+                            name=pending_action.get("name"),
+                            restaurant=pending_action.get("restaurant_name"),
+                        ),
+                        "context_update": {
+                            "pending_action": pending_action,
+                            "active_restaurant_id": pending_action.get("restaurant_id"),
+                        },
+                    },
+                    indent=2,
+                )
+            if not restaurant_id_str and pending_action.get("restaurant_id"):
+                restaurant_id_str = str(pending_action.get("restaurant_id"))
+            if not name and pending_action.get("name"):
+                name = str(pending_action.get("name")).strip()
+
         if not restaurant_id_str:
             return "Error: restaurant_id is required."
 
@@ -83,37 +176,31 @@ def create_supplier_tools(
         if not is_restaurant_owner(db, user_id, restaurant_id):
             return "Error: Only restaurant owners can create suppliers."
 
-        name = args.get("name", "").strip()
         if not name:
             return "Error: name is required."
 
-        supplier = Suppliers(
-            restaurant_id=restaurant_id,
-            name=name,
-            language=args.get("language") if args.get("language") else None,
-            currency=args.get("currency") if args.get("currency") else None,
-            lead_time_days=int(args.get("lead_time_days"))
-            if args.get("lead_time_days")
-            else None,
-            notes=args.get("notes") if args.get("notes") else None,
-            is_active=True,
-        )
-        db.add(supplier)
-        try:
-            db.commit()
-            return json.dumps(
-                {
-                    "status": "created",
-                    "id": str(supplier.id),
-                    "name": supplier.name,
-                    "message": f"Supplier '{supplier.name}' created!",
+        restaurant = db.get(Restaurant, restaurant_id)
+        restaurant_name = restaurant.name if restaurant else "your outlet"
+
+        return json.dumps(
+            {
+                "status": "pending_confirmation",
+                "message": responses.SUPPLIER_CREATE_CONFIRMATION.format(
+                    name=name,
+                    restaurant=restaurant_name,
+                ),
+                "context_update": {
+                    "pending_action": {
+                        "type": "create_supplier",
+                        "restaurant_id": str(restaurant_id),
+                        "restaurant_name": restaurant_name,
+                        "name": name,
+                    },
+                    "active_restaurant_id": str(restaurant_id),
                 },
-                indent=2,
-            )
-        except Exception as e:
-            db.rollback()
-            logger.exception("create_supplier_failed")
-            return f"Error creating supplier: {str(e)}"
+            },
+            indent=2,
+        )
 
     def get_supplier(args: dict[str, Any]) -> str:
         """Get details of a specific supplier."""

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime as dt
 import uuid
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -59,6 +60,8 @@ def create_db_tools(
     user_id: uuid.UUID,
     actor_role: str,  # User's highest role (for permission checks)
     restaurant_roles: dict[str, str],  # Map of restaurant_id -> role
+    pending_action: dict[str, Any] | None = None,  # Pending action from context
+    user_message: str | None = None,
     chat_id: int | None = None,  # Telegram chat_id for file processing tools
     session_id: uuid.UUID | None = None,  # Session ID for file processing tools
 ) -> dict[str, Tool]:
@@ -93,7 +96,12 @@ def create_db_tools(
         db=db, user_id=user_id, actor_role=actor_role, restaurant_roles=restaurant_roles
     )
     supplier_tools = suppliers.create_supplier_tools(
-        db=db, user_id=user_id, actor_role=actor_role, restaurant_roles=restaurant_roles
+        db=db,
+        user_id=user_id,
+        actor_role=actor_role,
+        restaurant_roles=restaurant_roles,
+        pending_action=pending_action,
+        user_message=user_message,
     )
     file_processing_tools = file_processing.create_file_processing_tools(
         db=db,
