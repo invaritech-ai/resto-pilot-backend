@@ -1,15 +1,11 @@
 """
 Instant message processor for the intent-driven bot.
 
-Processes messages immediately without batching:
-1. Send instant ACK
-2. Load user context
-3. Classify intent
-4. Resolve intent with decision LLM
-5. Execute operation
-6. Generate response with response LLM
-7. Update context
-8. Record telemetry
+Simplified flow:
+1. Load user context
+2. Resolve intent + call tools via a single LLM loop
+3. Send final response
+4. Update context
 """
 
 from __future__ import annotations
@@ -21,35 +17,18 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.ai.intent_classifier import Intent, ClassifiedIntent, classify_intent
-from app.ai.model_config import (
-    get_decision_model,
-    get_intent_model,
-    get_response_model,
-)
-from app.ai.openai_client import (
-    OpenAIError,
-    chat_completions_create_with_http_info,
-    create_chat_completion_text_allow_empty_with_http_info,
-)
-from app.ai.openrouter_generation import extract_openrouter_generation_id
-from app.ai.openrouter_usage import extract_openrouter_usage
+from app.ai.intent_classifier import Intent
+from app.ai.tool_resolver import resolve_with_tools
 from app.conversation import responses
-from app.conversation.context import (
-    load_context,
-    update_context_from_result,
-    get_context_for_classifier,
-)
-from app.conversation.executor import execute_intent, UserContext
+from app.conversation.context import load_context, update_context_from_result
+from app.conversation.executor import UserContext
 from app.core.config import Settings
 from app.db.models.processing_events import ProcessingEvents
 from app.db.models.telegram_messages import TelegramMessages
 from app.db.models.telegram_session import TelegramSessions
 from app.db.models.user import User
-from app.db.models.suppliers import Suppliers
 from app.domain.services.restaurant_service import RestaurantService
 from app.telegram.bot_api import send_message
 from app.workers.telemetry import record_llm_call, record_outgoing_message
@@ -62,58 +41,6 @@ class ProcessResult:
     response_text: str
     response_llm_call_id: uuid.UUID | None = None
 
-
-@dataclass
-class DecisionResult:
-    intent: Intent
-    params: dict[str, Any]
-    confidence: float
-    reason: str | None = None
-    model: str = ""
-    latency_ms: int = 0
-    generation_id: str | None = None
-    usage: dict[str, Any] | None = None
-
-
-DECISION_SYSTEM_PROMPT = """You are an intent resolver for a restaurant management bot.
-Use the classifier output as a hint, but you may override it if the user's message,
-history, and entity candidates clearly support a different intent.
-
-Rules:
-- Choose one intent from the allowed list provided in the user prompt.
-- IDs are internal; users will not provide them. Never ask for IDs.
-- Use candidate entities to map names to IDs when possible.
-
-**Restaurant/Outlet Selection:**
-- When the user mentions a restaurant/outlet name (even with typos, spacing, or partial names),
-  look it up in the "restaurants" array in Entity candidates.
-- Match flexibly: handle typos ("oyful" → "Joyful"), spacing ("joy ful" → "Joyful"), 
-  partial names ("joyful" → "Joyful banquet"), and case variations.
-- Use the exact "id" field (UUID) from the matched restaurant as the restaurant_id parameter.
-- If the user's mention is ambiguous or unclear, keep the raw name in params and explain in reason.
-
-**Supplier Selection:**
-- Similarly, match supplier names flexibly from the "suppliers" array when available.
-- Use the exact "id" field (UUID) from the matched supplier.
-
-- If you cannot resolve an entity, keep the raw name in params and ask for clarification in reason.
-- Use "help" only when the user asks about options or capabilities (help/menu/what can you do).
-- For price list questions, prefer "view_supplier_price_list" over "help".
-- Return ONLY valid JSON with: intent, params, confidence, reason.
-"""
-
-RESPONSE_SYSTEM_PROMPT = """You are a response composer for a restaurant management bot.
-Use only the provided action result and user message. Do not invent facts.
-Keep responses short, informative, and non-technical (1-3 sentences).
-If the action result contains a structured list or formatted block, you may return it unchanged.
-If the user asked for multiple things and the action result covers only one, ask a brief follow-up question.
-Use real Unicode characters; do not escape emojis or other symbols.
-"""
-
-ACK_SYSTEM_PROMPT = """You are an acknowledgment generator for a restaurant management bot.
-Return a single short sentence (max 12 words). No emojis, no markdown.
-If has_file is true, mention that the file is being processed.
-Do not answer the user or provide options. Just acknowledge and signal you're working."""
 
 
 def _get_message_text(messages: list[TelegramMessages]) -> str:
@@ -135,72 +62,6 @@ def _has_file(messages: list[TelegramMessages]) -> tuple[bool, str | None, str |
     return False, None, None
 
 
-def _format_history_for_prompt(
-    history: list[dict[str, str]] | None,
-    limit: int = 20,
-) -> str | None:
-    if not history:
-        return None
-
-    lines: list[str] = []
-    for msg in history[-limit:]:
-        role = msg.get("role", "")
-        content = msg.get("content", "")[:200]
-        if role and content:
-            lines.append(f"{role}: {content}")
-    if not lines:
-        return None
-    return "Recent conversation:\n" + "\n".join(lines)
-
-
-def _build_decision_candidates(
-    db: Session,
-    user: User,
-    context: UserContext,
-    max_suppliers: int = 50,
-    max_staff: int = 50,
-) -> dict[str, Any]:
-    restaurants = _get_user_restaurants(db, user.id)
-    candidates: dict[str, Any] = {"restaurants": restaurants}
-
-    active_restaurant_id = context.active_restaurant_id
-    if not active_restaurant_id and len(restaurants) == 1:
-        active_restaurant_id = restaurants[0]["id"]
-
-    if not active_restaurant_id:
-        return candidates
-
-    try:
-        restaurant_uuid = uuid.UUID(active_restaurant_id)
-    except (ValueError, AttributeError):
-        return candidates
-
-    suppliers = db.scalars(
-        select(Suppliers)
-        .where(
-            Suppliers.restaurant_id == restaurant_uuid,
-            Suppliers.is_active == True,
-        )
-        .order_by(Suppliers.name.asc())
-        .limit(max_suppliers)
-    ).all()
-    candidates["suppliers"] = [{"id": str(s.id), "name": s.name} for s in suppliers]
-
-    members = RestaurantService(db).list_members(restaurant_id=restaurant_uuid)
-    staff_list = []
-    for member, membership in members[:max_staff]:
-        staff_list.append(
-            {
-                "id": str(member.id),
-                "name": member.full_name,
-                "username": member.username,
-                "role": membership.role,
-            }
-        )
-    candidates["staff"] = staff_list
-    return candidates
-
-
 def _decode_unicode_escapes(text: str) -> str:
     if "\\u" not in text:
         return text
@@ -210,301 +71,6 @@ def _decode_unicode_escapes(text: str) -> str:
     except Exception:
         return text
 
-
-def _generate_ack_text(
-    *,
-    settings: Settings,
-    message_text: str,
-    has_file: bool = False,
-    file_kind: str | None = None,
-    db: Session | None = None,
-    session_id: uuid.UUID | None = None,
-    chat_id: int | None = None,
-) -> tuple[str | None, uuid.UUID | None]:
-    model = get_intent_model(settings)
-    ack_settings = (
-        settings.model_copy(update={"openai_model": model})
-        if model != settings.openai_model
-        else settings
-    )
-    ack_settings = ack_settings.model_copy(
-        update={
-            "openai_timeout_seconds": min(ack_settings.openai_timeout_seconds, 6.0)
-        }
-    )
-    user_prompt = json.dumps(
-        {
-            "message": message_text,
-            "has_file": has_file,
-            "file_kind": file_kind,
-        },
-        ensure_ascii=True,
-    )
-
-    try:
-        data, headers, latency_ms = chat_completions_create_with_http_info(
-            settings=ack_settings,
-            messages=[
-                {"role": "system", "content": ACK_SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.2,
-            extra_body={"max_tokens": 40},
-        )
-    except OpenAIError as exc:
-        logger.exception("ack_generation_failed", extra={"error": str(exc)})
-        if db is not None and session_id is not None:
-            llm_call_id = record_llm_call(
-                db=db,
-                session_id=session_id,
-                chat_id=chat_id,
-                purpose="ack_generation",
-                model=model,
-                error=str(exc),
-            )
-            db.commit()
-            return None, llm_call_id
-        return None, None
-
-    usage = extract_openrouter_usage(data)
-    generation_id = extract_openrouter_generation_id(headers=headers, data=data)
-    model_used = data.get("model", model)
-
-    content: str | None = None
-    try:
-        content = data["choices"][0]["message"]["content"]
-        if not isinstance(content, str):
-            raise ValueError("Empty content")
-        content = content.strip()
-        if content.startswith("```"):
-            lines = content.split("\n")
-            content = "\n".join(line for line in lines if not line.startswith("```"))
-        content = " ".join(content.splitlines()).strip()
-        if not content:
-            raise ValueError("Empty content")
-        if len(content) > 140:
-            content = content[:137].rstrip() + "..."
-    except (KeyError, TypeError, ValueError) as exc:
-        logger.warning(
-            "ack_generation_parse_failed",
-            extra={"error": str(exc), "content": content},
-        )
-        content = None
-
-    llm_call_id = None
-    if db is not None and session_id is not None:
-        llm_call_id = record_llm_call(
-            db=db,
-            session_id=session_id,
-            chat_id=chat_id,
-            purpose="ack_generation",
-            model=model_used if isinstance(model_used, str) else model,
-            openrouter_generation_id=generation_id,
-            usage=usage,
-            latency_ms=latency_ms,
-            error=None if content else "ack_generation_empty",
-        )
-        db.commit()
-
-    return _decode_unicode_escapes(content) if content else None, llm_call_id
-
-
-def _resolve_intent_with_llm(
-    *,
-    db: Session,
-    settings: Settings,
-    session_id: uuid.UUID,
-    chat_id: int,
-    message_text: str,
-    classified: ClassifiedIntent,
-    context: dict[str, Any] | None,
-    history: list[dict[str, str]] | None,
-    candidates: dict[str, Any],
-) -> tuple[DecisionResult | None, uuid.UUID | None]:
-    intent_values = [intent.value for intent in Intent]
-    user_prompt_parts = [
-        f"Allowed intents: {intent_values}",
-        f"Classifier result: {json.dumps({'intent': classified.intent.value, 'params': classified.params, 'confidence': classified.confidence})}",
-    ]
-
-    if context:
-        user_prompt_parts.append(f"Active context:\n{json.dumps(context, indent=2)}")
-
-    history_text = _format_history_for_prompt(history, limit=20)
-    if history_text:
-        user_prompt_parts.append(history_text)
-
-    if candidates:
-        user_prompt_parts.append(f"Entity candidates:\n{json.dumps(candidates, indent=2)}")
-
-    user_prompt_parts.append(f"User message: {message_text}")
-    user_prompt = "\n\n".join(user_prompt_parts)
-
-    model = get_decision_model(settings)
-    decision_settings = (
-        settings.model_copy(update={"openai_model": model})
-        if model != settings.openai_model
-        else settings
-    )
-
-    try:
-        data, headers, latency_ms = chat_completions_create_with_http_info(
-            settings=decision_settings,
-            messages=[
-                {"role": "system", "content": DECISION_SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.0,
-        )
-    except OpenAIError as exc:
-        logger.exception("intent_resolution_failed", extra={"error": str(exc)})
-        llm_call_id = record_llm_call(
-            db=db,
-            session_id=session_id,
-            chat_id=chat_id,
-            purpose="intent_resolution",
-            model=model,
-            error=str(exc),
-        )
-        db.commit()
-        return None, llm_call_id
-
-    usage = extract_openrouter_usage(data)
-    generation_id = extract_openrouter_generation_id(headers=headers, data=data)
-    model_used = data.get("model", model)
-
-    content: str | None = None
-    try:
-        content = data["choices"][0]["message"]["content"]
-        if not isinstance(content, str):
-            raise ValueError("Empty content")
-        content = content.strip()
-        if content.startswith("```"):
-            lines = content.split("\n")
-            content = "\n".join(line for line in lines if not line.startswith("```"))
-
-        parsed = json.loads(content)
-        intent_value = parsed.get("intent")
-        params = parsed.get("params") if isinstance(parsed.get("params"), dict) else {}
-        confidence = float(parsed.get("confidence", 0.0))
-        reason = parsed.get("reason")
-
-        intent = Intent(intent_value) if intent_value in intent_values else None
-        if intent is None:
-            raise ValueError("Invalid intent")
-
-        llm_call_id = record_llm_call(
-            db=db,
-            session_id=session_id,
-            chat_id=chat_id,
-            purpose="intent_resolution",
-            model=model_used if isinstance(model_used, str) else model,
-            openrouter_generation_id=generation_id,
-            usage=usage,
-            latency_ms=latency_ms,
-        )
-        db.commit()
-
-        return (
-            DecisionResult(
-                intent=intent,
-                params=params,
-                confidence=confidence,
-                reason=reason if isinstance(reason, str) else None,
-                model=model_used if isinstance(model_used, str) else model,
-                latency_ms=latency_ms,
-                generation_id=generation_id,
-                usage=usage if isinstance(usage, dict) else None,
-            ),
-            llm_call_id,
-        )
-    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
-        logger.warning(
-            "intent_resolution_parse_failed",
-            extra={"error": str(exc), "content": content},
-        )
-        llm_call_id = record_llm_call(
-            db=db,
-            session_id=session_id,
-            chat_id=chat_id,
-            purpose="intent_resolution",
-            model=model_used if isinstance(model_used, str) else model,
-            openrouter_generation_id=generation_id,
-            usage=usage,
-            latency_ms=latency_ms,
-            error=str(exc),
-        )
-        db.commit()
-        return None, llm_call_id
-
-
-def _render_response_with_llm(
-    *,
-    db: Session,
-    settings: Settings,
-    session_id: uuid.UUID,
-    chat_id: int,
-    message_text: str,
-    intent: Intent,
-    action_response: str,
-    success: bool,
-) -> tuple[str | None, uuid.UUID | None]:
-    model = get_response_model(settings)
-    response_settings = (
-        settings.model_copy(update={"openai_model": model})
-        if model != settings.openai_model
-        else settings
-    )
-
-    user_prompt = json.dumps(
-        {
-            "user_message": message_text,
-            "intent": intent.value,
-            "success": success,
-            "action_response": action_response,
-        },
-        indent=2,
-    )
-
-    try:
-        text, data, headers, latency_ms = create_chat_completion_text_allow_empty_with_http_info(
-            settings=response_settings,
-            messages=[
-                {"role": "system", "content": RESPONSE_SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.2,
-        )
-    except OpenAIError as exc:
-        logger.exception("response_generation_failed", extra={"error": str(exc)})
-        llm_call_id = record_llm_call(
-            db=db,
-            session_id=session_id,
-            chat_id=chat_id,
-            purpose="response_generation",
-            model=model,
-            error=str(exc),
-        )
-        db.commit()
-        return None, llm_call_id
-
-    usage = extract_openrouter_usage(data)
-    generation_id = extract_openrouter_generation_id(headers=headers, data=data)
-    model_used = data.get("model", model)
-
-    llm_call_id = record_llm_call(
-        db=db,
-        session_id=session_id,
-        chat_id=chat_id,
-        purpose="response_generation",
-        model=model_used if isinstance(model_used, str) else model,
-        openrouter_generation_id=generation_id,
-        usage=usage,
-        latency_ms=latency_ms,
-    )
-    db.commit()
-
-    return _decode_unicode_escapes(text) if text else text, llm_call_id
 
 
 def _create_closed_session(
@@ -528,6 +94,16 @@ def _create_closed_session(
     return session
 
 
+def _get_user_restaurants(db: Session, user_id: uuid.UUID) -> list[dict[str, Any]]:
+    """Get list of restaurants user has access to."""
+    service = RestaurantService(db)
+    rows = service.list_for_user(user_id=user_id)
+    return [
+        {"id": str(r.id), "name": r.name, "role": m.role}
+        for r, m in rows
+    ]
+
+
 def process_message_instant(
     *,
     db: Session,
@@ -540,7 +116,7 @@ def process_message_instant(
     """
     Process user message instantly and return response metadata.
 
-    This is the main entry point for the new intent-driven bot.
+    This is the main entry point for the intent-driven bot.
     Called directly from handler.py without batching.
 
     Args:
@@ -567,25 +143,12 @@ def process_message_instant(
 
     # Load user context
     context = load_context(db, user)
-    classifier_context = get_context_for_classifier(context, db=db)
 
     # Record start time
     started_at = dt.datetime.now(dt.UTC)
 
     # Handle file uploads specially - detect type with vision
     if has_file and file_id:
-        forced_type = None
-        supplier_id_override = None
-        if context.active_operation == Intent.UPLOAD_PRICE_LIST.value:
-            forced_type = "price_list"
-            supplier_id_override = (
-                context.collected_params.get("supplier_id")
-                if isinstance(context.collected_params, dict)
-                else None
-            )
-            if not supplier_id_override:
-                supplier_id_override = context.active_supplier_id
-
         upload_response, upload_intent = _handle_file_upload(
             db=db,
             user=user,
@@ -596,48 +159,21 @@ def process_message_instant(
             settings=settings,
             session_id=session_id,
             chat_id=chat_id,
-            forced_type=forced_type,
-            supplier_id=supplier_id_override,
         )
 
-        rendered_text, response_llm_call_id = _render_response_with_llm(
-            db=db,
-            settings=settings,
-            session_id=session_id,
-            chat_id=chat_id,
-            message_text=message_text,
-            intent=upload_intent,
-            action_response=upload_response,
-            success=True,
-        )
-        final_text = rendered_text or upload_response
+        response_llm_call_id = None
+        final_text = upload_response
 
         user.last_interaction_at = dt.datetime.now(dt.UTC)
-        if context.active_operation == Intent.UPLOAD_PRICE_LIST.value:
-            context = update_context_from_result(
-                db=db,
-                user=user,
-                context=context,
-                context_update={
-                    "clear": True,
-                    "active_restaurant_id": context.active_restaurant_id,
-                    "active_supplier_id": context.active_supplier_id,
-                },
-            )
         db.add(
             ProcessingEvents(
                 session_id=session_id,
                 at=dt.datetime.now(dt.UTC),
-                event="file_upload_processed_v1",
-                payload_json=json.dumps(
-                    {
-                        "intent": upload_intent.value,
-                        "success": True,
-                        "response_llm_call_id": str(response_llm_call_id)
-                        if response_llm_call_id
-                        else None,
-                    }
-                ),
+                event="file_upload_processed_v2",
+                payload_json=json.dumps({
+                    "intent": upload_intent.value,
+                    "success": True,
+                }),
                 error=None,
             )
         )
@@ -647,122 +183,42 @@ def process_message_instant(
             response_llm_call_id=response_llm_call_id,
         )
 
-    # Classify intent
-    classified = classify_intent(
+    tool_result = resolve_with_tools(
+        db=db,
+        user=user,
         message_text=message_text or "",
-        settings=settings,
-        has_file=has_file,
-        file_kind=file_kind,
-        context=classifier_context,
         history=history,
+        active_restaurant_id=context.active_restaurant_id,
+        active_supplier_id=context.active_supplier_id,
+        settings=settings,
+        chat_id=chat_id,
+        session_id=session_id,
     )
 
-    # Record LLM call for telemetry
-    if classified.usage:
-        record_llm_call(
+    response_llm_call_id = None
+    for call in tool_result.llm_calls:
+        response_llm_call_id = record_llm_call(
             db=db,
             session_id=session_id,
             chat_id=chat_id,
-            purpose="intent_classification",
-            model=classified.model,
-            openrouter_generation_id=classified.generation_id,
-            upstream_id=None,
-            provider_name=None,
-            usage=classified.usage,
-            latency_ms=classified.latency_ms,
-            total_cost_usd=None,
-            error=None,
+            purpose="tool_resolution",
+            model=call.model,
+            openrouter_generation_id=call.generation_id,
+            usage=call.usage,
+            latency_ms=call.latency_ms,
         )
+    if tool_result.llm_calls:
         db.commit()
 
-    logger.info(
-        "intent_classified",
-        extra={
-            "intent": classified.intent.value,
-            "confidence": classified.confidence,
-            "params": classified.params,
-            "chat_id": chat_id,
-            "user_id": str(user.id),
-        },
-    )
-
-    decision_candidates = _build_decision_candidates(db, user, context)
-    decision_result, decision_llm_call_id = _resolve_intent_with_llm(
-        db=db,
-        settings=settings,
-        session_id=session_id,
-        chat_id=chat_id,
-        message_text=message_text,
-        classified=classified,
-        context=classifier_context,
-        history=history,
-        candidates=decision_candidates,
-    )
-
-    final_classified = classified
-    if decision_result and decision_result.intent != Intent.UNKNOWN:
-        final_classified = ClassifiedIntent(
-            intent=decision_result.intent,
-            params=decision_result.params,
-            confidence=decision_result.confidence,
-            model=decision_result.model,
-            latency_ms=decision_result.latency_ms,
-            generation_id=decision_result.generation_id,
-            usage=decision_result.usage or {},
-        )
-
-    db.add(
-        ProcessingEvents(
-            session_id=session_id,
-            at=dt.datetime.now(dt.UTC),
-            event="intent_resolved_v1",
-            payload_json=json.dumps(
-                {
-                    "classifier_intent": classified.intent.value,
-                    "classifier_confidence": classified.confidence,
-                    "decision_intent": final_classified.intent.value,
-                    "decision_confidence": final_classified.confidence,
-                    "override": final_classified.intent.value != classified.intent.value,
-                    "reason": decision_result.reason if decision_result else None,
-                    "decision_llm_call_id": str(decision_llm_call_id)
-                    if decision_llm_call_id
-                    else None,
-                }
-            ),
-            error=None,
-        )
-    )
-    db.commit()
-
-    # Execute the intent
-    result = execute_intent(
-        classified=final_classified,
-        db=db,
-        user=user,
-        context=context,
-        settings=settings,
-    )
-
-    # Update context based on result
-    if result.context_update:
+    if tool_result.context_update:
         context = update_context_from_result(
             db=db,
             user=user,
             context=context,
-            context_update=result.context_update,
+            context_update=tool_result.context_update,
         )
 
-    rendered_text, response_llm_call_id = _render_response_with_llm(
-        db=db,
-        settings=settings,
-        session_id=session_id,
-        chat_id=chat_id,
-        message_text=message_text,
-        intent=final_classified.intent,
-        action_response=result.response,
-        success=result.success,
-    )
-    final_text = rendered_text or result.response
+    final_text = tool_result.response_text
 
     # Update user's last interaction time
     user.last_interaction_at = dt.datetime.now(dt.UTC)
@@ -770,36 +226,11 @@ def process_message_instant(
         ProcessingEvents(
             session_id=session_id,
             at=dt.datetime.now(dt.UTC),
-            event="response_generated_v1",
-            payload_json=json.dumps(
-                {
-                    "intent": final_classified.intent.value,
-                    "success": result.success,
-                    "response_llm_call_id": str(response_llm_call_id)
-                    if response_llm_call_id
-                    else None,
-                }
-            ),
-            error=None,
-        )
-    )
-    db.commit()
-
-    # Log processing event
-    db.add(
-        ProcessingEvents(
-            session_id=session_id,
-            at=dt.datetime.now(dt.UTC),
-            event="instant_processed_v1",
-            payload_json=json.dumps(
-                {
-                    "classifier_intent": classified.intent.value,
-                    "classifier_confidence": classified.confidence,
-                    "final_intent": final_classified.intent.value,
-                    "final_confidence": final_classified.confidence,
-                    "success": result.success,
-                }
-            ),
+            event="tool_response_generated_v1",
+            payload_json=json.dumps({
+                "tool_calls": tool_result.tool_calls,
+                "llm_calls": len(tool_result.llm_calls),
+            }),
             error=None,
         )
     )
@@ -822,19 +253,14 @@ def _handle_file_upload(
     settings: Settings,
     session_id: uuid.UUID,
     chat_id: int,
-    forced_type: str | None = None,
-    supplier_id: str | None = None,
 ) -> tuple[str, Intent]:
     """
-    Handle file upload with vision-based type detection.
+    Handle file upload with type detection.
 
     Flow:
-    1. Detect file type using vision LLM (price list vs invoice)
+    1. Detect file type from caption/context
     2. Queue file processing
     3. Return appropriate response
-
-    For now, we'll use a simplified approach that queues the file
-    and lets the existing file processing workers handle it.
     """
     from app.workers.tasks import (
         process_price_list_file_task,
@@ -846,19 +272,14 @@ def _handle_file_upload(
     # Determine file type from caption/context
     text_lower = (message_text or "").lower()
 
-    is_price_list = forced_type == "price_list" or any(
+    is_price_list = any(
         kw in text_lower
         for kw in ["price list", "pricelist", "prices", "rate card", "catalog"]
     )
-    is_invoice = forced_type == "invoice" or any(
+    is_invoice = any(
         kw in text_lower
         for kw in ["invoice", "bill", "receipt", "challan"]
     )
-
-    if forced_type == "price_list":
-        is_invoice = False
-    elif forced_type == "invoice":
-        is_price_list = False
 
     intent_guess = Intent.UPLOAD_PRICE_LIST if is_price_list else Intent.UPLOAD_INVOICE
 
@@ -873,19 +294,10 @@ def _handle_file_upload(
         restaurant_id = restaurants[0]["id"]
 
     if not restaurant_id:
-        # Need to ask which outlet
-        # Store file info in context for later
-        context.staging_id = None  # Will be set after processing
-        context.collected_params = {
-            "file_id": file_id,
-            "file_kind": file_kind,
-            "detected_type": "price_list" if is_price_list else ("invoice" if is_invoice else "unknown"),
-        }
-        context.active_operation = "file_upload"
-        context.pending_params = ["restaurant_id"]
-        _save_context(db, user, context)
-
         return responses.outlet_select_prompt(restaurants), intent_guess
+
+    # Get supplier_id from context if available
+    supplier_id = context.active_supplier_id
 
     # Queue the appropriate processing task
     task_kwargs = {
@@ -918,28 +330,6 @@ def _handle_file_upload(
         return responses.FILE_PROCESSING_STARTED.format(file_type="file"), intent_guess
 
 
-def _get_user_restaurants(db: Session, user_id: uuid.UUID) -> list[dict[str, Any]]:
-    """Get list of restaurants user has access to."""
-    from app.domain.services.restaurant_service import RestaurantService
-
-    service = RestaurantService(db)
-    rows = service.list_for_user(user_id=user_id)
-    return [
-        {
-            "id": str(r.id),
-            "name": r.name,
-            "role": m.role,
-        }
-        for r, m in rows
-    ]
-
-
-def _save_context(db: Session, user: User, context: UserContext) -> None:
-    """Save context to user."""
-    user.state_data = context.to_dict()
-    db.add(user)
-
-
 def send_ack_message(
     *,
     chat_id: int,
@@ -947,31 +337,18 @@ def send_ack_message(
     has_file: bool = False,
     file_kind: str | None = None,
     message_text: str = "",
-    # Optional telemetry params
     db: Session | None = None,
     session_id: uuid.UUID | None = None,
 ) -> int | None:
     """
     Send instant acknowledgment message.
 
-    If db and session_id are provided, records the ACK in telegram_outgoing_messages.
+    Uses static ACK messages instead of LLM generation.
 
     Returns the Telegram message ID or None if sending failed.
     """
-    llm_call_id: uuid.UUID | None = None
     text = responses.ACK_FILE_PROCESSING if has_file else responses.ACK_PROCESSING
-    if message_text.strip() or has_file:
-        ack_text, llm_call_id = _generate_ack_text(
-            settings=settings,
-            message_text=message_text,
-            has_file=has_file,
-            file_kind=file_kind,
-            db=db,
-            session_id=session_id,
-            chat_id=chat_id,
-        )
-        if ack_text:
-            text = ack_text
+    
     try:
         telegram_message_id = send_message(chat_id=chat_id, text=text, settings=settings)
 
@@ -984,7 +361,7 @@ def send_ack_message(
                 kind="ack",
                 text=text,
                 telegram_message_id=telegram_message_id,
-                llm_call_id=llm_call_id,
+                llm_call_id=None,
             )
 
         return telegram_message_id

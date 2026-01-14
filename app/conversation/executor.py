@@ -1,16 +1,14 @@
 """
-Intent executor that maps classified intents to database operations.
+Intent executor that maps resolved intents to database operations.
 
-Reuses existing db_tools handlers where possible, wrapping them with
-context-aware parameter handling and template responses.
+Simplified version that expects all params to be resolved by the intent resolver.
+No validation loops or multi-step prompting.
 """
 
 from __future__ import annotations
 
 import datetime as dt
-import json
 import logging
-import re
 import uuid
 from urllib.parse import parse_qs, urlparse
 from dataclasses import dataclass, field
@@ -19,7 +17,8 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.ai.intent_classifier import Intent, ClassifiedIntent, get_missing_param_prompt
+from app.ai.intent_classifier import Intent
+from app.ai.intent_resolver import ResolvedIntent
 from app.conversation import responses
 from app.db.models.restaurant import Restaurant
 from app.db.models.restaurant_user import RestaurantUser
@@ -39,32 +38,21 @@ class ExecutionResult:
 
     response: str
     success: bool = True
-    # For multi-step flows
-    needs_input: bool = False
-    prompt: str | None = None
     # Context to persist
     context_update: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
 class UserContext:
-    """User's current operation context."""
+    """User's current context - simplified to just active entities."""
 
-    active_operation: str | None = None
-    pending_params: list[str] = field(default_factory=list)
-    collected_params: dict[str, Any] = field(default_factory=dict)
     active_restaurant_id: str | None = None
     active_supplier_id: str | None = None
-    staging_id: str | None = None  # For file processing
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "active_operation": self.active_operation,
-            "pending_params": self.pending_params,
-            "collected_params": self.collected_params,
             "active_restaurant_id": self.active_restaurant_id,
             "active_supplier_id": self.active_supplier_id,
-            "staging_id": self.staging_id,
         }
 
     @classmethod
@@ -72,12 +60,8 @@ class UserContext:
         if not data:
             return cls()
         return cls(
-            active_operation=data.get("active_operation"),
-            pending_params=data.get("pending_params", []),
-            collected_params=data.get("collected_params", {}),
             active_restaurant_id=data.get("active_restaurant_id"),
             active_supplier_id=data.get("active_supplier_id"),
-            staging_id=data.get("staging_id"),
         )
 
 
@@ -85,192 +69,12 @@ def _get_user_restaurants(db: Session, user_id: uuid.UUID) -> list[dict[str, Any
     """Get list of restaurants user has access to."""
     service = RestaurantService(db)
     rows = service.list_for_user(user_id=user_id)
-    return [
-        {
-            "id": str(r.id),
-            "name": r.name,
-            "role": m.role,
-        }
-        for r, m in rows
-    ]
+    return [{"id": str(r.id), "name": r.name, "role": m.role} for r, m in rows]
 
 
-def _match_by_name_or_number(
-    search_value: str,
-    items: list[dict[str, Any]],
-    name_key: str = "name",
-    id_key: str = "id",
-) -> str | None:
-    """
-    Match an item by name, partial name, or list number.
-    
-    Uses prioritized matching:
-    1. Number match (1-indexed)
-    2. Exact name match (case-insensitive)
-    3. Word-boundary match (matches whole words at word boundaries)
-    4. Substring match (fallback)
-    
-    Args:
-        search_value: User's input (name, partial name, or number like "1", "2")
-        items: List of dicts with at least name_key and id_key
-        name_key: Key to use for name matching
-        id_key: Key to return as the matched ID
-    
-    Returns:
-        The matched item's ID, or None if no match
-    """
-    if not search_value or not items:
-        return None
-    
-    search_value = search_value.strip()
-    logger.debug(
-        "Matching search_value=%r against %d items",
-        search_value,
-        len(items),
-    )
-    
-    # Try to match by number (1, 2, 3, etc) - 1-indexed
-    if search_value.isdigit():
-        idx = int(search_value) - 1
-        if 0 <= idx < len(items):
-            matched_item = items[idx]
-            logger.debug(
-                "Matched by number: %d -> %s (%s)",
-                idx + 1,
-                matched_item.get(name_key),
-                matched_item.get(id_key),
-            )
-            return matched_item[id_key]
-    
-    search_lower = search_value.lower()
-    
-    # Collect all matches with their priority
-    exact_matches = []
-    word_boundary_matches = []
-    substring_matches = []
-    
-    for item in items:
-        item_name = item[name_key]
-        item_name_lower = item_name.lower()
-        
-        # Priority 1: Exact match (case-insensitive)
-        if item_name_lower == search_lower:
-            exact_matches.append(item)
-            continue
-        
-        # Priority 2: Word-boundary match
-        # Check if search term matches the start of any word in the item name
-        # Split by whitespace and check if any word starts with the search term
-        words = re.split(r'\s+', item_name_lower)
-        if any(word.startswith(search_lower) for word in words):
-            word_boundary_matches.append(item)
-            continue
-        
-        # Priority 3: Substring match (fallback)
-        if search_lower in item_name_lower:
-            substring_matches.append(item)
-    
-    # Return the best match (prioritize exact > word-boundary > substring)
-    if exact_matches:
-        matched_item = exact_matches[0]
-        logger.debug(
-            "Matched by exact name: %r -> %s (%s)",
-            search_value,
-            matched_item.get(name_key),
-            matched_item.get(id_key),
-        )
-        return matched_item[id_key]
-    
-    if word_boundary_matches:
-        matched_item = word_boundary_matches[0]
-        logger.debug(
-            "Matched by word boundary: %r -> %s (%s)",
-            search_value,
-            matched_item.get(name_key),
-            matched_item.get(id_key),
-        )
-        return matched_item[id_key]
-    
-    if substring_matches:
-        matched_item = substring_matches[0]
-        logger.debug(
-            "Matched by substring: %r -> %s (%s)",
-            search_value,
-            matched_item.get(name_key),
-            matched_item.get(id_key),
-        )
-        return matched_item[id_key]
-    
-    logger.debug("No match found for %r", search_value)
-    return None
-
-
-def _resolve_restaurant_id(
-    db: Session,
-    user_id: uuid.UUID,
-    context: UserContext,
-    params: dict[str, Any],
-) -> tuple[str | None, str | None]:
-    """
-    Resolve restaurant_id from params, context, or auto-select if only one.
-    Returns (restaurant_id, error_message).
-    
-    Handles multiple input formats:
-    - Valid UUID string (preferred - from LLM selection)
-    - Restaurant name (fuzzy match - fallback)
-    - Number (1, 2, 3) referring to list position
-    """
-    restaurants = _get_user_restaurants(db, user_id)
-    if not restaurants:
-        return None, responses.ERROR_NO_OUTLETS
-
-    # Check if provided in params
-    param_value = params.get("restaurant_id", "").strip() if params.get("restaurant_id") else ""
-    
-    if param_value:
-        # Priority 1: Try to parse as UUID first (LLM should return this)
-        try:
-            uuid.UUID(param_value)
-            # Valid UUID - verify user has access
-            if any(r["id"] == param_value for r in restaurants):
-                logger.debug(
-                    "Resolved restaurant_id from LLM selection: %s",
-                    param_value,
-                )
-                return param_value, None
-            else:
-                logger.warning(
-                    "LLM selected restaurant_id %s but user doesn't have access",
-                    param_value,
-                )
-                return None, responses.OUTLET_NO_ACCESS
-        except ValueError:
-            # Not a UUID - LLM didn't resolve it, fall back to string matching
-            logger.debug(
-                "LLM didn't resolve restaurant_id (got %r), falling back to string matching",
-                param_value,
-            )
-            matched_id = _match_by_name_or_number(param_value, restaurants)
-            if matched_id:
-                return matched_id, None
-            
-            # No match found - will prompt for selection
-
-    # Check context
-    if context.active_restaurant_id:
-        # Verify context restaurant is still accessible
-        if any(r["id"] == context.active_restaurant_id for r in restaurants):
-            return context.active_restaurant_id, None
-
-    # Auto-select if user has only one restaurant
-    if len(restaurants) == 1:
-        return restaurants[0]["id"], None
-
-    # Multiple restaurants - need to ask
-    return None, None  # Will prompt for selection
-
-
-def _is_restaurant_owner(db: Session, user_id: uuid.UUID, restaurant_id: uuid.UUID) -> bool:
+def _is_restaurant_owner(
+    db: Session, user_id: uuid.UUID, restaurant_id: uuid.UUID
+) -> bool:
     """Check if user is owner of a specific restaurant."""
     membership = db.scalar(
         select(RestaurantUser).where(
@@ -281,49 +85,6 @@ def _is_restaurant_owner(db: Session, user_id: uuid.UUID, restaurant_id: uuid.UU
         )
     )
     return membership is not None
-
-
-def _resolve_supplier_id(
-    db: Session,
-    restaurant_id: str,
-    param_value: str | None,
-) -> str | None:
-    """
-    Resolve supplier_id from user input.
-    
-    Handles:
-    - Valid UUID string
-    - Supplier name (fuzzy match)
-    - Number (1, 2, 3) referring to list position
-    
-    Returns supplier_id as string or None if not resolved.
-    """
-    if not param_value:
-        return None
-    
-    param_value = param_value.strip()
-    
-    # Try to parse as UUID first
-    try:
-        uuid.UUID(param_value)
-        return param_value
-    except ValueError:
-        pass
-    
-    # Load suppliers for this restaurant
-    suppliers = db.scalars(
-        select(Suppliers).where(
-            Suppliers.restaurant_id == uuid.UUID(restaurant_id),
-            Suppliers.is_active == True,
-        ).order_by(Suppliers.name.asc())
-    ).all()
-    
-    if not suppliers:
-        return None
-    
-    # Convert to list of dicts for the helper
-    supplier_list = [{"id": str(s.id), "name": s.name} for s in suppliers]
-    return _match_by_name_or_number(param_value, supplier_list)
 
 
 def _safe_uuid(value: str | None) -> uuid.UUID | None:
@@ -353,46 +114,126 @@ def _extract_invite_code(value: str) -> str:
     return raw
 
 
+def _get_restaurant_id(
+    params: dict[str, Any],
+    context: UserContext,
+    db: Session,
+    user_id: uuid.UUID,
+) -> str | None:
+    """Get restaurant_id from params, context, or auto-select if only one.
+    
+    SECURITY: Validates that the user has access to the restaurant.
+    """
+    # Check params first
+    restaurant_id = params.get("restaurant_id")
+    if restaurant_id:
+        restaurant_id_str = (
+            str(restaurant_id).strip()
+            if isinstance(restaurant_id, str)
+            else str(restaurant_id)
+        )
+        # Validate access
+        restaurants = _get_user_restaurants(db, user_id)
+        if any(r["id"] == restaurant_id_str for r in restaurants):
+            return restaurant_id_str
+        # Invalid or unauthorized - return None to trigger error
+
+    # Check context
+    if context.active_restaurant_id:
+        # Validate context restaurant is still accessible
+        restaurants = _get_user_restaurants(db, user_id)
+        if any(r["id"] == context.active_restaurant_id for r in restaurants):
+            return context.active_restaurant_id
+
+    # Auto-select if only one restaurant
+    restaurants = _get_user_restaurants(db, user_id)
+    if len(restaurants) == 1:
+        return restaurants[0]["id"]
+
+    return None
+
+
+def _get_supplier_id(
+    params: dict[str, Any],
+    context: UserContext,
+    db: Session,
+    user_id: uuid.UUID,
+) -> str | None:
+    """Get supplier_id from params or context.
+    
+    SECURITY: Validates that the supplier belongs to a restaurant the user has access to.
+    """
+    supplier_id = params.get("supplier_id")
+    if supplier_id:
+        supplier_id_str = (
+            str(supplier_id).strip()
+            if isinstance(supplier_id, str)
+            else str(supplier_id)
+        )
+        # Validate access - check supplier belongs to user's restaurant
+        try:
+            supplier = db.get(Suppliers, uuid.UUID(supplier_id_str))
+            if supplier:
+                # Check user has access to the supplier's restaurant
+                restaurants = _get_user_restaurants(db, user_id)
+                if any(r["id"] == str(supplier.restaurant_id) for r in restaurants):
+                    return supplier_id_str
+        except (ValueError, AttributeError):
+            pass
+        # Invalid or unauthorized - return None
+    
+    # Check context
+    if context.active_supplier_id:
+        # Validate context supplier is still accessible
+        try:
+            supplier = db.get(Suppliers, uuid.UUID(context.active_supplier_id))
+            if supplier:
+                restaurants = _get_user_restaurants(db, user_id)
+                if any(r["id"] == str(supplier.restaurant_id) for r in restaurants):
+                    return context.active_supplier_id
+        except (ValueError, AttributeError):
+            pass
+    
+    return None
+
+
 def execute_intent(
     *,
-    classified: ClassifiedIntent,
+    resolved: ResolvedIntent,
     db: Session,
     user: User,
     context: UserContext,
     settings: Settings | None = None,
 ) -> ExecutionResult:
     """
-    Execute a classified intent.
+    Execute a resolved intent.
 
     Args:
-        classified: The classified intent with params
+        resolved: The resolved intent with fully resolved params
         db: Database session
         user: Current user
-        context: User's operation context
+        context: User's context (active restaurant/supplier)
         settings: App settings (optional, will load if not provided)
 
     Returns:
         ExecutionResult with response text and context updates
     """
     settings = settings or get_settings()
-    intent = classified.intent
-    params = classified.params
+    intent = resolved.intent
+    params = resolved.params
 
-    # Merge with context params for multi-step flows
-    if context.active_operation == intent.value:
-        params = {**context.collected_params, **params}
+    # Handle clarification needed
+    if resolved.needs_clarification and resolved.clarification_message:
+        return ExecutionResult(response=resolved.clarification_message, success=False)
 
     # Navigation intents
     if intent == Intent.SHOW_MENU:
         return ExecutionResult(response=responses.MAIN_MENU)
 
     if intent == Intent.CANCEL:
-        if context.active_operation:
             return ExecutionResult(
-                response=responses.CANCEL_SUCCESS,
-                context_update={"clear": True},
+            response=responses.CANCEL_SUCCESS, context_update={"clear": True}
             )
-        return ExecutionResult(response=responses.CANCEL_NOTHING)
 
     if intent == Intent.UNKNOWN:
         return ExecutionResult(response=responses.CANT_HELP, success=False)
@@ -402,14 +243,14 @@ def execute_intent(
         return _execute_view_profile(user)
 
     if intent == Intent.HELP:
-        topic = params.get("topic") if isinstance(params, dict) else None
+        topic = params.get("topic")
         return ExecutionResult(response=responses.help_topic(topic))
 
     if intent == Intent.UPDATE_NAME:
-        return _execute_update_name(db, user, params, context)
+        return _execute_update_name(db, user, params)
 
     if intent == Intent.UPDATE_PHONE:
-        return _execute_update_phone(db, user, params, context)
+        return _execute_update_phone(db, user, params)
 
     if intent == Intent.UPLOAD_PRICE_LIST:
         return _execute_upload_price_list(db, user, params, context)
@@ -419,7 +260,7 @@ def execute_intent(
         return _execute_list_outlets(db, user)
 
     if intent == Intent.ADD_OUTLET:
-        return _execute_add_outlet(db, user, params, context)
+        return _execute_add_outlet(db, user, params)
 
     if intent == Intent.UPDATE_OUTLET:
         return _execute_update_outlet(db, user, params, context)
@@ -468,20 +309,20 @@ def execute_intent(
         return _execute_list_invoices(db, user, params, context)
 
     if intent == Intent.VIEW_INVOICE:
-        return _execute_view_invoice(db, user, params, context)
+        return _execute_view_invoice(db, user, params)
 
     # Inventory intents
     if intent == Intent.LIST_INVENTORY:
         return _execute_list_inventory(db, user, params, context)
 
     if intent == Intent.ADD_INVENTORY:
-        return _execute_add_inventory(db, user, params, context)
+        return _execute_add_inventory()
 
     if intent == Intent.UPDATE_INVENTORY:
-        return _execute_update_inventory(db, user, params, context)
+        return _execute_update_inventory()
 
     if intent == Intent.LOG_INVENTORY_USAGE:
-        return _execute_log_inventory_usage(db, user, params, context)
+        return _execute_log_inventory_usage(db, user, params)
 
     if intent == Intent.LIST_LOCATIONS:
         return _execute_list_locations(db, user, params, context)
@@ -516,18 +357,12 @@ def _execute_update_name(
     db: Session,
     user: User,
     params: dict[str, Any],
-    context: UserContext,
 ) -> ExecutionResult:
-    name = params.get("name", "").strip()
+    name_raw = params.get("name")
+    name = str(name_raw).strip() if name_raw else ""
     if not name:
         return ExecutionResult(
-            response=get_missing_param_prompt(Intent.UPDATE_NAME, "name"),
-            needs_input=True,
-            context_update={
-                "active_operation": Intent.UPDATE_NAME.value,
-                "pending_params": ["name"],
-                "collected_params": params,
-            },
+            response="Please provide the name you want to use.", success=False
         )
 
     user.full_name = name
@@ -547,18 +382,12 @@ def _execute_update_phone(
     db: Session,
     user: User,
     params: dict[str, Any],
-    context: UserContext,
 ) -> ExecutionResult:
-    phone = params.get("phone", "").strip()
+    phone_raw = params.get("phone")
+    phone = str(phone_raw).strip() if phone_raw else ""
     if not phone:
         return ExecutionResult(
-            response=get_missing_param_prompt(Intent.UPDATE_PHONE, "phone"),
-            needs_input=True,
-            context_update={
-                "active_operation": Intent.UPDATE_PHONE.value,
-                "pending_params": ["phone"],
-                "collected_params": params,
-            },
+            response="Please provide your phone number.", success=False
         )
 
     user.phone = phone
@@ -586,75 +415,18 @@ def _execute_upload_price_list(
     params: dict[str, Any],
     context: UserContext,
 ) -> ExecutionResult:
-    supplier_id_raw = (
-        params.get("supplier_id")
-        or params.get("supplier")
-        or params.get("supplier_name")
-        or params.get("name")
-    )
-    if not supplier_id_raw and context.active_supplier_id:
-        supplier_id_raw = context.active_supplier_id
+    supplier_id = _get_supplier_id(params, context, db, user.id)
+    if not supplier_id:
+        return ExecutionResult(response=responses.FILE_MISSING_SUPPLIER, success=False)
 
-    restaurant_id = context.active_restaurant_id
-    if not restaurant_id:
-        restaurants = _get_user_restaurants(db, user.id)
-        if len(restaurants) == 1:
-            restaurant_id = restaurants[0]["id"]
-        elif restaurants:
-            return ExecutionResult(
-                response=responses.outlet_select_prompt(restaurants),
-                needs_input=True,
-                context_update={
-                    "active_operation": Intent.UPLOAD_PRICE_LIST.value,
-                    "pending_params": ["restaurant_id"],
-                    "collected_params": params,
-                },
-            )
-
-    supplier_id: str | None = None
-    supplier_name: str | None = None
-
-    if supplier_id_raw:
-        raw_value = str(supplier_id_raw).strip()
-        if _safe_uuid(raw_value):
-            supplier_id = raw_value
-        else:
-            supplier_name = raw_value
-
-    if supplier_id is None and supplier_name and restaurant_id:
-        supplier_id = _resolve_supplier_id(db, restaurant_id, supplier_name)
-
-    supplier = None
-    if supplier_id:
         supplier = db.get(Suppliers, uuid.UUID(supplier_id))
-        if supplier:
-            restaurant_id = str(supplier.restaurant_id)
-
     if not supplier:
-        prompt = responses.FILE_MISSING_SUPPLIER
-        return ExecutionResult(
-            response=prompt,
-            needs_input=True,
-            context_update={
-                "active_operation": Intent.UPLOAD_PRICE_LIST.value,
-                "pending_params": ["supplier_id"],
-                "collected_params": {
-                    **params,
-                    "restaurant_id": restaurant_id,
-                },
-            },
-        )
+        return ExecutionResult(response=responses.SUPPLIER_NOT_FOUND, success=False)
 
     return ExecutionResult(
         response=responses.FILE_UPLOAD_PRICE_LIST_PROMPT.format(supplier=supplier.name),
-        needs_input=True,
         context_update={
-            "active_operation": Intent.UPLOAD_PRICE_LIST.value,
-            "pending_params": ["file_id"],
-            "collected_params": {
-                "supplier_id": str(supplier.id),
-            },
-            "active_restaurant_id": restaurant_id,
+            "active_restaurant_id": str(supplier.restaurant_id),
             "active_supplier_id": str(supplier.id),
         },
     )
@@ -674,18 +446,12 @@ def _execute_add_outlet(
     db: Session,
     user: User,
     params: dict[str, Any],
-    context: UserContext,
 ) -> ExecutionResult:
-    name = params.get("name", "").strip()
+    name_raw = params.get("name")
+    name = str(name_raw).strip() if name_raw else ""
     if not name:
         return ExecutionResult(
-            response=get_missing_param_prompt(Intent.ADD_OUTLET, "name"),
-            needs_input=True,
-            context_update={
-                "active_operation": Intent.ADD_OUTLET.value,
-                "pending_params": ["name"],
-                "collected_params": params,
-            },
+            response="Please provide a name for the outlet.", success=False
         )
 
     try:
@@ -707,36 +473,22 @@ def _execute_update_outlet(
     params: dict[str, Any],
     context: UserContext,
 ) -> ExecutionResult:
-    restaurant_id, error = _resolve_restaurant_id(db, user.id, context, params)
-    if error:
-        return ExecutionResult(response=error, success=False)
-
+    restaurant_id = _get_restaurant_id(params, context, db, user.id)
     if not restaurant_id:
         restaurants = _get_user_restaurants(db, user.id)
         return ExecutionResult(
             response=responses.outlet_select_prompt(restaurants),
-            needs_input=True,
-            context_update={
-                "active_operation": Intent.UPDATE_OUTLET.value,
-                "pending_params": ["restaurant_id", "name"],
-                "collected_params": params,
-            },
+            success=False,
         )
 
-    # Check ownership
     if not _is_restaurant_owner(db, user.id, uuid.UUID(restaurant_id)):
         return ExecutionResult(response=responses.OUTLET_NO_ACCESS, success=False)
 
-    name = params.get("name", "").strip()
+    name_raw = params.get("name")
+    name = str(name_raw).strip() if name_raw else ""
     if not name:
         return ExecutionResult(
-            response=get_missing_param_prompt(Intent.UPDATE_OUTLET, "name"),
-            needs_input=True,
-            context_update={
-                "active_operation": Intent.UPDATE_OUTLET.value,
-                "pending_params": ["name"],
-                "collected_params": {**params, "restaurant_id": restaurant_id},
-            },
+            response="Please provide the new name for the outlet.", success=False
         )
 
     restaurant = db.get(Restaurant, uuid.UUID(restaurant_id))
@@ -767,20 +519,14 @@ def _execute_list_staff(
     params: dict[str, Any],
     context: UserContext,
 ) -> ExecutionResult:
-    restaurant_id, error = _resolve_restaurant_id(db, user.id, context, params)
-    if error:
-        return ExecutionResult(response=error, success=False)
-
+    restaurant_id = _get_restaurant_id(params, context, db, user.id)
     if not restaurant_id:
         restaurants = _get_user_restaurants(db, user.id)
+        if not restaurants:
+            return ExecutionResult(response=responses.ERROR_NO_OUTLETS, success=False)
         return ExecutionResult(
             response=responses.outlet_select_prompt(restaurants),
-            needs_input=True,
-            context_update={
-                "active_operation": Intent.LIST_STAFF.value,
-                "pending_params": ["restaurant_id"],
-                "collected_params": params,
-            },
+            success=False,
         )
 
     service = RestaurantService(db)
@@ -788,11 +534,7 @@ def _execute_list_staff(
     restaurant = db.get(Restaurant, uuid.UUID(restaurant_id))
 
     formatted = [
-        {
-            "name": u.full_name,
-            "username": u.username,
-            "role": m.role,
-        }
+        {"name": u.full_name, "username": u.username, "role": m.role}
         for u, m in members
     ]
 
@@ -812,27 +554,21 @@ def _execute_add_staff(
     context: UserContext,
     settings: Settings,
 ) -> ExecutionResult:
-    restaurant_id, error = _resolve_restaurant_id(db, user.id, context, params)
-    if error:
-        return ExecutionResult(response=error, success=False)
-
+    restaurant_id = _get_restaurant_id(params, context, db, user.id)
     if not restaurant_id:
         restaurants = _get_user_restaurants(db, user.id)
+        if not restaurants:
+            return ExecutionResult(response=responses.ERROR_NO_OUTLETS, success=False)
         return ExecutionResult(
             response=responses.outlet_select_prompt(restaurants),
-            needs_input=True,
-            context_update={
-                "active_operation": Intent.ADD_STAFF.value,
-                "pending_params": ["restaurant_id"],
-                "collected_params": params,
-            },
+            success=False,
         )
 
-    # Check ownership
     if not _is_restaurant_owner(db, user.id, uuid.UUID(restaurant_id)):
         return ExecutionResult(response=responses.STAFF_NOT_OWNER, success=False)
 
-    role = params.get("role", "staff").lower()
+    role_raw = params.get("role", "staff")
+    role = str(role_raw).lower() if role_raw else "staff"
     if role not in ("staff", "owner"):
         role = "staff"
 
@@ -868,65 +604,19 @@ def _execute_revoke_staff(
     params: dict[str, Any],
     context: UserContext,
 ) -> ExecutionResult:
-    restaurant_id, error = _resolve_restaurant_id(db, user.id, context, params)
-    if error:
-        return ExecutionResult(response=error, success=False)
-
+    restaurant_id = _get_restaurant_id(params, context, db, user.id)
     if not restaurant_id:
-        restaurants = _get_user_restaurants(db, user.id)
-        return ExecutionResult(
-            response=responses.outlet_select_prompt(restaurants),
-            needs_input=True,
-            context_update={
-                "active_operation": Intent.REVOKE_STAFF.value,
-                "pending_params": ["restaurant_id", "user_id"],
-                "collected_params": params,
-            },
-        )
+        return ExecutionResult(response="Please specify which outlet.", success=False)
 
-    # Check ownership
     if not _is_restaurant_owner(db, user.id, uuid.UUID(restaurant_id)):
         return ExecutionResult(response=responses.STAFF_NOT_OWNER, success=False)
 
-    target_user_id_raw = params.get("user_id", "").strip() if params.get("user_id") else ""
-    if not target_user_id_raw:
-        return ExecutionResult(
-            response=get_missing_param_prompt(Intent.REVOKE_STAFF, "user_id"),
-            needs_input=True,
-            context_update={
-                "active_operation": Intent.REVOKE_STAFF.value,
-                "pending_params": ["user_id"],
-                "collected_params": {**params, "restaurant_id": restaurant_id},
-            },
-        )
-
-    # Resolve user_id - try UUID first, then by name/number
-    target_user_id = None
-    if _safe_uuid(target_user_id_raw):
-        target_user_id = target_user_id_raw
-    else:
-        # Get members and try to match by name or number
-        service = RestaurantService(db)
-        members = service.list_members(restaurant_id=uuid.UUID(restaurant_id))
-        
-        # Try number match (1, 2, 3...)
-        if target_user_id_raw.isdigit():
-            idx = int(target_user_id_raw) - 1
-            if 0 <= idx < len(members):
-                target_user_id = str(members[idx][0].id)
-        else:
-            # Try name match
-            search_lower = target_user_id_raw.lower()
-            for u, m in members:
-                if u.full_name and search_lower in u.full_name.lower():
-                    target_user_id = str(u.id)
-                    break
-                if u.username and search_lower in u.username.lower():
-                    target_user_id = str(u.id)
-                    break
-    
+    target_user_id_raw = params.get("user_id")
+    target_user_id = str(target_user_id_raw).strip() if target_user_id_raw else ""
     if not target_user_id:
-        return ExecutionResult(response="User not found. Please provide a valid user name or number.", success=False)
+        return ExecutionResult(
+            response="Please specify which staff member to remove.", success=False
+        )
 
     # Can't revoke self
     if target_user_id == str(user.id):
@@ -941,7 +631,9 @@ def _execute_revoke_staff(
     )
 
     if not membership:
-        return ExecutionResult(response="User is not a member of this outlet.", success=False)
+        return ExecutionResult(
+            response="User is not a member of this outlet.", success=False
+        )
 
     try:
         membership.status = "removed"
@@ -953,7 +645,9 @@ def _execute_revoke_staff(
         restaurant_name = restaurant.name if restaurant else "outlet"
 
         return ExecutionResult(
-            response=responses.STAFF_REVOKED.format(name=name, restaurant=restaurant_name),
+            response=responses.STAFF_REVOKED.format(
+                name=name, restaurant=restaurant_name
+            ),
             context_update={"clear": True},
         )
     except Exception as e:
@@ -974,20 +668,14 @@ def _execute_list_invites(
     context: UserContext,
     settings: Settings,
 ) -> ExecutionResult:
-    restaurant_id, error = _resolve_restaurant_id(db, user.id, context, params)
-    if error:
-        return ExecutionResult(response=error, success=False)
-
+    restaurant_id = _get_restaurant_id(params, context, db, user.id)
     if not restaurant_id:
         restaurants = _get_user_restaurants(db, user.id)
+        if not restaurants:
+            return ExecutionResult(response=responses.ERROR_NO_OUTLETS, success=False)
         return ExecutionResult(
             response=responses.outlet_select_prompt(restaurants),
-            needs_input=True,
-            context_update={
-                "active_operation": Intent.LIST_INVITES.value,
-                "pending_params": ["restaurant_id"],
-                "collected_params": params,
-            },
+            success=False,
         )
 
     if not _is_restaurant_owner(db, user.id, uuid.UUID(restaurant_id)):
@@ -1014,7 +702,9 @@ def _execute_list_invites(
             {
                 "code": invite.code,
                 "role": invite.role,
-                "expires_at": invite.expires_at.strftime("%Y-%m-%d") if invite.expires_at else "Never",
+                "expires_at": invite.expires_at.strftime("%Y-%m-%d")
+                if invite.expires_at
+                else "Never",
                 "link": deep_link,
             }
         )
@@ -1034,20 +724,10 @@ def _execute_move_invite(
     params: dict[str, Any],
     context: UserContext,
 ) -> ExecutionResult:
-    restaurant_id, error = _resolve_restaurant_id(db, user.id, context, params)
-    if error:
-        return ExecutionResult(response=error, success=False)
-
+    restaurant_id = _get_restaurant_id(params, context, db, user.id)
     if not restaurant_id:
-        restaurants = _get_user_restaurants(db, user.id)
         return ExecutionResult(
-            response=responses.outlet_select_prompt(restaurants),
-            needs_input=True,
-            context_update={
-                "active_operation": Intent.MOVE_INVITE.value,
-                "pending_params": ["restaurant_id"],
-                "collected_params": params,
-            },
+            response="Please specify which outlet to move the invite to.", success=False
         )
 
     invite_code_raw = (
@@ -1056,17 +736,12 @@ def _execute_move_invite(
         or params.get("invite")
         or params.get("invite_link")
     )
-    invite_code = _extract_invite_code(str(invite_code_raw)) if invite_code_raw else ""
+    if invite_code_raw:
+        invite_code = _extract_invite_code(str(invite_code_raw))
+    else:
+        invite_code = ""
     if not invite_code:
-        return ExecutionResult(
-            response=responses.INVITE_MOVE_NEED_CODE,
-            needs_input=True,
-            context_update={
-                "active_operation": Intent.MOVE_INVITE.value,
-                "pending_params": ["invite_code"],
-                "collected_params": {**params, "restaurant_id": restaurant_id},
-            },
-        )
+        return ExecutionResult(response=responses.INVITE_MOVE_NEED_CODE, success=False)
 
     from app.db.models.invite_codes import InviteCodes
 
@@ -1080,16 +755,18 @@ def _execute_move_invite(
     ):
         return ExecutionResult(response=responses.INVITE_MOVE_NOT_ACTIVE, success=False)
 
-    if not _is_restaurant_owner(db, user.id, invite.restaurant_id) or not _is_restaurant_owner(
-        db, user.id, uuid.UUID(restaurant_id)
-    ):
+    if not _is_restaurant_owner(
+        db, user.id, invite.restaurant_id
+    ) or not _is_restaurant_owner(db, user.id, uuid.UUID(restaurant_id)):
         return ExecutionResult(response=responses.INVITE_MOVE_NOT_OWNER, success=False)
 
     if str(invite.restaurant_id) == restaurant_id:
         restaurant = db.get(Restaurant, uuid.UUID(restaurant_id))
         restaurant_name = restaurant.name if restaurant else "this outlet"
         return ExecutionResult(
-            response=responses.INVITE_MOVE_ALREADY_TARGET.format(restaurant=restaurant_name),
+            response=responses.INVITE_MOVE_ALREADY_TARGET.format(
+                restaurant=restaurant_name
+            ),
             context_update={"active_restaurant_id": restaurant_id},
         )
 
@@ -1121,20 +798,14 @@ def _execute_list_suppliers(
     params: dict[str, Any],
     context: UserContext,
 ) -> ExecutionResult:
-    restaurant_id, error = _resolve_restaurant_id(db, user.id, context, params)
-    if error:
-        return ExecutionResult(response=error, success=False)
-
+    restaurant_id = _get_restaurant_id(params, context, db, user.id)
     if not restaurant_id:
         restaurants = _get_user_restaurants(db, user.id)
+        if not restaurants:
+            return ExecutionResult(response=responses.ERROR_NO_OUTLETS, success=False)
         return ExecutionResult(
             response=responses.outlet_select_prompt(restaurants),
-            needs_input=True,
-            context_update={
-                "active_operation": Intent.LIST_SUPPLIERS.value,
-                "pending_params": ["restaurant_id"],
-                "collected_params": params,
-            },
+            success=False,
         )
 
     suppliers = db.scalars(
@@ -1158,39 +829,26 @@ def _execute_add_supplier(
     params: dict[str, Any],
     context: UserContext,
 ) -> ExecutionResult:
-    restaurant_id, error = _resolve_restaurant_id(db, user.id, context, params)
-    if error:
-        return ExecutionResult(response=error, success=False)
-
+    restaurant_id = _get_restaurant_id(params, context, db, user.id)
     if not restaurant_id:
         restaurants = _get_user_restaurants(db, user.id)
+        if not restaurants:
+            return ExecutionResult(response=responses.ERROR_NO_OUTLETS, success=False)
         return ExecutionResult(
             response=responses.outlet_select_prompt(restaurants),
-            needs_input=True,
-            context_update={
-                "active_operation": Intent.ADD_SUPPLIER.value,
-                "pending_params": ["restaurant_id", "name"],
-                "collected_params": params,
-            },
-        )
-
-    # Check ownership (only owners can add suppliers)
-    if not _is_restaurant_owner(db, user.id, uuid.UUID(restaurant_id)):
-        return ExecutionResult(
-            response="Only outlet owners can add suppliers.",
             success=False,
         )
 
-    name = params.get("name", "").strip()
+    if not _is_restaurant_owner(db, user.id, uuid.UUID(restaurant_id)):
+        return ExecutionResult(
+            response="Only outlet owners can add suppliers.", success=False
+        )
+
+    name_raw = params.get("name")
+    name = str(name_raw).strip() if name_raw else ""
     if not name:
         return ExecutionResult(
-            response=get_missing_param_prompt(Intent.ADD_SUPPLIER, "name"),
-            needs_input=True,
-            context_update={
-                "active_operation": Intent.ADD_SUPPLIER.value,
-                "pending_params": ["name"],
-                "collected_params": {**params, "restaurant_id": restaurant_id},
-            },
+            response="Please provide the supplier name.", success=False
         )
 
     try:
@@ -1222,33 +880,11 @@ def _execute_deactivate_supplier(
     params: dict[str, Any],
     context: UserContext,
 ) -> ExecutionResult:
-    supplier_id_raw = params.get("supplier_id", "").strip() if params.get("supplier_id") else ""
-    if not supplier_id_raw and context.active_supplier_id:
-        supplier_id_raw = context.active_supplier_id
-    if not supplier_id_raw:
+    supplier_id = _get_supplier_id(params, context, db, user.id)
+    if not supplier_id:
         return ExecutionResult(
-            response=get_missing_param_prompt(Intent.DEACTIVATE_SUPPLIER, "supplier_id"),
-            needs_input=True,
-            context_update={
-                "active_operation": Intent.DEACTIVATE_SUPPLIER.value,
-                "pending_params": ["supplier_id"],
-                "collected_params": params,
-            },
+            response="Please specify which supplier to deactivate.", success=False
         )
-
-    restaurant_id = context.active_restaurant_id
-    if not restaurant_id:
-        restaurants = _get_user_restaurants(db, user.id)
-        if len(restaurants) == 1:
-            restaurant_id = restaurants[0]["id"]
-
-    supplier_id = None
-    if restaurant_id:
-        supplier_id = _resolve_supplier_id(db, restaurant_id, supplier_id_raw)
-    if not supplier_id:
-        supplier_id = supplier_id_raw if _safe_uuid(supplier_id_raw) else None
-    if not supplier_id:
-        return ExecutionResult(response=responses.SUPPLIER_NOT_FOUND, success=False)
 
     supplier = db.get(Suppliers, uuid.UUID(supplier_id))
     if not supplier:
@@ -1256,8 +892,7 @@ def _execute_deactivate_supplier(
 
     if not _is_restaurant_owner(db, user.id, supplier.restaurant_id):
         return ExecutionResult(
-            response="Only outlet owners can deactivate suppliers.",
-            success=False,
+            response="Only outlet owners can deactivate suppliers.", success=False
         )
 
     if not supplier.is_active:
@@ -1289,59 +924,26 @@ def _execute_update_supplier(
     params: dict[str, Any],
     context: UserContext,
 ) -> ExecutionResult:
-    supplier_id_raw = params.get("supplier_id", "").strip() if params.get("supplier_id") else ""
-    if not supplier_id_raw and context.active_supplier_id:
-        supplier_id_raw = context.active_supplier_id
-    if not supplier_id_raw:
+    supplier_id = _get_supplier_id(params, context, db, user.id)
+    if not supplier_id:
         return ExecutionResult(
-            response=get_missing_param_prompt(Intent.UPDATE_SUPPLIER, "supplier_id"),
-            needs_input=True,
-            context_update={
-                "active_operation": Intent.UPDATE_SUPPLIER.value,
-                "pending_params": ["supplier_id"],
-                "collected_params": params,
-            },
+            response="Please specify which supplier to update.", success=False
         )
-
-    # Try to resolve supplier_id - may need restaurant context
-    restaurant_id = context.active_restaurant_id
-    if not restaurant_id:
-        restaurants = _get_user_restaurants(db, user.id)
-        if len(restaurants) == 1:
-            restaurant_id = restaurants[0]["id"]
-    
-    supplier_id = None
-    if restaurant_id:
-        supplier_id = _resolve_supplier_id(db, restaurant_id, supplier_id_raw)
-    
-    if not supplier_id:
-        # Try direct UUID parse as fallback
-        supplier_id = supplier_id_raw if _safe_uuid(supplier_id_raw) else None
-    
-    if not supplier_id:
-        return ExecutionResult(response=responses.SUPPLIER_NOT_FOUND, success=False)
 
     supplier = db.get(Suppliers, uuid.UUID(supplier_id))
     if not supplier:
         return ExecutionResult(response=responses.SUPPLIER_NOT_FOUND, success=False)
 
-    # Check ownership
     if not _is_restaurant_owner(db, user.id, supplier.restaurant_id):
         return ExecutionResult(
-            response="Only outlet owners can update suppliers.",
-            success=False,
+            response="Only outlet owners can update suppliers.", success=False
         )
 
-    name = params.get("name", "").strip()
+    name_raw = params.get("name")
+    name = str(name_raw).strip() if name_raw else ""
     if not name:
         return ExecutionResult(
-            response="What's the new name for this supplier?",
-            needs_input=True,
-            context_update={
-                "active_operation": Intent.UPDATE_SUPPLIER.value,
-                "pending_params": ["name"],
-                "collected_params": {**params, "supplier_id": supplier_id},
-            },
+            response="Please provide the new name for this supplier.", success=False
         )
 
     try:
@@ -1363,48 +965,25 @@ def _execute_view_supplier(
     params: dict[str, Any],
     context: UserContext,
 ) -> ExecutionResult:
-    supplier_id_raw = params.get("supplier_id", "").strip() if params.get("supplier_id") else ""
-    if not supplier_id_raw and context.active_supplier_id:
-        supplier_id_raw = context.active_supplier_id
-    if not supplier_id_raw:
+    supplier_id = _get_supplier_id(params, context, db, user.id)
+    if not supplier_id:
         return ExecutionResult(
-            response=get_missing_param_prompt(Intent.VIEW_SUPPLIER, "supplier_id"),
-            needs_input=True,
-            context_update={
-                "active_operation": Intent.VIEW_SUPPLIER.value,
-                "pending_params": ["supplier_id"],
-                "collected_params": params,
-            },
+            response="Please specify which supplier to view.", success=False
         )
-
-    # Try to resolve supplier_id
-    restaurant_id = context.active_restaurant_id
-    if not restaurant_id:
-        restaurants = _get_user_restaurants(db, user.id)
-        if len(restaurants) == 1:
-            restaurant_id = restaurants[0]["id"]
-    
-    supplier_id = None
-    if restaurant_id:
-        supplier_id = _resolve_supplier_id(db, restaurant_id, supplier_id_raw)
-    
-    if not supplier_id:
-        supplier_id = supplier_id_raw if _safe_uuid(supplier_id_raw) else None
-    
-    if not supplier_id:
-        return ExecutionResult(response=responses.SUPPLIER_NOT_FOUND, success=False)
 
     supplier = db.get(Suppliers, uuid.UUID(supplier_id))
     if not supplier:
         return ExecutionResult(response=responses.SUPPLIER_NOT_FOUND, success=False)
 
     return ExecutionResult(
-        response=responses.supplier_details({
+        response=responses.supplier_details(
+            {
             "name": supplier.name,
             "currency": supplier.currency,
             "lead_time_days": supplier.lead_time_days,
             "notes": supplier.notes,
-        }),
+            }
+        ),
         context_update={"active_supplier_id": str(supplier.id)},
     )
 
@@ -1416,36 +995,12 @@ def _execute_view_supplier_price_list(
     context: UserContext,
 ) -> ExecutionResult:
     """View supplier's current price list."""
-    supplier_id_raw = params.get("supplier_id", "").strip() if params.get("supplier_id") else ""
-    if not supplier_id_raw and context.active_supplier_id:
-        supplier_id_raw = context.active_supplier_id
-    if not supplier_id_raw:
+    supplier_id = _get_supplier_id(params, context, db, user.id)
+    if not supplier_id:
         return ExecutionResult(
-            response=get_missing_param_prompt(Intent.VIEW_SUPPLIER_PRICE_LIST, "supplier_id"),
-            needs_input=True,
-            context_update={
-                "active_operation": Intent.VIEW_SUPPLIER_PRICE_LIST.value,
-                "pending_params": ["supplier_id"],
-                "collected_params": params,
-            },
+            response="Please specify which supplier's price list to view.",
+            success=False,
         )
-
-    # Resolve supplier_id
-    restaurant_id = context.active_restaurant_id
-    if not restaurant_id:
-        restaurants = _get_user_restaurants(db, user.id)
-        if len(restaurants) == 1:
-            restaurant_id = restaurants[0]["id"]
-    
-    supplier_id = None
-    if restaurant_id:
-        supplier_id = _resolve_supplier_id(db, restaurant_id, supplier_id_raw)
-    
-    if not supplier_id:
-        supplier_id = supplier_id_raw if _safe_uuid(supplier_id_raw) else None
-    
-    if not supplier_id:
-        return ExecutionResult(response=responses.SUPPLIER_NOT_FOUND, success=False)
 
     supplier = db.get(Suppliers, uuid.UUID(supplier_id))
     if not supplier:
@@ -1454,13 +1009,14 @@ def _execute_view_supplier_price_list(
     from app.db.models.supplier_items import SupplierItems
     from app.db.models.supplier_prices import SupplierPrices
 
-    # Get latest prices for this supplier's items
+    now = dt.datetime.now(dt.UTC)
     prices = db.execute(
         select(SupplierItems, SupplierPrices)
         .outerjoin(
             SupplierPrices,
-            (SupplierPrices.supplier_item_id == SupplierItems.id) &
-            (SupplierPrices.is_current == True)
+            (SupplierPrices.supplier_item_id == SupplierItems.id)
+            & (SupplierPrices.valid_from <= now)
+            & ((SupplierPrices.valid_to.is_(None)) | (SupplierPrices.valid_to >= now)),
         )
         .where(SupplierItems.supplier_id == uuid.UUID(supplier_id))
         .order_by(SupplierItems.supplier_sku.asc())
@@ -1468,10 +1024,10 @@ def _execute_view_supplier_price_list(
 
     formatted = [
         {
-            "name": item.supplier_name,
+            "name": item.supplier_name_raw,
             "sku": item.supplier_sku,
-            "unit": item.supplier_unit,
-            "price": float(price.unit_price) if price else None,
+            "unit": item.unit_basis,
+            "price": float(price.price) if price else None,
             "currency": price.currency if price else supplier.currency,
         }
         for item, price in prices
@@ -1490,36 +1046,11 @@ def _execute_view_supplier_items(
     context: UserContext,
 ) -> ExecutionResult:
     """View items offered by a supplier."""
-    supplier_id_raw = params.get("supplier_id", "").strip() if params.get("supplier_id") else ""
-    if not supplier_id_raw and context.active_supplier_id:
-        supplier_id_raw = context.active_supplier_id
-    if not supplier_id_raw:
+    supplier_id = _get_supplier_id(params, context, db, user.id)
+    if not supplier_id:
         return ExecutionResult(
-            response=get_missing_param_prompt(Intent.VIEW_SUPPLIER_ITEMS, "supplier_id"),
-            needs_input=True,
-            context_update={
-                "active_operation": Intent.VIEW_SUPPLIER_ITEMS.value,
-                "pending_params": ["supplier_id"],
-                "collected_params": params,
-            },
+            response="Please specify which supplier's items to view.", success=False
         )
-
-    # Resolve supplier_id
-    restaurant_id = context.active_restaurant_id
-    if not restaurant_id:
-        restaurants = _get_user_restaurants(db, user.id)
-        if len(restaurants) == 1:
-            restaurant_id = restaurants[0]["id"]
-    
-    supplier_id = None
-    if restaurant_id:
-        supplier_id = _resolve_supplier_id(db, restaurant_id, supplier_id_raw)
-    
-    if not supplier_id:
-        supplier_id = supplier_id_raw if _safe_uuid(supplier_id_raw) else None
-    
-    if not supplier_id:
-        return ExecutionResult(response=responses.SUPPLIER_NOT_FOUND, success=False)
 
     supplier = db.get(Suppliers, uuid.UUID(supplier_id))
     if not supplier:
@@ -1530,14 +1061,14 @@ def _execute_view_supplier_items(
     items = db.scalars(
         select(SupplierItems)
         .where(SupplierItems.supplier_id == uuid.UUID(supplier_id))
-        .order_by(SupplierItems.supplier_name.asc())
+        .order_by(SupplierItems.supplier_name_raw.asc())
     ).all()
 
     formatted = [
         {
-            "name": item.supplier_name,
+            "name": item.supplier_name_raw,
             "sku": item.supplier_sku,
-            "unit": item.supplier_unit,
+            "unit": item.unit_basis,
         }
         for item in items
     ]
@@ -1560,20 +1091,14 @@ def _execute_list_invoices(
     context: UserContext,
 ) -> ExecutionResult:
     """List invoices for a restaurant."""
-    restaurant_id, error = _resolve_restaurant_id(db, user.id, context, params)
-    if error:
-        return ExecutionResult(response=error, success=False)
-
+    restaurant_id = _get_restaurant_id(params, context, db, user.id)
     if not restaurant_id:
         restaurants = _get_user_restaurants(db, user.id)
+        if not restaurants:
+            return ExecutionResult(response=responses.ERROR_NO_OUTLETS, success=False)
         return ExecutionResult(
             response=responses.outlet_select_prompt(restaurants),
-            needs_input=True,
-            context_update={
-                "active_operation": Intent.LIST_INVOICES.value,
-                "pending_params": ["restaurant_id"],
-                "collected_params": params,
-            },
+            success=False,
         )
 
     from app.db.models.invoices import Invoices
@@ -1588,7 +1113,9 @@ def _execute_list_invoices(
     formatted = [
         {
             "id": str(inv.id),
-            "date": inv.invoice_date.strftime("%Y-%m-%d") if inv.invoice_date else "N/A",
+            "date": inv.invoice_date.strftime("%Y-%m-%d")
+            if inv.invoice_date
+            else "N/A",
             "supplier": inv.supplier_name,
             "total": float(inv.total_amount) if inv.total_amount else None,
             "currency": inv.currency,
@@ -1607,19 +1134,13 @@ def _execute_view_invoice(
     db: Session,
     user: User,
     params: dict[str, Any],
-    context: UserContext,
 ) -> ExecutionResult:
     """View invoice details with line items."""
-    invoice_id = params.get("invoice_id", "").strip()
+    invoice_id_raw = params.get("invoice_id")
+    invoice_id = str(invoice_id_raw).strip() if invoice_id_raw else ""
     if not invoice_id:
         return ExecutionResult(
-            response=get_missing_param_prompt(Intent.VIEW_INVOICE, "invoice_id"),
-            needs_input=True,
-            context_update={
-                "active_operation": Intent.VIEW_INVOICE.value,
-                "pending_params": ["invoice_id"],
-                "collected_params": params,
-            },
+            response="Please specify which invoice to view.", success=False
         )
 
     from app.db.models.invoices import Invoices
@@ -1631,6 +1152,11 @@ def _execute_view_invoice(
         return ExecutionResult(response="Invoice not found.", success=False)
 
     if not invoice:
+        return ExecutionResult(response="Invoice not found.", success=False)
+    
+    # SECURITY: Validate user has access to the invoice's restaurant
+    restaurants = _get_user_restaurants(db, user.id)
+    if not any(r["id"] == str(invoice.restaurant_id) for r in restaurants):
         return ExecutionResult(response="Invoice not found.", success=False)
 
     line_items = db.scalars(
@@ -1653,7 +1179,9 @@ def _execute_view_invoice(
     return ExecutionResult(
         response=responses.invoice_details(
             invoice={
-                "date": invoice.invoice_date.strftime("%Y-%m-%d") if invoice.invoice_date else "N/A",
+                "date": invoice.invoice_date.strftime("%Y-%m-%d")
+                if invoice.invoice_date
+                else "N/A",
                 "supplier": invoice.supplier_name,
                 "invoice_number": invoice.invoice_number,
                 "total": float(invoice.total_amount) if invoice.total_amount else None,
@@ -1676,20 +1204,14 @@ def _execute_list_inventory(
     params: dict[str, Any],
     context: UserContext,
 ) -> ExecutionResult:
-    restaurant_id, error = _resolve_restaurant_id(db, user.id, context, params)
-    if error:
-        return ExecutionResult(response=error, success=False)
-
+    restaurant_id = _get_restaurant_id(params, context, db, user.id)
     if not restaurant_id:
         restaurants = _get_user_restaurants(db, user.id)
+        if not restaurants:
+            return ExecutionResult(response=responses.ERROR_NO_OUTLETS, success=False)
         return ExecutionResult(
             response=responses.outlet_select_prompt(restaurants),
-            needs_input=True,
-            context_update={
-                "active_operation": Intent.LIST_INVENTORY.value,
-                "pending_params": ["restaurant_id"],
-                "collected_params": params,
-            },
+            success=False,
         )
 
     from app.db.models.inventory_batches import InventoryBatches
@@ -1720,13 +1242,7 @@ def _execute_list_inventory(
     )
 
 
-def _execute_add_inventory(
-    db: Session,
-    user: User,
-    params: dict[str, Any],
-    context: UserContext,
-) -> ExecutionResult:
-    # This is a complex operation - for now, direct to file upload
+def _execute_add_inventory() -> ExecutionResult:
     return ExecutionResult(
         response="To add inventory, please upload an invoice or manually record it. "
         "Upload a file and I'll help you process it.",
@@ -1734,13 +1250,7 @@ def _execute_add_inventory(
     )
 
 
-def _execute_update_inventory(
-    db: Session,
-    user: User,
-    params: dict[str, Any],
-    context: UserContext,
-) -> ExecutionResult:
-    # This is a complex operation
+def _execute_update_inventory() -> ExecutionResult:
     return ExecutionResult(
         response="To update inventory, please specify the batch and the change you'd like to make.",
         context_update={"clear": True},
@@ -1751,44 +1261,21 @@ def _execute_log_inventory_usage(
     db: Session,
     user: User,
     params: dict[str, Any],
-    context: UserContext,
 ) -> ExecutionResult:
     """Log inventory usage, waste, or consumption."""
-    batch_id = params.get("batch_id", "").strip()
+    batch_id_raw = params.get("batch_id")
+    batch_id = str(batch_id_raw).strip() if batch_id_raw else ""
     if not batch_id:
         return ExecutionResult(
-            response=get_missing_param_prompt(Intent.LOG_INVENTORY_USAGE, "batch_id"),
-            needs_input=True,
-            context_update={
-                "active_operation": Intent.LOG_INVENTORY_USAGE.value,
-                "pending_params": ["batch_id", "quantity", "reason"],
-                "collected_params": params,
-            },
+            response="Please specify which inventory batch.", success=False
         )
 
     quantity = params.get("quantity")
     if not quantity:
-        return ExecutionResult(
-            response=get_missing_param_prompt(Intent.LOG_INVENTORY_USAGE, "quantity"),
-            needs_input=True,
-            context_update={
-                "active_operation": Intent.LOG_INVENTORY_USAGE.value,
-                "pending_params": ["quantity", "reason"],
-                "collected_params": {**params, "batch_id": batch_id},
-            },
-        )
+        return ExecutionResult(response="Please specify the quantity.", success=False)
 
-    reason = params.get("reason", "").strip()
-    if not reason:
-        return ExecutionResult(
-            response=get_missing_param_prompt(Intent.LOG_INVENTORY_USAGE, "reason"),
-            needs_input=True,
-            context_update={
-                "active_operation": Intent.LOG_INVENTORY_USAGE.value,
-                "pending_params": ["reason"],
-                "collected_params": {**params, "batch_id": batch_id, "quantity": quantity},
-            },
-        )
+    reason_raw = params.get("reason", "usage")
+    reason = str(reason_raw).strip() if reason_raw else "usage"
 
     from app.db.models.inventory_batches import InventoryBatches
     from app.db.models.inventory_movements import InventoryMovements
@@ -1801,30 +1288,34 @@ def _execute_log_inventory_usage(
 
     if not batch:
         return ExecutionResult(response="Inventory batch not found.", success=False)
+    
+    # SECURITY: Validate user has access to the batch's restaurant
+    restaurants = _get_user_restaurants(db, user.id)
+    if not any(r["id"] == str(batch.restaurant_id) for r in restaurants):
+        return ExecutionResult(response="Inventory batch not found.", success=False)
 
     try:
         qty = Decimal(str(quantity))
         if qty <= 0:
             return ExecutionResult(response="Quantity must be positive.", success=False)
 
-        # Check sufficient quantity
         if batch.quantity < qty:
             return ExecutionResult(
                 response=f"Insufficient quantity. Current: {batch.quantity} {batch.unit}",
                 success=False,
             )
 
-        # Create movement record
         movement = InventoryMovements(
             batch_id=uuid.UUID(batch_id),
-            movement_type=reason.lower() if reason.lower() in ("usage", "waste", "expired", "transfer") else "usage",
+            movement_type=reason.lower()
+            if reason.lower() in ("usage", "waste", "expired", "transfer")
+            else "usage",
             quantity=qty,
             reason=reason,
             recorded_by_user_id=user.id,
         )
         db.add(movement)
 
-        # Update batch quantity
         batch.quantity = batch.quantity - qty
         if batch.quantity <= 0:
             batch.status = "depleted"
@@ -1848,20 +1339,14 @@ def _execute_list_locations(
     context: UserContext,
 ) -> ExecutionResult:
     """List inventory storage locations."""
-    restaurant_id, error = _resolve_restaurant_id(db, user.id, context, params)
-    if error:
-        return ExecutionResult(response=error, success=False)
-
+    restaurant_id = _get_restaurant_id(params, context, db, user.id)
     if not restaurant_id:
         restaurants = _get_user_restaurants(db, user.id)
+        if not restaurants:
+            return ExecutionResult(response=responses.ERROR_NO_OUTLETS, success=False)
         return ExecutionResult(
             response=responses.outlet_select_prompt(restaurants),
-            needs_input=True,
-            context_update={
-                "active_operation": Intent.LIST_LOCATIONS.value,
-                "pending_params": ["restaurant_id"],
-                "collected_params": params,
-            },
+            success=False,
         )
 
     from app.db.models.inventory_locations import InventoryLocations
@@ -1873,11 +1358,7 @@ def _execute_list_locations(
     ).all()
 
     formatted = [
-        {
-            "id": str(loc.id),
-            "name": loc.name,
-            "type": loc.location_type,
-        }
+        {"id": str(loc.id), "name": loc.name, "type": loc.location_type}
         for loc in locations
     ]
 
@@ -1894,39 +1375,20 @@ def _execute_add_location(
     context: UserContext,
 ) -> ExecutionResult:
     """Add a new inventory storage location."""
-    restaurant_id, error = _resolve_restaurant_id(db, user.id, context, params)
-    if error:
-        return ExecutionResult(response=error, success=False)
-
+    restaurant_id = _get_restaurant_id(params, context, db, user.id)
     if not restaurant_id:
-        restaurants = _get_user_restaurants(db, user.id)
-        return ExecutionResult(
-            response=responses.outlet_select_prompt(restaurants),
-            needs_input=True,
-            context_update={
-                "active_operation": Intent.ADD_LOCATION.value,
-                "pending_params": ["restaurant_id", "name"],
-                "collected_params": params,
-            },
-        )
+        return ExecutionResult(response="Please specify which outlet.", success=False)
 
-    # Check ownership (only owners can add locations)
     if not _is_restaurant_owner(db, user.id, uuid.UUID(restaurant_id)):
         return ExecutionResult(
-            response="Only outlet owners can add storage locations.",
-            success=False,
+            response="Only outlet owners can add storage locations.", success=False
         )
 
-    name = params.get("name", "").strip()
+    name_raw = params.get("name")
+    name = str(name_raw).strip() if name_raw else ""
     if not name:
         return ExecutionResult(
-            response=get_missing_param_prompt(Intent.ADD_LOCATION, "name"),
-            needs_input=True,
-            context_update={
-                "active_operation": Intent.ADD_LOCATION.value,
-                "pending_params": ["name"],
-                "collected_params": {**params, "restaurant_id": restaurant_id},
-            },
+            response="Please provide a name for the location.", success=False
         )
 
     from app.db.models.inventory_locations import InventoryLocations
@@ -1935,7 +1397,7 @@ def _execute_add_location(
         location = InventoryLocations(
             restaurant_id=uuid.UUID(restaurant_id),
             name=name,
-            location_type="general",  # Default type
+            location_type="general",
         )
         db.add(location)
         db.commit()
@@ -1961,11 +1423,10 @@ def _execute_confirm_upload(
     params: dict[str, Any],
     context: UserContext,
 ) -> ExecutionResult:
-    staging_id = params.get("staging_id") or context.staging_id
+    staging_id = params.get("staging_id")
     if not staging_id:
         return ExecutionResult(
-            response="Nothing to confirm. Upload a file first.",
-            success=False,
+            response="Nothing to confirm. Upload a file first.", success=False
         )
 
     try:
@@ -1975,21 +1436,22 @@ def _execute_confirm_upload(
 
     if not staging:
         return ExecutionResult(response="Upload not found.", success=False)
+    
+    # SECURITY: Validate user owns this staging record
+    if staging.user_id != user.id:
+        return ExecutionResult(response="Upload not found.", success=False)
 
     if staging.status != "pending_review":
         return ExecutionResult(
-            response=f"This upload is already {staging.status}.",
-            success=False,
+            response=f"This upload is already {staging.status}.", success=False
         )
 
-    # Import confirm logic from file_processing tools
     from app.ai.db_tools.file_processing import create_file_processing_tools
 
-    # Create temporary tools to access confirm handler
     tools = create_file_processing_tools(
         db=db,
         user_id=user.id,
-        actor_role="owner",  # Simplified
+        actor_role="owner",
         restaurant_roles={},
     )
 

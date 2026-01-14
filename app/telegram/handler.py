@@ -384,3 +384,7 @@ def handle_update_v2(update: dict, db: Session, settings: Settings) -> None:
                 "session_id": str(session.id),
             },
         )
+
+
+# Alias for backwards compatibility with tests
+handle_update = handle_update_v2

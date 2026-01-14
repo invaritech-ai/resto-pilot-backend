@@ -18,12 +18,12 @@ def _pick_model(settings: Settings, *fields: str, fallback: str) -> str:
 
 
 def get_gate_model(settings: Settings) -> str:
-    """Legacy alias for intent/file-type model selection."""
+    """Legacy alias for intent model selection."""
     return get_intent_model(settings)
 
 
 def get_intent_model(settings: Settings) -> str:
-    """Get the model for intent classification."""
+    """Get the model for intent classification and resolution."""
     return _pick_model(
         settings,
         "openai_intent_model",
@@ -39,16 +39,6 @@ def get_file_type_model(settings: Settings) -> str:
         "openai_file_type_model",
         "openai_intent_model",
         "openai_gate_model",
-        fallback=settings.openai_model,
-    )
-
-
-def get_decision_model(settings: Settings) -> str:
-    """Get the model for intent resolution and entity grounding."""
-    return _pick_model(
-        settings,
-        "openai_decision_model",
-        "openai_reasoning_model",
         fallback=settings.openai_model,
     )
 

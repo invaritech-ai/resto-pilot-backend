@@ -41,7 +41,6 @@ class Settings(BaseSettings):
     openai_gate_model: str = ""
     # Purpose-specific models (all optional, fall back to openai_model)
     openai_intent_model: str = ""
-    openai_decision_model: str = ""
     openai_response_model: str = ""
     openai_reasoning_model: str = ""
     openai_file_type_model: str = ""

@@ -1,7 +1,7 @@
 """
-User context management for multi-step conversation flows.
+User context management for conversation.
 
-Handles loading, updating, and clearing conversation context stored in User.state_data.
+Simplified version - just tracks active restaurant/supplier IDs.
 """
 
 from __future__ import annotations
@@ -88,7 +88,7 @@ def update_context_from_result(
 
     # Check for clear flag
     if context_update.get("clear"):
-        # Keep only active_restaurant_id if specified
+        # Keep only active IDs if specified
         new_context = UserContext(
             active_restaurant_id=context_update.get(
                 "active_restaurant_id",
@@ -103,75 +103,10 @@ def update_context_from_result(
         return new_context
 
     # Update specific fields
-    if "active_operation" in context_update:
-        context.active_operation = context_update["active_operation"]
-    if "pending_params" in context_update:
-        context.pending_params = context_update["pending_params"]
-    if "collected_params" in context_update:
-        context.collected_params = context_update["collected_params"]
     if "active_restaurant_id" in context_update:
         context.active_restaurant_id = context_update["active_restaurant_id"]
     if "active_supplier_id" in context_update:
         context.active_supplier_id = context_update["active_supplier_id"]
-    if "staging_id" in context_update:
-        context.staging_id = context_update["staging_id"]
 
     save_context(db, user, context)
     return context
-
-
-def get_context_for_classifier(
-    context: UserContext,
-    db: Session | None = None,
-) -> dict[str, Any] | None:
-    """
-    Format context for passing to intent classifier.
-
-    Args:
-        context: User's current context
-        db: Database session (optional, for resolving restaurant name)
-
-    Returns:
-        Dict to pass to classifier with hints about current state
-    """
-    result: dict[str, Any] = {}
-
-    # Include active restaurant info if available
-    if context.active_restaurant_id and db:
-        from app.db.models.restaurant import Restaurant
-        import uuid as uuid_mod
-
-        try:
-            restaurant = db.get(Restaurant, uuid_mod.UUID(context.active_restaurant_id))
-            if restaurant:
-                result["active_outlet"] = {
-                    "id": context.active_restaurant_id,
-                    "name": restaurant.name,
-                }
-                result["hint"] = (
-                    f"User is currently working with outlet '{restaurant.name}'. Use this as restaurant_id if not specified."
-                )
-        except (ValueError, AttributeError):
-            pass
-
-    if context.active_supplier_id and db:
-        from app.db.models.suppliers import Suppliers
-        import uuid as uuid_mod
-
-        try:
-            supplier = db.get(Suppliers, uuid_mod.UUID(context.active_supplier_id))
-            if supplier:
-                result["active_supplier"] = {
-                    "id": context.active_supplier_id,
-                    "name": supplier.name,
-                }
-        except (ValueError, AttributeError):
-            pass
-
-    # Include active operation if any
-    if context.active_operation:
-        result["active_operation"] = context.active_operation
-        result["pending_params"] = context.pending_params
-        result["collected_params"] = context.collected_params
-
-    return result if result else None
