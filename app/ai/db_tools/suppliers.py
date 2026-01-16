@@ -17,7 +17,7 @@ from app.conversation import responses
 from app.db.models.suppliers import Suppliers
 from app.db.models.restaurant import Restaurant
 
-from .base import format_date, has_restaurant_access, is_restaurant_owner
+from .base import format_date, has_restaurant_access
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +90,7 @@ def create_supplier_tools(
         return json.dumps(payload, indent=2)
 
     def create_supplier(args: dict[str, Any]) -> str:
-        """Create a new supplier. Only restaurant owners can create suppliers."""
+        """Create a new supplier for a restaurant."""
         message_lower = _normalize(user_message)
 
         restaurant_id_str = args.get("restaurant_id", "").strip()
@@ -116,8 +116,8 @@ def create_supplier_tools(
                 except ValueError:
                     return "Error: Invalid pending restaurant_id format."
                 name = str(pending_name).strip()
-                if not is_restaurant_owner(db, user_id, restaurant_id):
-                    return "Error: Only restaurant owners can create suppliers."
+                if not has_restaurant_access(db, user_id, restaurant_id):
+                    return "Error: You don't have access to this restaurant."
                 supplier = Suppliers(
                     restaurant_id=restaurant_id,
                     name=name,
@@ -173,8 +173,8 @@ def create_supplier_tools(
         except ValueError:
             return "Error: Invalid restaurant_id format."
 
-        if not is_restaurant_owner(db, user_id, restaurant_id):
-            return "Error: Only restaurant owners can create suppliers."
+        if not has_restaurant_access(db, user_id, restaurant_id):
+            return "Error: You don't have access to this restaurant."
 
         if not name:
             return "Error: name is required."
@@ -235,7 +235,7 @@ def create_supplier_tools(
         )
 
     def update_supplier(args: dict[str, Any]) -> str:
-        """Update supplier details. Only restaurant owners can update."""
+        """Update supplier details."""
         supplier_id_str = args.get("supplier_id", "").strip()
         if not supplier_id_str:
             return "Error: supplier_id is required."
@@ -249,8 +249,8 @@ def create_supplier_tools(
         if not supplier:
             return "Error: Supplier not found."
 
-        if not is_restaurant_owner(db, user_id, supplier.restaurant_id):
-            return "Error: Only restaurant owners can update suppliers."
+        if not has_restaurant_access(db, user_id, supplier.restaurant_id):
+            return "Error: You don't have access to this supplier's restaurant."
 
         updates = []
         if "name" in args:
@@ -304,7 +304,7 @@ def create_supplier_tools(
         ),
         "create_supplier": Tool(
             name="create_supplier",
-            description="Create a new supplier. Only restaurant owners can create suppliers.",
+            description="Create a new supplier for a restaurant.",
             parameters={
                 "type": "object",
                 "properties": {
@@ -356,7 +356,7 @@ def create_supplier_tools(
         ),
         "update_supplier": Tool(
             name="update_supplier",
-            description="Update supplier details. Only restaurant owners can update.",
+            description="Update supplier details for a supplier.",
             parameters={
                 "type": "object",
                 "properties": {

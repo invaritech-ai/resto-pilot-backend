@@ -122,7 +122,7 @@ def create_staff_tools(
     return {
         "list_staff": Tool(
             name="list_staff",
-            description="List all staff members of a restaurant. Returns JSON with restaurant_name and members.",
+            description="List all staff members of a restaurant.",
             parameters={
                 "type": "object",
                 "properties": {

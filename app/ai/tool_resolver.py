@@ -114,7 +114,9 @@ def resolve_with_tools(
     if active_supplier_id:
         context_info["active_supplier_id"] = active_supplier_id
     if pending_action:
-        context_info["pending_action"] = pending_action.get("type")
+        pending_action_type = pending_action.get("type")
+        if isinstance(pending_action_type, str) and pending_action_type:
+            context_info["pending_action"] = pending_action_type
 
     user_prompt_parts: list[str] = []
     if context_info:
