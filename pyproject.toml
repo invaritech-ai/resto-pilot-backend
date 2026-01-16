@@ -10,7 +10,6 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "alembic>=1.17.2",
-    "antiword>=0.5",
     "celery[sqs]>=5.6.0",
     "docx2txt>=0.8",
     "fastapi[standard]>=0.124.0",
