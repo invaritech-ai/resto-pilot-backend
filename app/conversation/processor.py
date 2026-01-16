@@ -69,7 +69,10 @@ def _has_file(messages: list[TelegramMessages]) -> tuple[bool, str | None, str |
 
 
 def _detect_file_type_from_text(message_text: str | None) -> str | None:
-    text_lower = (message_text or "").lower()
+    text = (message_text or "").strip()
+    if text in ("1", "2"):
+        return "price_list" if text == "1" else "invoice"
+    text_lower = text.lower()
     if any(
         kw in text_lower
         for kw in ["price list", "pricelist", "prices", "rate card", "catalog"]
