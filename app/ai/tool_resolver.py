@@ -227,6 +227,13 @@ def resolve_with_tools(
                 context_update["active_restaurant_id"] = last_restaurant_id
             if last_supplier_id:
                 context_update["active_supplier_id"] = last_supplier_id
+            if tool_calls_count == 0:
+                return ToolResolutionResult(
+                    response_text=responses.CANT_HELP,
+                    llm_calls=llm_calls,
+                    context_update=context_update,
+                    tool_calls=tool_calls_count,
+                )
             return ToolResolutionResult(
                 response_text=content.strip(),
                 llm_calls=llm_calls,
