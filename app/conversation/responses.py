@@ -38,7 +38,7 @@ CANCEL_NOTHING = "Nothing to cancel. Type /menu to see available options."
 
 ACK_PROCESSING = "Got it..."
 
-ACK_FILE_PROCESSING = "Processing your file..."
+ACK_FILE_PROCESSING = "Got it. File received."
 
 
 # =============================================================================
@@ -438,7 +438,11 @@ FILE_DETECTED_PRICE_LIST = "This looks like a *price list*. Processing..."
 
 FILE_DETECTED_INVOICE = "This looks like an *invoice*. Processing..."
 
-FILE_DETECTION_UNSURE = "I'm not sure what type of file this is. Is it a price list or an invoice?"
+FILE_DETECTION_UNSURE = (
+    "What is this file?\n"
+    "1. Supplier price list\n"
+    "2. Invoice"
+)
 
 FILE_PROCESSING_STARTED = "Processing your {file_type}. I'll show you what I found."
 

@@ -68,6 +68,44 @@ def _has_file(messages: list[TelegramMessages]) -> tuple[bool, str | None, str |
     return False, None, None
 
 
+def _detect_file_type_from_text(message_text: str | None) -> str | None:
+    text_lower = (message_text or "").lower()
+    if any(
+        kw in text_lower
+        for kw in ["price list", "pricelist", "prices", "rate card", "catalog"]
+    ):
+        return "price_list"
+    if any(kw in text_lower for kw in ["invoice", "bill", "receipt", "challan"]):
+        return "invoice"
+    return None
+
+
+def _match_restaurant_from_message(
+    message_text: str | None,
+    restaurants: list[dict[str, Any]],
+) -> str | None:
+    if not message_text:
+        return None
+    text = message_text.strip()
+    if not text:
+        return None
+    if text.isdigit():
+        idx = int(text)
+        if 1 <= idx <= len(restaurants):
+            return restaurants[idx - 1]["id"]
+
+    text_lower = text.lower()
+    matches: list[str] = []
+    for restaurant in restaurants:
+        name = restaurant.get("name", "")
+        name_lower = name.lower()
+        if name_lower in text_lower or text_lower in name_lower:
+            matches.append(restaurant["id"])
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
 def _decode_unicode_escapes(text: str) -> str:
     if "\\u" not in text:
         return text
@@ -257,6 +295,46 @@ def _get_user_restaurants(db: Session, user_id: uuid.UUID) -> list[dict[str, Any
     ]
 
 
+def _enqueue_file_processing(
+    *,
+    file_type: str,
+    restaurant_id: str,
+    file_id: str,
+    supplier_id: str | None,
+    chat_id: int,
+    user_id: uuid.UUID,
+    session_id: uuid.UUID,
+) -> str:
+    from app.workers.tasks import (
+        process_price_list_file_task,
+        process_invoice_file_task,
+    )
+    from app.workers.celery_types import CeleryApplyAsync
+    from typing import cast
+
+    task_kwargs = {
+        "restaurant_id": restaurant_id,
+        "file_id": file_id,
+        "supplier_id": supplier_id,
+        "chat_id": chat_id,
+        "user_id": str(user_id),
+        "session_id": str(session_id),
+    }
+
+    if file_type == "price_list":
+        cast(CeleryApplyAsync, process_price_list_file_task).apply_async(
+            kwargs=task_kwargs,
+            countdown=0.0,
+        )
+        return responses.FILE_DETECTED_PRICE_LIST
+
+    cast(CeleryApplyAsync, process_invoice_file_task).apply_async(
+        kwargs=task_kwargs,
+        countdown=0.0,
+    )
+    return responses.FILE_DETECTED_INVOICE
+
+
 def process_message_instant(
     *,
     db: Session,
@@ -300,9 +378,30 @@ def process_message_instant(
     # Record start time
     started_at = dt.datetime.now(dt.UTC)
 
+    if not has_file and context.pending_action:
+        pending_result = _handle_pending_file_upload(
+            db=db,
+            user=user,
+            context=context,
+            message_text=message_text,
+            session_id=session_id,
+            chat_id=chat_id,
+        )
+        if pending_result is not None:
+            response_text, context_update = pending_result
+            if context_update:
+                context = update_context_from_result(
+                    db=db,
+                    user=user,
+                    context=context,
+                    context_update=context_update,
+                )
+                db.commit()
+            return ProcessResult(response_text=response_text)
+
     # Handle file uploads specially - detect type with vision
     if has_file and file_id:
-        upload_response, upload_intent = _handle_file_upload(
+        upload_response, upload_intent, context_update = _handle_file_upload(
             db=db,
             user=user,
             context=context,
@@ -318,6 +417,13 @@ def process_message_instant(
         final_text = upload_response
 
         user.last_interaction_at = dt.datetime.now(dt.UTC)
+        if context_update:
+            context = update_context_from_result(
+                db=db,
+                user=user,
+                context=context,
+                context_update=context_update,
+            )
         db.add(
             ProcessingEvents(
                 session_id=session_id,
@@ -404,6 +510,62 @@ def process_message_instant(
     )
 
 
+def _handle_pending_file_upload(
+    *,
+    db: Session,
+    user: User,
+    context: UserContext,
+    message_text: str,
+    session_id: uuid.UUID,
+    chat_id: int,
+) -> tuple[str, dict[str, Any]] | None:
+    pending_action = context.pending_action
+    if not pending_action or pending_action.get("type") != "file_upload_pending":
+        return None
+
+    file_id = pending_action.get("file_id")
+    if not isinstance(file_id, str) or not file_id.strip():
+        return None
+
+    file_type = pending_action.get("file_type")
+    if not isinstance(file_type, str) or not file_type:
+        file_type = _detect_file_type_from_text(message_text)
+        if not file_type:
+            return responses.FILE_DETECTION_UNSURE, {"pending_action": pending_action}
+
+    restaurant_id = pending_action.get("restaurant_id") or context.active_restaurant_id
+    if not restaurant_id:
+        restaurants = _get_user_restaurants(db, user.id)
+        if not restaurants:
+            return responses.ERROR_NO_OUTLETS, {"clear_pending_action": True}
+        restaurant_id = _match_restaurant_from_message(message_text, restaurants)
+        if not restaurant_id:
+            updated_action = dict(pending_action)
+            updated_action["file_type"] = file_type
+            return (
+                responses.outlet_select_prompt(restaurants),
+                {"pending_action": updated_action},
+            )
+
+    supplier_id = pending_action.get("supplier_id") or context.active_supplier_id
+    response_text = _enqueue_file_processing(
+        file_type=file_type,
+        restaurant_id=str(restaurant_id),
+        file_id=str(file_id),
+        supplier_id=str(supplier_id) if supplier_id else None,
+        chat_id=chat_id,
+        user_id=user.id,
+        session_id=session_id,
+    )
+    context_update = {
+        "clear_pending_action": True,
+        "active_restaurant_id": str(restaurant_id),
+    }
+    if supplier_id:
+        context_update["active_supplier_id"] = str(supplier_id)
+    return response_text, context_update
+
+
 def _handle_file_upload(
     *,
     db: Session,
@@ -415,7 +577,7 @@ def _handle_file_upload(
     settings: Settings,
     session_id: uuid.UUID,
     chat_id: int,
-) -> tuple[str, Intent]:
+) -> tuple[str, Intent, dict[str, Any]]:
     """
     Handle file upload with type detection.
 
@@ -424,26 +586,11 @@ def _handle_file_upload(
     2. Queue file processing
     3. Return appropriate response
     """
-    from app.workers.tasks import (
-        process_price_list_file_task,
-        process_invoice_file_task,
-    )
-    from app.workers.celery_types import CeleryApplyAsync
-    from typing import cast
-
     # Determine file type from caption/context
-    text_lower = (message_text or "").lower()
-
-    is_price_list = any(
-        kw in text_lower
-        for kw in ["price list", "pricelist", "prices", "rate card", "catalog"]
+    file_type = _detect_file_type_from_text(message_text)
+    intent_guess = (
+        Intent.UPLOAD_PRICE_LIST if file_type == "price_list" else Intent.UPLOAD_INVOICE
     )
-    is_invoice = any(
-        kw in text_lower
-        for kw in ["invoice", "bill", "receipt", "challan"]
-    )
-
-    intent_guess = Intent.UPLOAD_PRICE_LIST if is_price_list else Intent.UPLOAD_INVOICE
 
     # Get restaurant ID
     restaurants = _get_user_restaurants(db, user.id)
@@ -455,41 +602,49 @@ def _handle_file_upload(
     if not restaurant_id and len(restaurants) == 1:
         restaurant_id = restaurants[0]["id"]
 
-    if not restaurant_id:
-        return responses.outlet_select_prompt(restaurants), intent_guess
-
     # Get supplier_id from context if available
     supplier_id = context.active_supplier_id
+    if not file_type:
+        return (
+            responses.FILE_DETECTION_UNSURE,
+            intent_guess,
+            {
+                "pending_action": {
+                    "type": "file_upload_pending",
+                    "file_id": file_id,
+                    "file_kind": file_kind,
+                    "restaurant_id": restaurant_id,
+                    "supplier_id": supplier_id,
+                }
+            },
+        )
 
-    # Queue the appropriate processing task
-    task_kwargs = {
-        "restaurant_id": restaurant_id,
-        "file_id": file_id,
-        "supplier_id": supplier_id,
-        "chat_id": chat_id,
-        "user_id": str(user.id),
-        "session_id": str(session_id),
-    }
+    if not restaurant_id:
+        return (
+            responses.outlet_select_prompt(restaurants),
+            intent_guess,
+            {
+                "pending_action": {
+                    "type": "file_upload_pending",
+                    "file_id": file_id,
+                    "file_kind": file_kind,
+                    "restaurant_id": restaurant_id,
+                    "supplier_id": supplier_id,
+                    "file_type": file_type,
+                }
+            },
+        )
 
-    if is_price_list:
-        cast(CeleryApplyAsync, process_price_list_file_task).apply_async(
-            kwargs=task_kwargs,
-            countdown=0.0,
-        )
-        return responses.FILE_DETECTED_PRICE_LIST, intent_guess
-    elif is_invoice:
-        cast(CeleryApplyAsync, process_invoice_file_task).apply_async(
-            kwargs=task_kwargs,
-            countdown=0.0,
-        )
-        return responses.FILE_DETECTED_INVOICE, intent_guess
-    else:
-        # Can't determine type - default to invoice
-        cast(CeleryApplyAsync, process_invoice_file_task).apply_async(
-            kwargs=task_kwargs,
-            countdown=0.0,
-        )
-        return responses.FILE_PROCESSING_STARTED.format(file_type="file"), intent_guess
+    response_text = _enqueue_file_processing(
+        file_type=file_type,
+        restaurant_id=str(restaurant_id),
+        file_id=file_id,
+        supplier_id=supplier_id,
+        chat_id=chat_id,
+        user_id=user.id,
+        session_id=session_id,
+    )
+    return response_text, intent_guess, {}
 
 
 def send_ack_message(
@@ -549,8 +704,8 @@ def send_ack_message(
 
 ACK_SYSTEM_PROMPT = """You are an acknowledgment generator for a restaurant management bot.
 Return a single short sentence (max 6 words). No emojis, no markdown.
-If has_file is true, mention that the file is being processed.
-Do not answer the user or provide options. Just acknowledge and signal you're working."""
+If has_file is true, acknowledge receipt of the file.
+Do not answer the user or provide options. Just acknowledge."""
 
 FINAL_RESPONSE_SYSTEM_PROMPT = """You are a response composer for a restaurant management bot.
 Use only the provided tool response and user message. Do not invent facts.
