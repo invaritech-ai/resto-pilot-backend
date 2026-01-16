@@ -44,6 +44,23 @@ class VisionDocumentResult:
     telemetry_results: list[VisionCallResult]
 
 
+def _log_combined_text(text: str, max_chars: int = 20000) -> None:
+    if not text:
+        logger.info("vision_combined_text_empty")
+        return
+    if len(text) <= max_chars:
+        snippet = text
+        truncated = 0
+    else:
+        snippet = text[:max_chars]
+        truncated = len(text) - max_chars
+        snippet += f"\n... [truncated {truncated} chars]"
+    logger.info(
+        "vision_combined_text",
+        extra={"length": len(text), "truncated": truncated, "text": snippet},
+    )
+
+
 def _get_vision_settings(settings: Settings) -> tuple[str, str, str]:
     """Get vision model settings, falling back to OpenAI defaults if not configured."""
     model = settings.vision_model or settings.openai_model
@@ -387,188 +404,85 @@ def process_pdf_with_vision(
             telemetry_results=[result],
         )
 
-    # Page-by-page processing
-    is_text_based = _is_text_based_pdf(file_bytes)
-    model, _, _ = _get_vision_settings(settings)
+    # Page-by-page processing with combined text + OCR
+    print("[VISION] process_pdf_with_vision: extracting text + OCR per page...")
+
+    text_pages: list[tuple[int, str]] = []
+    try:
+        text_pages = _extract_text_from_pdf_pages(file_bytes)
+    except OpenAIError as exc:
+        logger.warning("text_extraction_failed_using_ocr_only", extra={"error": str(exc)})
+
+    image_pages = _convert_pdf_pages_to_images(file_bytes)
+    total_pages = len(image_pages)
+    text_by_page = {page_num: text for page_num, text in text_pages}
+
     telemetry_results: list[VisionCallResult] = []
+    ocr_by_page: dict[int, str] = {}
 
-    if is_text_based:
-        # Extract text from each page - use vision_model for text extraction
-        print(
-            f"[VISION] process_pdf_with_vision: PDF is TEXT-BASED, extracting text..."
-        )
-        pages = _extract_text_from_pdf_pages(file_bytes)
-        total_pages = len(pages)
-        page_results = []
-
-        for page_num, page_text in pages:
-            if not page_text.strip():
-                print(
-                    f"[VISION] process_pdf_with_vision: page {page_num}/{total_pages} - SKIPPED (empty)"
-                )
-                continue
-
-            print(
-                f"[VISION] process_pdf_with_vision: page {page_num}/{total_pages} - sending to LLM ({len(page_text)} chars)..."
-            )
-
-            # Process text with vision model via chat API
-            system_prompt = "You are a helpful assistant that extracts structured data from text. Return ONLY valid JSON, no other text."
-            user_prompt = (
-                f"{prompt}\n\nExtracted text from page {page_num}:\n{page_text}"
-            )
-
-            start_time: float | None = None
-            try:
-                start_time = time.time()
-                # Use vision model for extraction (via raw httpx to control model)
-                _, api_key, base_url = _get_vision_settings(settings)
-                url = f"{base_url.rstrip('/')}/chat/completions"
-                print(
-                    f"[VISION] process_pdf_with_vision: page {page_num} - calling {url} with model={model}"
-                )
-                headers = {
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                }
-                if settings.openrouter_http_referer:
-                    headers["HTTP-Referer"] = settings.openrouter_http_referer
-                if settings.openrouter_title:
-                    headers["X-Title"] = settings.openrouter_title
-
-                payload = {
-                    "model": model,  # vision_model
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    "temperature": 0.2,
-                }
-                _apply_reasoning_policy(payload, settings, base_url)
-
-                timeout = httpx.Timeout(
-                    connect=10.0,
-                    read=float(settings.openai_timeout_seconds),
-                    write=10.0,
-                    pool=10.0,
-                )
-                resp = httpx.post(url, headers=headers, json=payload, timeout=timeout)
-                resp.raise_for_status()
-                end_time = time.time()
-                latency_ms = int((end_time - start_time) * 1000)
-                print(
-                    f"[VISION] process_pdf_with_vision: page {page_num} - response received in {latency_ms}ms"
-                )
-
-                response = resp.json()
-                content = (
-                    response.get("choices", [{}])[0].get("message", {}).get("content")
-                )
-                if not isinstance(content, str):
-                    raise OpenAIError(f"Unexpected LLM response: {response}")
-
-                print(
-                    f"[VISION] process_pdf_with_vision: page {page_num} - extracted {len(content)} chars"
-                )
-
-                # Extract telemetry
-                from app.ai.openrouter_generation import (
-                    extract_openrouter_generation_id,
-                )
-                from app.ai.openrouter_usage import extract_openrouter_usage
-
-                generation_id = extract_openrouter_generation_id(
-                    headers=dict(resp.headers), data=response
-                )
-                usage = extract_openrouter_usage(response)
-
-                telemetry_result = VisionCallResult(
-                    content=content,
-                    model=model,  # vision_model
-                    latency_ms=latency_ms,
-                    usage=usage,
-                    openrouter_generation_id=generation_id,
-                    response_headers=dict(resp.headers),
-                    response_data=response,
-                    error=None,
-                )
-                telemetry_results.append(telemetry_result)
-                page_results.append((page_num, content))
-                print(f"[VISION] process_pdf_with_vision: page {page_num} - ✓ SUCCESS")
-            except Exception as e:
-                print(
-                    f"[VISION] process_pdf_with_vision: page {page_num} - ✗ ERROR: {e}"
-                )
-                logger.warning(f"Error processing page {page_num}: {e}")
-                end_time = time.time()
-                latency_ms = int((end_time - start_time) * 1000) if start_time else 0
-                error_result = VisionCallResult(
-                    content="",
-                    model=model,
-                    latency_ms=latency_ms,
-                    usage=None,
-                    openrouter_generation_id=None,
-                    response_headers={},
-                    response_data={},
-                    error=f"Error processing page {page_num}: {e}",
-                )
-                telemetry_results.append(error_result)
-                continue
-
-    else:
-        # Convert pages to images and process with vision API
-        print(
-            f"[VISION] process_pdf_with_vision: PDF is IMAGE-BASED, converting to images..."
-        )
-        pages = _convert_pdf_pages_to_images(file_bytes)
-        total_pages = len(pages)
-        page_results = []
-
-        for page_num, page_image_bytes in pages:
-            print(
-                f"[VISION] process_pdf_with_vision: page {page_num}/{total_pages} - sending image ({len(page_image_bytes):,} bytes) to vision API..."
-            )
-            start_time = time.time()
-            try:
-                result = process_image_with_vision(
-                    page_image_bytes, prompt, settings, "image/png"
-                )
-                telemetry_results.append(result)
-                page_results.append((page_num, result.content))
-                print(
-                    f"[VISION] process_pdf_with_vision: page {page_num}/{total_pages} - ✓ SUCCESS ({result.latency_ms}ms)"
-                )
-            except Exception as e:
-                print(
-                    f"[VISION] process_pdf_with_vision: page {page_num}/{total_pages} - ✗ ERROR: {e}"
-                )
-                logger.warning(f"Error processing page {page_num}: {e}")
-                end_time = time.time()
-                latency_ms = int((end_time - start_time) * 1000)
-                # Record error telemetry for this page
-                error_result = VisionCallResult(
-                    content="",
-                    model=model,
-                    latency_ms=latency_ms,
-                    usage=None,
-                    openrouter_generation_id=None,
-                    response_headers={},
-                    response_data={},
-                    error=f"Error processing page {page_num}: {e}",
-                )
-                telemetry_results.append(error_result)
-                continue
-
-    # Consolidate results
-    print(
-        f"[VISION] process_pdf_with_vision: consolidating {len(page_results)} page results..."
+    ocr_prompt = (
+        "Extract all readable text from this page. Preserve line breaks and table "
+        "structure as best as possible. Do not summarize or omit headers/footers. "
+        "Return plain text only."
     )
-    consolidated_content = _consolidate_pdf_page_results(page_results, prompt, settings)
+
+    for page_num, page_image_bytes in image_pages:
+        print(
+            f"[VISION] process_pdf_with_vision: page {page_num}/{total_pages} - OCR ({len(page_image_bytes):,} bytes)..."
+        )
+        try:
+            result = process_image_with_vision(
+                page_image_bytes, ocr_prompt, settings, "image/png"
+            )
+            telemetry_results.append(result)
+            ocr_by_page[page_num] = result.content or ""
+            print(
+                f"[VISION] process_pdf_with_vision: page {page_num}/{total_pages} - ✓ OCR ({result.latency_ms}ms)"
+            )
+        except Exception as exc:
+            logger.warning(
+                "ocr_page_failed",
+                extra={"page": page_num, "error": str(exc)},
+            )
+            error_result = VisionCallResult(
+                content="",
+                model=_get_vision_settings(settings)[0],
+                latency_ms=0,
+                usage=None,
+                openrouter_generation_id=None,
+                response_headers={},
+                response_data={},
+                error=f"OCR failed for page {page_num}: {exc}",
+            )
+            telemetry_results.append(error_result)
+            ocr_by_page[page_num] = ""
+
+    page_text_blocks = []
+    for page_num, _ in image_pages:
+        text_layer = text_by_page.get(page_num, "")
+        ocr_layer = ocr_by_page.get(page_num, "")
+        page_text_blocks.append(
+            "\n".join(
+                [
+                    f"## Page {page_num}",
+                    "Text layer:",
+                    text_layer if text_layer.strip() else "[EMPTY]",
+                    "OCR layer:",
+                    ocr_layer if ocr_layer.strip() else "[EMPTY]",
+                ]
+            )
+        )
+
+    combined_text = "\n\n".join(page_text_blocks)
+    _log_combined_text(combined_text)
+    structured_result = _extract_structured_from_text(prompt, combined_text, settings)
+    telemetry_results.append(structured_result)
+
     print(
-        f"[VISION] process_pdf_with_vision: ✓ consolidation complete, {len(consolidated_content)} chars"
+        f"[VISION] process_pdf_with_vision: ✓ aggregation complete, {len(structured_result.content)} chars"
     )
     return VisionDocumentResult(
-        content=consolidated_content,
+        content=structured_result.content,
         telemetry_results=telemetry_results,
     )
 
@@ -949,6 +863,90 @@ def extract_text_from_file(
     raise OpenAIError(f"Unsupported text file type: {mime_type}")
 
 
+def _extract_structured_from_text(
+    prompt: str,
+    extracted_text: str,
+    settings: Settings,
+) -> VisionCallResult:
+    from app.ai.openrouter_generation import extract_openrouter_generation_id
+    from app.ai.openrouter_usage import extract_openrouter_usage
+
+    system_prompt = (
+        "You are a helpful assistant that extracts structured data from text. "
+        "Return ONLY valid JSON, no other text."
+    )
+    user_prompt = f"{prompt}\n\nExtracted text:\n{extracted_text}"
+
+    model, api_key, base_url = _get_vision_settings(settings)
+    start_time = time.time()
+    try:
+        url = f"{base_url.rstrip('/')}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        if settings.openrouter_http_referer:
+            headers["HTTP-Referer"] = settings.openrouter_http_referer
+        if settings.openrouter_title:
+            headers["X-Title"] = settings.openrouter_title
+
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0.2,
+        }
+        _apply_reasoning_policy(payload, settings, base_url)
+
+        timeout = httpx.Timeout(
+            connect=10.0,
+            read=float(settings.openai_timeout_seconds),
+            write=10.0,
+            pool=10.0,
+        )
+        resp = httpx.post(url, headers=headers, json=payload, timeout=timeout)
+        resp.raise_for_status()
+        response = resp.json()
+        end_time = time.time()
+        latency_ms = int((end_time - start_time) * 1000)
+
+        content = response.get("choices", [{}])[0].get("message", {}).get("content")
+        if not isinstance(content, str):
+            raise OpenAIError(f"Unexpected LLM response: {response}")
+
+        generation_id = extract_openrouter_generation_id(
+            headers=dict(resp.headers), data=response
+        )
+        usage = extract_openrouter_usage(response)
+
+        return VisionCallResult(
+            content=content,
+            model=model,
+            latency_ms=latency_ms,
+            usage=usage,
+            openrouter_generation_id=generation_id,
+            response_headers=dict(resp.headers),
+            response_data=response,
+            error=None,
+        )
+    except Exception as exc:
+        end_time = time.time()
+        latency_ms = int((end_time - start_time) * 1000)
+        logger.exception("text_extraction_failed")
+        return VisionCallResult(
+            content="",
+            model=model,
+            latency_ms=latency_ms,
+            usage=None,
+            openrouter_generation_id=None,
+            response_headers={},
+            response_data={},
+            error=f"Text extraction failed: {exc}",
+        )
+
+
 def process_document_with_vision(
     file_bytes: bytes,
     mime_type: str,
@@ -1011,77 +1009,14 @@ def process_document_with_vision(
         # Extract text from file
         extracted_text = extract_text_from_file(file_bytes, mime_type, filename)
 
-        # Send extracted text to LLM for structured extraction
-        from app.ai.openrouter_generation import extract_openrouter_generation_id
-        from app.ai.openrouter_usage import extract_openrouter_usage
-
-        system_prompt = "You are a helpful assistant that extracts structured data from text. Return ONLY valid JSON, no other text."
-        user_prompt = f"{prompt}\n\nExtracted text:\n{extracted_text}"
-
-        # Use vision_model for text file extraction
-        model, api_key, base_url = _get_vision_settings(settings)
-        start_time = time.time()
-        try:
-            url = f"{base_url.rstrip('/')}/chat/completions"
-            headers = {
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            }
-            if settings.openrouter_http_referer:
-                headers["HTTP-Referer"] = settings.openrouter_http_referer
-            if settings.openrouter_title:
-                headers["X-Title"] = settings.openrouter_title
-
-            payload = {
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                "temperature": 0.2,
-            }
-            _apply_reasoning_policy(payload, settings, base_url)
-
-            timeout = httpx.Timeout(
-                connect=10.0,
-                read=float(settings.openai_timeout_seconds),
-                write=10.0,
-                pool=10.0,
-            )
-            resp = httpx.post(url, headers=headers, json=payload, timeout=timeout)
-            resp.raise_for_status()
-            response = resp.json()
-            end_time = time.time()
-            latency_ms = int((end_time - start_time) * 1000)
-
-            content = response.get("choices", [{}])[0].get("message", {}).get("content")
-            if not isinstance(content, str):
-                raise OpenAIError(f"Unexpected LLM response: {response}")
-
-            generation_id = extract_openrouter_generation_id(
-                headers=dict(resp.headers), data=response
-            )
-            usage = extract_openrouter_usage(response)
-
-            telemetry_result = VisionCallResult(
-                content=content,
-                model=model,
-                latency_ms=latency_ms,
-                usage=usage,
-                openrouter_generation_id=generation_id,
-                response_headers=dict(resp.headers),
-                response_data=response,
-                error=None,
-            )
-            return VisionDocumentResult(
-                content=content,
-                telemetry_results=[telemetry_result],
-            )
-        except Exception as e:
-            end_time = time.time()
-            latency_ms = int((end_time - start_time) * 1000)
-            logger.exception("text_file_llm_processing_failed")
-            # Error telemetry will be recorded by caller if needed
-            raise OpenAIError(f"Failed to process extracted text: {e}") from e
+        telemetry_result = _extract_structured_from_text(
+            prompt, extracted_text, settings
+        )
+        if telemetry_result.error:
+            raise OpenAIError(telemetry_result.error)
+        return VisionDocumentResult(
+            content=telemetry_result.content,
+            telemetry_results=[telemetry_result],
+        )
 
     raise OpenAIError(f"Unsupported document type: {mime_type}")
