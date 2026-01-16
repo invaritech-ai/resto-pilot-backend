@@ -14,6 +14,8 @@ from app.db.models.file_processing_staging import FileProcessingStaging
 from app.db.models.processing_events import ProcessingEvents
 from app.db.models.suppliers import Suppliers
 from app.db.models.telegram_messages import TelegramMessages
+from app.db.models.user import User
+from app.conversation.context import load_context, save_context
 from app.ai.openrouter_generation import extract_openrouter_generation_id
 from app.ai.vision_client import VisionCallResult, _get_vision_settings
 from app.processing.file_processor import (
@@ -118,6 +120,54 @@ def _record_vision_telemetry(
                         "error": result.error,
                     },
                 )
+
+
+def _set_pending_file_processing_action(
+    *,
+    db: Session,
+    user_id: uuid.UUID,
+    restaurant_id: uuid.UUID,
+    staging_id: uuid.UUID,
+    field: str,
+    supplier_id: uuid.UUID | None = None,
+) -> None:
+    user = db.get(User, user_id)
+    if not user:
+        return
+
+    context = load_context(db, user)
+    context.pending_action = {
+        "type": "file_processing_missing_field",
+        "staging_id": str(staging_id),
+        "field": field,
+    }
+    context.active_restaurant_id = str(restaurant_id)
+    if supplier_id:
+        context.active_supplier_id = str(supplier_id)
+    save_context(db, user, context)
+
+
+def _clear_pending_file_processing_action(
+    *,
+    db: Session,
+    user_id: uuid.UUID,
+    restaurant_id: uuid.UUID,
+    supplier_id: uuid.UUID | None = None,
+) -> None:
+    user = db.get(User, user_id)
+    if not user:
+        return
+
+    context = load_context(db, user)
+    if (
+        context.pending_action
+        and context.pending_action.get("type") == "file_processing_missing_field"
+    ):
+        context.pending_action = None
+    context.active_restaurant_id = str(restaurant_id)
+    if supplier_id:
+        context.active_supplier_id = str(supplier_id)
+    save_context(db, user, context)
 
 
 @celery_app.task(name="process_invoice_file_task")
@@ -256,18 +306,43 @@ def process_invoice_file_task(
 
             # Send message based on status
             if status == "awaiting_supplier":
+                _set_pending_file_processing_action(
+                    db=db,
+                    user_id=user_uuid,
+                    restaurant_id=restaurant_uuid,
+                    staging_id=staging.id,
+                    field="supplier",
+                    supplier_id=supplier_uuid,
+                )
+                db.commit()
                 send_message(
                     chat_id=chat_id,
-                    text="What supplier is this invoice from?",
+                    text="I couldn't find the supplier in this invoice. What supplier is it from?",
                     settings=settings,
                 )
             elif status == "awaiting_currency":
+                _set_pending_file_processing_action(
+                    db=db,
+                    user_id=user_uuid,
+                    restaurant_id=restaurant_uuid,
+                    staging_id=staging.id,
+                    field="currency",
+                    supplier_id=supplier_uuid,
+                )
+                db.commit()
                 send_message(
                     chat_id=chat_id,
                     text="What currency is this invoice in? (e.g., USD, EUR)",
                     settings=settings,
                 )
             else:
+                _clear_pending_file_processing_action(
+                    db=db,
+                    user_id=user_uuid,
+                    restaurant_id=restaurant_uuid,
+                    supplier_id=supplier_uuid,
+                )
+                db.commit()
                 # Format and send preview message with summary
                 line_items = extracted_data.get("line_items", [])
                 total_items = len(line_items)
@@ -489,18 +564,43 @@ def process_price_list_file_task(
 
             # Send message based on status
             if status == "awaiting_supplier":
+                _set_pending_file_processing_action(
+                    db=db,
+                    user_id=user_uuid,
+                    restaurant_id=restaurant_uuid,
+                    staging_id=staging.id,
+                    field="supplier",
+                    supplier_id=supplier_uuid,
+                )
+                db.commit()
                 send_message(
                     chat_id=chat_id,
-                    text="What supplier is this price list from?",
+                    text="I couldn't find the supplier in this price list. Which supplier is it from?",
                     settings=settings,
                 )
             elif status == "awaiting_currency":
+                _set_pending_file_processing_action(
+                    db=db,
+                    user_id=user_uuid,
+                    restaurant_id=restaurant_uuid,
+                    staging_id=staging.id,
+                    field="currency",
+                    supplier_id=supplier_uuid,
+                )
+                db.commit()
                 send_message(
                     chat_id=chat_id,
                     text="What currency is this price list in? (e.g., USD, EUR)",
                     settings=settings,
                 )
             else:
+                _clear_pending_file_processing_action(
+                    db=db,
+                    user_id=user_uuid,
+                    restaurant_id=restaurant_uuid,
+                    supplier_id=supplier_uuid,
+                )
+                db.commit()
                 # Format and send preview message with summary (not all items)
                 items = extracted_data.get("items", [])
                 total_items = len(items)

@@ -83,6 +83,18 @@ def _detect_file_type_from_text(message_text: str | None) -> str | None:
     return None
 
 
+def _is_derive_from_file(message_text: str) -> bool:
+    text = message_text.strip().lower()
+    return text in {
+        "derive from file",
+        "use the file",
+        "use file",
+        "from file",
+        "pull from file",
+        "extract from file",
+    }
+
+
 def _match_restaurant_from_message(
     message_text: str | None,
     restaurants: list[dict[str, Any]],
@@ -382,6 +394,26 @@ def process_message_instant(
     started_at = dt.datetime.now(dt.UTC)
 
     if not has_file and context.pending_action:
+        pending_result = _handle_pending_file_processing_missing_field(
+            db=db,
+            user=user,
+            context=context,
+            message_text=message_text,
+            chat_id=chat_id,
+            session_id=session_id,
+        )
+        if pending_result is not None:
+            response_text, context_update = pending_result
+            if context_update:
+                context = update_context_from_result(
+                    db=db,
+                    user=user,
+                    context=context,
+                    context_update=context_update,
+                )
+                db.commit()
+            return ProcessResult(response_text=response_text)
+
         pending_result = _handle_pending_file_upload(
             db=db,
             user=user,
@@ -567,6 +599,90 @@ def _handle_pending_file_upload(
     if supplier_id:
         context_update["active_supplier_id"] = str(supplier_id)
     return response_text, context_update
+
+
+def _handle_pending_file_processing_missing_field(
+    *,
+    db: Session,
+    user: User,
+    context: UserContext,
+    message_text: str,
+    chat_id: int,
+    session_id: uuid.UUID,
+) -> tuple[str, dict[str, Any]] | None:
+    pending_action = context.pending_action
+    if not pending_action or pending_action.get("type") != "file_processing_missing_field":
+        return None
+
+    staging_id = pending_action.get("staging_id")
+    field = pending_action.get("field")
+    if not isinstance(staging_id, str) or not staging_id:
+        return None
+    if field not in ("supplier", "currency"):
+        return None
+
+    value = message_text.strip()
+    if not value:
+        prompt = (
+            "Please provide the supplier name."
+            if field == "supplier"
+            else "Please provide the currency (e.g., USD, EUR)."
+        )
+        return prompt, {"pending_action": pending_action}
+
+    if _is_derive_from_file(value):
+        prompt = (
+            "I couldn't find the supplier in the file. Please provide the supplier name."
+            if field == "supplier"
+            else "I couldn't find the currency in the file. Please provide it (e.g., USD, EUR)."
+        )
+        return prompt, {"pending_action": pending_action}
+
+    from app.ai.db_tools import file_processing as file_processing_tools
+    from app.db.models.file_processing_staging import FileProcessingStaging
+
+    tools = file_processing_tools.create_file_processing_tools(
+        db=db,
+        user_id=user.id,
+        actor_role="staff",
+        restaurant_roles={},
+        chat_id=chat_id,
+        session_id=session_id,
+    )
+    tool = tools.get("update_missing_field")
+    if not tool:
+        return responses.CANT_HELP, {"pending_action": pending_action}
+
+    result = tool.handler({"staging_id": staging_id, "value": value})
+    if isinstance(result, str) and result.startswith("Error:"):
+        return result, {"pending_action": pending_action}
+
+    try:
+        staging_uuid = uuid.UUID(staging_id)
+    except ValueError:
+        return result, {"pending_action": pending_action}
+
+    staging = db.get(FileProcessingStaging, staging_uuid)
+    if not staging:
+        return result, {"pending_action": pending_action}
+
+    context_update = {"active_restaurant_id": str(staging.restaurant_id)}
+    if staging.status == "awaiting_currency":
+        context_update["pending_action"] = {
+            "type": "file_processing_missing_field",
+            "staging_id": staging_id,
+            "field": "currency",
+        }
+    elif staging.status == "awaiting_supplier":
+        context_update["pending_action"] = {
+            "type": "file_processing_missing_field",
+            "staging_id": staging_id,
+            "field": "supplier",
+        }
+    else:
+        context_update["clear_pending_action"] = True
+
+    return result, context_update
 
 
 def _handle_file_upload(
