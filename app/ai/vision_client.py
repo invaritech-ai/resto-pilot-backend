@@ -61,6 +61,37 @@ def _log_combined_text(text: str, max_chars: int = 20000) -> None:
     )
 
 
+def _log_page_text(
+    page_num: int,
+    text_layer: str,
+    ocr_layer: str,
+    max_chars: int = 20000,
+) -> None:
+    def _clip(value: str) -> tuple[str, int, int]:
+        if not value or not value.strip():
+            return "[EMPTY]", 0, 0
+        length = len(value)
+        if length <= max_chars:
+            return value, length, 0
+        snippet = value[:max_chars] + f"\n... [truncated {length - max_chars} chars]"
+        return snippet, length, length - max_chars
+
+    text_snippet, text_length, text_truncated = _clip(text_layer)
+    ocr_snippet, ocr_length, ocr_truncated = _clip(ocr_layer)
+    logger.info(
+        "vision_page_text",
+        extra={
+            "page": page_num,
+            "text_length": text_length,
+            "text_truncated": text_truncated,
+            "text": text_snippet,
+            "ocr_length": ocr_length,
+            "ocr_truncated": ocr_truncated,
+            "ocr": ocr_snippet,
+        },
+    )
+
+
 def _get_vision_settings(settings: Settings) -> tuple[str, str, str]:
     """Get vision model settings, falling back to OpenAI defaults if not configured."""
     model = settings.vision_model or settings.openai_model
@@ -461,6 +492,7 @@ def process_pdf_with_vision(
     for page_num, _ in image_pages:
         text_layer = text_by_page.get(page_num, "")
         ocr_layer = ocr_by_page.get(page_num, "")
+        _log_page_text(page_num, text_layer, ocr_layer)
         page_text_blocks.append(
             "\n".join(
                 [
