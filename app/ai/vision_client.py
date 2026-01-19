@@ -73,8 +73,10 @@ def _log_structured_text(text: str, max_chars: int = 20000) -> None:
         truncated = len(text) - max_chars
         snippet += f"\n... [truncated {truncated} chars]"
     logger.info(
-        "vision_structured_text",
-        extra={"length": len(text), "truncated": truncated, "text": snippet},
+        "vision_structured_text length=%s truncated=%s\nSTRUCTURED:\n%s",
+        len(text),
+        truncated,
+        snippet,
     )
 
 
@@ -470,7 +472,7 @@ def process_pdf_with_vision(
     ocr_prompt = (
         "Extract all readable text from this page. Preserve line breaks and table "
         "structure as best as possible. Do not summarize or omit headers/footers. "
-        "Return plain text only."
+        "Return Markdown only (use tables where appropriate, keep headings)."
     )
 
     for page_num, page_image_bytes in image_pages:
