@@ -61,6 +61,23 @@ def _log_combined_text(text: str, max_chars: int = 20000) -> None:
     )
 
 
+def _log_structured_text(text: str, max_chars: int = 20000) -> None:
+    if not text:
+        logger.info("vision_structured_text_empty")
+        return
+    if len(text) <= max_chars:
+        snippet = text
+        truncated = 0
+    else:
+        snippet = text[:max_chars]
+        truncated = len(text) - max_chars
+        snippet += f"\n... [truncated {truncated} chars]"
+    logger.info(
+        "vision_structured_text",
+        extra={"length": len(text), "truncated": truncated, "text": snippet},
+    )
+
+
 def _log_page_text(
     page_num: int,
     text_layer: str,
@@ -507,6 +524,7 @@ def process_pdf_with_vision(
     combined_text = "\n\n".join(page_text_blocks)
     _log_combined_text(combined_text)
     structured_result = _extract_structured_from_text(prompt, combined_text, settings)
+    _log_structured_text(structured_result.content)
     telemetry_results.append(structured_result)
 
     print(
