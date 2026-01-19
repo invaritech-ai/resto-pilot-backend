@@ -79,16 +79,15 @@ def _log_page_text(
     text_snippet, text_length, text_truncated = _clip(text_layer)
     ocr_snippet, ocr_length, ocr_truncated = _clip(ocr_layer)
     logger.info(
-        "vision_page_text",
-        extra={
-            "page": page_num,
-            "text_length": text_length,
-            "text_truncated": text_truncated,
-            "text": text_snippet,
-            "ocr_length": ocr_length,
-            "ocr_truncated": ocr_truncated,
-            "ocr": ocr_snippet,
-        },
+        "vision_page_text page=%s text_length=%s text_truncated=%s ocr_length=%s "
+        "ocr_truncated=%s\nTEXT:\n%s\nOCR:\n%s",
+        page_num,
+        text_length,
+        text_truncated,
+        ocr_length,
+        ocr_truncated,
+        text_snippet,
+        ocr_snippet,
     )
 
 
