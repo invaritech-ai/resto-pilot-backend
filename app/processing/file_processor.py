@@ -271,57 +271,55 @@ def extract_price_list_data(
             ],
         }
     """
-    # Get DB schema for supplier_items and supplier_prices tables
-    schema_info = _format_schema_for_extraction(["supplier_items", "supplier_prices"])
+    prompt = """Extract supplier price list data and return ONLY valid JSON.
+No markdown, no commentary, no extra keys.
 
-    prompt = f"""Extract all price list data from this document and return it as JSON.
+Schema (must match exactly):
+{
+  "supplier": {
+    "name": "string",
+    "contact_name": "string|null",
+    "contact_email": "string|null",
+    "contact_phone": "string|null",
+    "language": "string|null",
+    "currency": "string|null",
+    "lead_time_days": "number|null"
+  },
+  "product_info": [
+    {
+      "name_en": "string",
+      "name_local": "string|null",
+      "category": "string|null",
+      "sub_category": "string|null",
+      "storage_type": "frozen|chilled|dry|null",
+      "default_unit": "kg|pack|piece|null",
+      "default_unit_size": "number|null",
+      "supplier_name_raw": "string",
+      "supplier_sku": "string|null",
+      "pack_size_text": "string|null",
+      "unit_basis": "kg|pack|piece|null",
+      "min_order_qty": "number|null",
+      "price": "number",
+      "currency": "string|null",
+      "price_type": "standard|promo|special",
+      "valid_from": "YYYY-MM-DD",
+      "valid_to": "YYYY-MM-DD|null",
+      "min_qty": "number|null",
+      "source_page": "number",
+      "row_index": "number",
+      "raw_row": "string|null"
+    }
+  ]
+}
 
-{schema_info}
-
-IMPORTANT: Map extracted data to the exact database column names shown above.
-
-Required fields (must not be null):
-- supplier_name: The company name of the supplier/vendor (required)
-- currency: Currency code e.g., USD, EUR, HKD (required)
-
-Supplier contact information (optional but extract if visible):
-- contact_name: Name of contact person (e.g., "Teresa Leung", "John Smith")
-- contact_email: Email address if visible
-- contact_phone: Phone number if visible
-
-- items: Array of items, each with:
-  - supplier_name_raw: Product name as shown in the document (required, maps to supplier_items.supplier_name_raw)
-  - price: Price per unit (required, Numeric type, maps to supplier_prices.price)
-  - currency: Currency code (required, String type, maps to supplier_prices.currency)
-  - price_type: Price type (required, enum: "standard", "promo", "special", maps to supplier_prices.price_type)
-  - valid_from: Effective/valid from date in ISO format YYYY-MM-DD (required, maps to supplier_prices.valid_from)
-
-Optional fields (use null if not found):
-- effective_date: Effective date in ISO format YYYY-MM-DD (nullable)
-- supplier_sku: SKU or product code (nullable, maps to supplier_items.supplier_sku)
-- pack_size_text: Pack size description e.g., "10 x 1kg" (nullable, maps to supplier_items.pack_size_text)
-- unit_basis: Unit basis (nullable, enum: "kg", "pack", "piece", maps to supplier_items.unit_basis)
-- min_order_qty: Minimum order quantity (nullable, Numeric, maps to supplier_items.min_order_qty)
-- min_qty: Minimum quantity for this price (nullable, Numeric, maps to supplier_prices.min_qty)
-- valid_to: Valid until date in ISO format YYYY-MM-DD (nullable, maps to supplier_prices.valid_to)
-- source_page: Page number where this item was found ({source_page if source_page is not None else "null if not applicable"})
-- row_index: Row number/index in the document (null if not applicable)
-- raw_row: Original text/row content before extraction (null if not applicable)
-
-NORMALIZATION RULES:
-1. Normalize product names: Extract base name and separate size/pack/MOQ information
-2. Split variants: If same base name appears with different sizes/prices, create separate items
-3. Example: "Tomatoes 1kg" and "Tomatoes 5kg" should be two items with:
-   - supplier_name_raw: "Tomatoes" (base name)
-   - pack_size_text: "1kg" and "5kg" respectively
-   - unit_basis: "kg" for both
-
-CRITICAL RULES:
-1. Return null for any field you cannot determine - NEVER summarize or guess
-2. Use exact column names from the schema above
-3. Include trace fields (source_page, row_index, raw_row) for each item
-4. All numeric fields must be actual numbers, not strings
-5. Return ONLY valid JSON, no other text."""
+Rules:
+1. Use null for missing fields; do not guess.
+2. Do not include DB ids, status, created_at, or source_document_id.
+3. If unsure about name_local, put the full item name in name_en and set name_local null.
+4. price must be numeric only (no currency symbols).
+5. If item currency is missing, use supplier.currency.
+6. source_page and row_index must be set for each product_info item.
+7. raw_row should be the original line text if available."""
 
     try:
         result = process_document_with_vision(
@@ -341,6 +339,52 @@ CRITICAL RULES:
             )
 
         data = json.loads(extracted_text)
+
+        supplier = data.get("supplier")
+        if isinstance(supplier, dict):
+            if supplier.get("name") and not data.get("supplier_name"):
+                data["supplier_name"] = supplier.get("name")
+            if supplier.get("contact_name") and not data.get("contact_name"):
+                data["contact_name"] = supplier.get("contact_name")
+            if supplier.get("contact_email") and not data.get("contact_email"):
+                data["contact_email"] = supplier.get("contact_email")
+            if supplier.get("contact_phone") and not data.get("contact_phone"):
+                data["contact_phone"] = supplier.get("contact_phone")
+            if supplier.get("currency") and not data.get("currency"):
+                data["currency"] = supplier.get("currency")
+            if supplier.get("lead_time_days") is not None:
+                data["lead_time_days"] = supplier.get("lead_time_days")
+
+        if "product_info" in data and "items" not in data:
+            items = []
+            for idx, entry in enumerate(data["product_info"] or []):
+                if not isinstance(entry, dict):
+                    continue
+                supplier_name_raw = entry.get("supplier_name_raw") or entry.get(
+                    "name_en"
+                )
+                if not supplier_name_raw:
+                    continue
+                item_currency = entry.get("currency") or data.get("currency")
+                items.append(
+                    {
+                        "supplier_name_raw": supplier_name_raw,
+                        "supplier_sku": entry.get("supplier_sku"),
+                        "pack_size_text": entry.get("pack_size_text"),
+                        "unit_basis": entry.get("unit_basis"),
+                        "min_order_qty": entry.get("min_order_qty"),
+                        "price": entry.get("price"),
+                        "currency": item_currency,
+                        "price_type": entry.get("price_type", "standard"),
+                        "min_qty": entry.get("min_qty"),
+                        "valid_from": entry.get("valid_from"),
+                        "valid_to": entry.get("valid_to"),
+                        "source_page": entry.get("source_page"),
+                        "row_index": entry.get("row_index", idx),
+                        "raw_row": entry.get("raw_row"),
+                    }
+                )
+            data["items"] = items
 
         # Ensure trace fields are set for each item
         if "items" in data:
@@ -614,7 +658,7 @@ Return ONLY valid JSON, no other text."""
             raise OpenAIError(f"Unexpected LLM response: {response}")
 
         # Extract telemetry data
-        generation_id = extract_openrouter_generation_id(headers)
+        generation_id = extract_openrouter_generation_id(headers=headers)
         usage = extract_openrouter_usage(response)
         model = settings.openai_model
 

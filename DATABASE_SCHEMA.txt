@@ -1,9 +1,15 @@
-DATABASE SCHEMA - RESTO PILOT
-================================
+DATABASE SCHEMA - RESTO PILOT (from app/db/models)
+===============================================
 
-All tables have:
-- id: UUID (primary key, auto-generated)
-- Standard naming conventions for indexes, unique constraints, foreign keys, etc.
+All tables include:
+- id: UUID (primary key, default uuid4)
+
+Naming conventions (from Base metadata):
+- pk: pk_%(table_name)s
+- fk: fk_%(table_name)s_%(column_0_name)s_%(referred_table_name)s
+- uq: uq_%(table_name)s_%(column_0_name)s
+- ix: ix_%(column_0_label)s
+- ck: ck_%(table_name)s_%(constraint_name)s
 
 ================================
 USER MANAGEMENT
@@ -19,7 +25,7 @@ Table: users
 - phone: STRING (nullable)
 - is_phone_verified: BOOLEAN (not null, default: false)
 - state: STRING(50) (nullable, default: 'IDLE')
-- state_data: JSON/JSONB (nullable) - stores conversation context, active operation, collected params
+- state_data: JSON/JSONB (nullable)
 - created_at: TIMESTAMP WITH TIME ZONE (not null, default: now())
 - last_interaction_at: TIMESTAMP WITH TIME ZONE (not null, default: now())
 
@@ -42,24 +48,24 @@ Table: restaurant_users
 - id: UUID (primary key)
 - restaurant_id: UUID (foreign key -> restaurants.id, on delete: CASCADE, not null)
 - user_id: UUID (foreign key -> users.id, on delete: CASCADE, not null)
-- role: ENUM('owner', 'staff') (not null)
+- role: ENUM('owner', 'staff') (not null) [enum name: restaurant_user_role]
 - joined_at: TIMESTAMP WITH TIME ZONE (not null, default: now())
 - invited_by: UUID (foreign key -> users.id, on delete: SET NULL, nullable)
-- status: ENUM('invited', 'active', 'removed') (not null, default: 'invited')
-- Unique constraint: (restaurant_id, user_id)
+- status: ENUM('invited', 'active', 'removed') (not null, default: 'invited') [enum name: restaurant_user_status]
+- Unique constraint: (restaurant_id, user_id) [uq_restaurant_users_member]
 
 
 Table: invite_codes
 -------------------
 - id: UUID (primary key)
-- code: STRING(10) (not null, unique)
+- code: STRING(10) (not null)
 - restaurant_id: UUID (foreign key -> restaurants.id, on delete: CASCADE, not null)
-- role: ENUM('owner', 'staff') (not null)
+- role: ENUM('owner', 'staff') (not null) [enum name: invite_target_role]
 - expires_at: TIMESTAMP WITH TIME ZONE (nullable)
 - used_at: TIMESTAMP WITH TIME ZONE (nullable)
 - created_by: UUID (foreign key -> users.id, on delete: SET NULL, nullable)
 - created_at: TIMESTAMP WITH TIME ZONE (not null, default: now())
-
+- Unique constraint: (code) [uq_invite_codes_code]
 
 ================================
 SUPPLIER MANAGEMENT
@@ -90,9 +96,9 @@ Table: supplier_items
 - supplier_sku: STRING (nullable)
 - supplier_name_raw: STRING (not null)
 - pack_size_text: STRING (nullable)
-- unit_basis: ENUM('kg', 'pack', 'piece') (nullable)
+- unit_basis: ENUM('kg', 'pack', 'piece') (nullable) [enum name: unit_type]
 - min_order_qty: NUMERIC (nullable)
-- status: ENUM('active', 'discontinued') (not null)
+- status: ENUM('active', 'discontinued') (not null) [enum name: supplier_item_status]
 - source_document_id: UUID (foreign key -> documents.id, on delete: SET NULL, nullable)
 - created_at: TIMESTAMP WITH TIME ZONE (not null, default: now())
 
@@ -103,13 +109,12 @@ Table: supplier_prices
 - supplier_item_id: UUID (foreign key -> supplier_items.id, on delete: CASCADE, not null)
 - price: NUMERIC (not null)
 - currency: STRING (not null)
-- price_type: ENUM('standard', 'promo', 'special') (not null)
+- price_type: ENUM('standard', 'promo', 'special') (not null) [enum name: price_type]
 - valid_from: TIMESTAMP WITH TIME ZONE (not null)
 - valid_to: TIMESTAMP WITH TIME ZONE (nullable)
 - min_qty: NUMERIC (nullable)
 - source_document_id: UUID (foreign key -> documents.id, on delete: SET NULL, nullable)
 - created_at: TIMESTAMP WITH TIME ZONE (not null, default: now())
-
 
 ================================
 PRODUCT MANAGEMENT
@@ -123,8 +128,8 @@ Table: products
 - name_local: STRING (nullable)
 - category: STRING (nullable)
 - sub_category: STRING (nullable)
-- storage_type: ENUM('frozen', 'chilled', 'dry') (nullable)
-- default_unit: ENUM('kg', 'pack', 'piece') (nullable)
+- storage_type: ENUM('frozen', 'chilled', 'dry') (nullable) [enum name: storage_type]
+- default_unit: ENUM('kg', 'pack', 'piece') (nullable) [enum name: unit_type]
 - default_unit_size: NUMERIC (nullable)
 - is_active: BOOLEAN (not null, default: true)
 - created_at: TIMESTAMP WITH TIME ZONE (not null, default: now())
@@ -137,9 +142,8 @@ Table: product_aliases
 - product_id: UUID (foreign key -> products.id, on delete: CASCADE, not null)
 - supplier_id: UUID (foreign key -> suppliers.id, on delete: CASCADE, nullable)
 - alias_text: STRING (not null)
-- confidence: ENUM('auto', 'manual') (not null)
+- confidence: ENUM('auto', 'manual') (not null) [enum name: alias_confidence]
 - created_at: TIMESTAMP WITH TIME ZONE (not null, default: now())
-
 
 ================================
 INVOICE MANAGEMENT
@@ -158,7 +162,7 @@ Table: invoices
 - tax: NUMERIC (not null)
 - total: NUMERIC (not null)
 - document_id: UUID (foreign key -> documents.id, on delete: SET NULL, nullable)
-- status: ENUM('received', 'paid', 'disputed') (not null)
+- status: ENUM('received', 'paid', 'disputed') (not null) [enum name: invoice_status]
 - authorized_by_user_id: UUID (foreign key -> users.id, on delete: SET NULL, nullable)
 - created_at: TIMESTAMP WITH TIME ZONE (not null, default: now())
 
@@ -179,7 +183,6 @@ Table: invoice_line_items
 - tax_amount: NUMERIC (not null)
 - created_at: TIMESTAMP WITH TIME ZONE (not null, default: now())
 
-
 ================================
 INVENTORY MANAGEMENT
 ================================
@@ -189,7 +192,7 @@ Table: inventory_locations
 - id: UUID (primary key)
 - restaurant_id: UUID (foreign key -> restaurants.id, on delete: CASCADE, not null)
 - name: STRING (not null)
-- type: ENUM('storage', 'kitchen') (not null)
+- type: ENUM('storage', 'kitchen') (not null) [enum name: location_type]
 - created_at: TIMESTAMP WITH TIME ZONE (not null, default: now())
 - updated_at: TIMESTAMP WITH TIME ZONE (not null, default: now(), auto-update)
 
@@ -207,7 +210,7 @@ Table: inventory_batches
 - received_date: TIMESTAMP WITH TIME ZONE (not null)
 - expiry_date: TIMESTAMP WITH TIME ZONE (nullable)
 - location_id: UUID (foreign key -> inventory_locations.id, on delete: SET NULL, nullable)
-- status: ENUM('available', 'consumed', 'expired') (not null)
+- status: ENUM('available', 'consumed', 'expired') (not null) [enum name: batch_status]
 - created_at: TIMESTAMP WITH TIME ZONE (not null, default: now())
 - updated_at: TIMESTAMP WITH TIME ZONE (not null, default: now(), auto-update)
 
@@ -217,11 +220,10 @@ Table: inventory_movements
 - id: UUID (primary key)
 - restaurant_id: UUID (foreign key -> restaurants.id, on delete: CASCADE, not null)
 - inventory_batch_id: UUID (foreign key -> inventory_batches.id, on delete: CASCADE, not null)
-- movement_type: ENUM('receive', 'consume', 'waste', 'adjust') (not null)
+- movement_type: ENUM('receive', 'consume', 'waste', 'adjust') (not null) [enum name: movement_type]
 - quantity: NUMERIC (not null)
 - reason: STRING (nullable)
 - created_at: TIMESTAMP WITH TIME ZONE (not null, default: now())
-
 
 ================================
 PRICING & DISPUTES
@@ -235,7 +237,7 @@ Table: price_comparisons
 - expected_price: NUMERIC (not null)
 - actual_price: NUMERIC (not null)
 - delta: NUMERIC (not null)
-- status: ENUM('ok', 'warning', 'dispute') (not null)
+- status: ENUM('ok', 'warning', 'dispute') (not null) [enum name: comparison_status]
 - reviewed_by: UUID (foreign key -> users.id, on delete: SET NULL, nullable)
 - reviewed_at: TIMESTAMP WITH TIME ZONE (nullable)
 - created_at: TIMESTAMP WITH TIME ZONE (not null, default: now())
@@ -247,11 +249,10 @@ Table: supplier_disputes
 - restaurant_id: UUID (foreign key -> restaurants.id, on delete: CASCADE, not null)
 - invoice_id: UUID (foreign key -> invoices.id, on delete: CASCADE, not null)
 - reason: STRING (not null)
-- status: ENUM('open', 'resolved') (not null)
+- status: ENUM('open', 'resolved') (not null) [enum name: dispute_status]
 - resolution_notes: STRING (nullable)
 - created_at: TIMESTAMP WITH TIME ZONE (not null, default: now())
 - updated_at: TIMESTAMP WITH TIME ZONE (not null, default: now(), auto-update)
-
 
 ================================
 DOCUMENT MANAGEMENT
@@ -262,7 +263,7 @@ Table: documents
 - id: UUID (primary key)
 - restaurant_id: UUID (foreign key -> restaurants.id, on delete: CASCADE, not null)
 - supplier_id: UUID (foreign key -> suppliers.id, on delete: SET NULL, nullable)
-- doc_type: ENUM('catalogue', 'price_list', 'promo', 'invoice') (not null)
+- doc_type: ENUM('catalogue', 'price_list', 'promo', 'invoice') (not null) [enum name: doc_type]
 - language: STRING (nullable)
 - effective_date: TIMESTAMP WITH TIME ZONE (nullable)
 - file_url: STRING (not null) - Telegram file_id
@@ -276,17 +277,16 @@ Table: file_processing_staging
 - restaurant_id: UUID (foreign key -> restaurants.id, on delete: CASCADE, not null)
 - user_id: UUID (foreign key -> users.id, on delete: CASCADE, not null)
 - document_id: UUID (foreign key -> documents.id, on delete: SET NULL, nullable)
-- processing_type: ENUM('invoice', 'price_list', 'inventory') (not null)
+- processing_type: ENUM('invoice', 'price_list', 'inventory') (not null) [enum name: processing_type]
 - extracted_data_json: JSON/JSONB (not null)
 - product_alias_matches_json: JSON/JSONB (not null, default: {})
-- status: ENUM('pending_review', 'confirmed', 'cancelled', 'awaiting_supplier', 'awaiting_currency') (not null, default: 'pending_review')
+- status: ENUM('pending_review', 'confirmed', 'cancelled', 'awaiting_supplier', 'awaiting_currency') (not null, default: 'pending_review') [enum name: staging_status]
 - authorized_by_user_id: UUID (foreign key -> users.id, on delete: SET NULL, nullable)
 - confirmed_at: TIMESTAMP WITH TIME ZONE (nullable)
 - cancelled_at: TIMESTAMP WITH TIME ZONE (nullable)
 - expires_at: TIMESTAMP WITH TIME ZONE (not null, default: now() + 7 days)
 - created_at: TIMESTAMP WITH TIME ZONE (not null, default: now())
 - updated_at: TIMESTAMP WITH TIME ZONE (not null, default: now(), auto-update)
-
 
 ================================
 TELEGRAM & MESSAGING
@@ -299,7 +299,7 @@ Table: telegram_sessions
 - started_at: TIMESTAMP WITH TIME ZONE (not null)
 - last_activity_at: TIMESTAMP WITH TIME ZONE (not null)
 - flush_at: TIMESTAMP WITH TIME ZONE (not null)
-- status: ENUM('open', 'processing', 'closed') (not null)
+- status: ENUM('open', 'processing', 'closed') (not null) [enum name: telegram_session_status]
 - hint_command: STRING (nullable)
 - closed_at: TIMESTAMP WITH TIME ZONE (nullable)
 - ack_sent_at: TIMESTAMP WITH TIME ZONE (nullable)
@@ -347,7 +347,6 @@ Table: telegram_outgoing_messages
   - ix_telegram_outgoing_messages_chat_id_sent_at (chat_id, sent_at)
   - ix_telegram_outgoing_messages_kind_sent_at (kind, sent_at)
 
-
 ================================
 LLM & PROCESSING
 ================================
@@ -387,59 +386,5 @@ Table: processing_events
 - event: STRING (nullable)
 - payload_json: STRING (nullable)
 - error: STRING (nullable)
-- Index:
+- Indexes:
   - ix_processing_events_session_id_at (session_id, at)
-
-
-================================
-RELATIONSHIPS SUMMARY
-================================
-
-Core Relationships:
-- users -> restaurants (owner_user_id)
-- restaurants -> restaurant_users (many-to-many via junction table)
-- restaurants -> suppliers (one-to-many)
-- restaurants -> products (one-to-many)
-- restaurants -> invoices (one-to-many)
-- restaurants -> inventory_locations (one-to-many)
-- restaurants -> inventory_batches (one-to-many)
-- restaurants -> inventory_movements (one-to-many)
-- restaurants -> supplier_disputes (one-to-many)
-- restaurants -> documents (one-to-many)
-- restaurants -> file_processing_staging (one-to-many)
-
-Supplier Relationships:
-- suppliers -> supplier_items (one-to-many)
-- suppliers -> supplier_prices (via supplier_items)
-- suppliers -> invoices (one-to-many)
-- suppliers -> documents (one-to-many)
-
-Product Relationships:
-- products -> product_aliases (one-to-many)
-- products -> supplier_items (one-to-many)
-- products -> invoice_line_items (one-to-many)
-- products -> inventory_batches (one-to-many)
-
-Invoice Relationships:
-- invoices -> invoice_line_items (one-to-many)
-- invoices -> supplier_disputes (one-to-many)
-- invoice_line_items -> inventory_batches (one-to-many)
-- invoice_line_items -> price_comparisons (one-to-many)
-
-Inventory Relationships:
-- inventory_batches -> inventory_movements (one-to-many)
-- inventory_locations -> inventory_batches (one-to-many)
-
-Document Relationships:
-- documents -> supplier_items (source_document_id)
-- documents -> supplier_prices (source_document_id)
-- documents -> invoices (document_id)
-- documents -> file_processing_staging (document_id)
-
-Telegram Relationships:
-- telegram_sessions -> telegram_messages (one-to-many)
-- telegram_sessions -> telegram_outgoing_messages (one-to-many)
-- telegram_sessions -> llm_calls (one-to-many)
-- telegram_sessions -> processing_events (one-to-many)
-- users -> telegram_messages (one-to-many)
-- llm_calls -> telegram_outgoing_messages (one-to-many)

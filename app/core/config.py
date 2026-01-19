@@ -59,6 +59,7 @@ class Settings(BaseSettings):
     vision_model: str = ""  # Model name, e.g., "gpt-4-vision-preview"
     vision_api_key: str = ""  # Optional, defaults to openai_api_key if empty
     vision_base_url: str = ""  # Optional, defaults to openai_base_url if empty
+    vision_pdf_chunk_size: int = 3
 
     model_config = SettingsConfigDict(
         env_file=".env", env_prefix="APP_", extra="ignore"

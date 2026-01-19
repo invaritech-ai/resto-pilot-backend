@@ -80,6 +80,108 @@ def _log_structured_text(text: str, max_chars: int = 20000) -> None:
     )
 
 
+def _clean_structured_text(text: str) -> str:
+    cleaned = text.strip()
+    if cleaned.startswith("```json"):
+        lines = cleaned.split("\n")
+        cleaned = "\n".join(lines[1:-1]) if len(lines) > 2 else cleaned
+    elif cleaned.startswith("```"):
+        lines = cleaned.split("\n")
+        cleaned = "\n".join(lines[1:-1]) if len(lines) > 2 else cleaned
+    return cleaned
+
+
+def _parse_structured_json(text: str) -> dict[str, Any]:
+    cleaned = _clean_structured_text(text)
+    try:
+        data = json.loads(cleaned)
+    except json.JSONDecodeError as exc:
+        logger.exception(
+            "vision_structured_json_parse_failed",
+            extra={"error": str(exc)},
+        )
+        raise OpenAIError(f"Failed to parse structured JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise OpenAIError("Structured JSON must be an object")
+    return data
+
+
+def _merge_non_null_fields(target: dict[str, Any], source: dict[str, Any]) -> None:
+    for key, value in source.items():
+        if value is None:
+            continue
+        if key not in target or target[key] in ("", None, []):
+            target[key] = value
+
+
+def _merge_structured_results(results: list[dict[str, Any]]) -> dict[str, Any]:
+    if not results:
+        raise OpenAIError("No structured results to merge")
+
+    merged: dict[str, Any] = {}
+    for result in results:
+        if not merged:
+            merged = result.copy()
+            continue
+
+        if isinstance(result.get("supplier"), dict):
+            supplier = merged.get("supplier")
+            if not isinstance(supplier, dict):
+                supplier = {}
+            _merge_non_null_fields(supplier, result.get("supplier", {}))
+            merged["supplier"] = supplier
+
+        for key, value in result.items():
+            if key in ("supplier", "line_items", "items", "product_info"):
+                continue
+            if key not in merged or merged[key] in ("", None, []):
+                merged[key] = value
+
+        for key in ("line_items", "items", "product_info"):
+            if key in result:
+                existing = merged.get(key)
+                if not isinstance(existing, list):
+                    existing = []
+                incoming = result.get(key)
+                if isinstance(incoming, list):
+                    existing.extend(incoming)
+                merged[key] = existing
+
+    if isinstance(merged.get("line_items"), list):
+        deduplicated = []
+        seen = set()
+        for item in merged["line_items"]:
+            if not isinstance(item, dict):
+                continue
+            desc = item.get("description_raw", item.get("description", ""))
+            qty = item.get("quantity")
+            unit = item.get("unit", "")
+            price = item.get("unit_price")
+            dedup_key = (desc, qty, unit, price)
+            if dedup_key not in seen:
+                seen.add(dedup_key)
+                deduplicated.append(item)
+        merged["line_items"] = deduplicated
+
+    if isinstance(merged.get("items"), list):
+        deduplicated = []
+        seen = set()
+        for item in merged["items"]:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("supplier_name_raw", item.get("name", ""))
+            pack_size = item.get("pack_size_text", "")
+            unit_basis = item.get("unit_basis", "")
+            min_order_qty = item.get("min_order_qty")
+            dedup_key = (name, pack_size, unit_basis, min_order_qty)
+            if dedup_key not in seen:
+                seen.add(dedup_key)
+                deduplicated.append(item)
+        merged["items"] = deduplicated
+
+    return merged
+
+
 def _log_page_text(
     page_num: int,
     text_layer: str,
@@ -525,15 +627,35 @@ def process_pdf_with_vision(
 
     combined_text = "\n\n".join(page_text_blocks)
     _log_combined_text(combined_text)
-    structured_result = _extract_structured_from_text(prompt, combined_text, settings)
-    _log_structured_text(structured_result.content)
-    telemetry_results.append(structured_result)
+
+    chunk_size = max(1, int(getattr(settings, "vision_pdf_chunk_size", 3) or 1))
+    chunk_results: list[dict[str, Any]] = []
+    total_chunks = (len(page_text_blocks) + chunk_size - 1) // chunk_size
+
+    for start in range(0, len(page_text_blocks), chunk_size):
+        end = min(start + chunk_size, len(page_text_blocks))
+        chunk_index = (start // chunk_size) + 1
+        chunk_text = "\n\n".join(page_text_blocks[start:end])
+        print(
+            f"[VISION] process_pdf_with_vision: chunk {chunk_index}/{total_chunks} - structured extraction..."
+        )
+        structured_result = _extract_structured_from_text(
+            prompt, chunk_text, settings
+        )
+        telemetry_results.append(structured_result)
+        _log_structured_text(structured_result.content)
+        if structured_result.error:
+            raise OpenAIError(structured_result.error)
+        chunk_results.append(_parse_structured_json(structured_result.content))
+
+    merged = _merge_structured_results(chunk_results)
+    merged_content = json.dumps(merged, ensure_ascii=False)
 
     print(
-        f"[VISION] process_pdf_with_vision: ✓ aggregation complete, {len(structured_result.content)} chars"
+        f"[VISION] process_pdf_with_vision: ✓ aggregation complete, {len(merged_content)} chars"
     )
     return VisionDocumentResult(
-        content=structured_result.content,
+        content=merged_content,
         telemetry_results=telemetry_results,
     )
 
