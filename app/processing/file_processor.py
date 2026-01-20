@@ -319,11 +319,21 @@ Rules:
 4. price must be numeric only (no currency symbols).
 5. If item currency is missing, use supplier.currency.
 6. source_page and row_index must be set for each product_info item.
-7. raw_row should be the original line text if available."""
+7. raw_row should be the original line text if available.
+8. The input may include "## Page N" headers. Extract only items from the provided text and set source_page to that page number.
+9. Output must include ONLY the top-level keys "supplier" and "product_info".
+10. If Unit Wt contains “up” (e.g., “4 kg up”), set min_qty to the numeric value and keep pack_size_text as raw text.
+11. If Unit Wt is a range (e.g., “350–500gm”), set min_qty to the lower bound and keep pack_size_text as raw text.
+12. If Unit Wt is a pack (e.g., “2 kg/pack”, “5 lb/pack”), set unit_basis to “pack” and set min_qty to the numeric value; keep pack_size_text as raw text."""
 
     try:
         result = process_document_with_vision(
-            file_bytes, mime_type, prompt, settings, filename
+            file_bytes,
+            mime_type,
+            prompt,
+            settings,
+            filename,
+            structured_chunk_size=1,
         )
         # Parse JSON from response
         extracted_text = result.content.strip()
@@ -340,6 +350,81 @@ Rules:
 
         data = json.loads(extracted_text)
 
+        supplier_keys = (
+            "name",
+            "contact_name",
+            "contact_email",
+            "contact_phone",
+            "language",
+            "currency",
+            "lead_time_days",
+        )
+        product_keys = (
+            "name_en",
+            "name_local",
+            "category",
+            "sub_category",
+            "storage_type",
+            "default_unit",
+            "default_unit_size",
+            "supplier_name_raw",
+            "supplier_sku",
+            "pack_size_text",
+            "unit_basis",
+            "min_order_qty",
+            "price",
+            "currency",
+            "price_type",
+            "valid_from",
+            "valid_to",
+            "min_qty",
+            "source_page",
+            "row_index",
+            "raw_row",
+        )
+        allowed_storage = {"frozen", "chilled", "dry"}
+        allowed_units = {"kg", "pack", "piece"}
+        allowed_price_types = {"standard", "promo", "special"}
+
+        def _normalize_supplier(raw_supplier: Any) -> dict[str, Any]:
+            normalized = {key: None for key in supplier_keys}
+            if isinstance(raw_supplier, dict):
+                for key in supplier_keys:
+                    if key in raw_supplier:
+                        normalized[key] = raw_supplier.get(key)
+            return normalized
+
+        def _normalize_product(entry: Any) -> dict[str, Any] | None:
+            if not isinstance(entry, dict):
+                return None
+            normalized = {key: None for key in product_keys}
+            for key in product_keys:
+                if key in entry:
+                    normalized[key] = entry.get(key)
+            if normalized["storage_type"] not in allowed_storage:
+                normalized["storage_type"] = None
+            if normalized["default_unit"] not in allowed_units:
+                normalized["default_unit"] = None
+            if normalized["unit_basis"] not in allowed_units:
+                normalized["unit_basis"] = None
+            if normalized["price_type"] not in allowed_price_types:
+                normalized["price_type"] = None
+            return normalized
+
+        normalized_supplier = _normalize_supplier(data.get("supplier"))
+        normalized_products: list[dict[str, Any]] = []
+        raw_products = data.get("product_info")
+        if isinstance(raw_products, list):
+            for entry in raw_products:
+                normalized = _normalize_product(entry)
+                if normalized is not None:
+                    normalized_products.append(normalized)
+
+        data = {
+            "supplier": normalized_supplier,
+            "product_info": normalized_products,
+        }
+
         supplier = data.get("supplier")
         if isinstance(supplier, dict):
             if supplier.get("name") and not data.get("supplier_name"):
@@ -355,11 +440,9 @@ Rules:
             if supplier.get("lead_time_days") is not None:
                 data["lead_time_days"] = supplier.get("lead_time_days")
 
-        if "product_info" in data and "items" not in data:
+        if "product_info" in data:
             items = []
             for idx, entry in enumerate(data["product_info"] or []):
-                if not isinstance(entry, dict):
-                    continue
                 supplier_name_raw = entry.get("supplier_name_raw") or entry.get(
                     "name_en"
                 )

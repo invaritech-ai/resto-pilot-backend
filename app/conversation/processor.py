@@ -414,6 +414,26 @@ def process_message_instant(
                 db.commit()
             return ProcessResult(response_text=response_text)
 
+        pending_result = _handle_pending_file_processing_confirm(
+            db=db,
+            user=user,
+            context=context,
+            message_text=message_text,
+            chat_id=chat_id,
+            session_id=session_id,
+        )
+        if pending_result is not None:
+            response_text, context_update = pending_result
+            if context_update:
+                context = update_context_from_result(
+                    db=db,
+                    user=user,
+                    context=context,
+                    context_update=context_update,
+                )
+                db.commit()
+            return ProcessResult(response_text=response_text)
+
         pending_result = _handle_pending_file_upload(
             db=db,
             user=user,
@@ -568,7 +588,7 @@ def _handle_pending_file_upload(
         if not file_type:
             return responses.FILE_DETECTION_UNSURE, {"pending_action": pending_action}
 
-    restaurant_id = pending_action.get("restaurant_id") or context.active_restaurant_id
+    restaurant_id = pending_action.get("restaurant_id")
     if not restaurant_id:
         restaurants = _get_user_restaurants(db, user.id)
         if not restaurants:
@@ -685,6 +705,69 @@ def _handle_pending_file_processing_missing_field(
     return result, context_update
 
 
+def _handle_pending_file_processing_confirm(
+    *,
+    db: Session,
+    user: User,
+    context: UserContext,
+    message_text: str,
+    chat_id: int,
+    session_id: uuid.UUID,
+) -> tuple[str, dict[str, Any]] | None:
+    pending_action = context.pending_action
+    if not pending_action or pending_action.get("type") != "file_processing_confirm":
+        return None
+
+    staging_id = pending_action.get("staging_id")
+    if not isinstance(staging_id, str) or not staging_id:
+        return None
+
+    text_lower = message_text.strip().lower().rstrip("!?.,")
+    if text_lower not in (
+        "/confirm",
+        "confirm",
+        "yes",
+        "looks good",
+        "save",
+        "ok",
+    ):
+        return (
+            "Say /confirm to save this file.",
+            {"pending_action": pending_action},
+        )
+
+    from app.ai.db_tools import file_processing as file_processing_tools
+    from app.db.models.file_processing_staging import FileProcessingStaging
+
+    tools = file_processing_tools.create_file_processing_tools(
+        db=db,
+        user_id=user.id,
+        actor_role="staff",
+        restaurant_roles={},
+        chat_id=chat_id,
+        session_id=session_id,
+    )
+    tool = tools.get("confirm_file_processing")
+    if not tool:
+        return responses.CANT_HELP, {"pending_action": pending_action}
+
+    result = tool.handler({"staging_id": staging_id})
+    if isinstance(result, str) and result.startswith("Error:"):
+        return result, {"pending_action": pending_action}
+
+    try:
+        staging_uuid = uuid.UUID(staging_id)
+    except ValueError:
+        return result, {"clear_pending_action": True}
+
+    staging = db.get(FileProcessingStaging, staging_uuid)
+    context_update = {"clear_pending_action": True}
+    if staging:
+        context_update["active_restaurant_id"] = str(staging.restaurant_id)
+
+    return result, context_update
+
+
 def _handle_file_upload(
     *,
     db: Session,
@@ -716,10 +799,11 @@ def _handle_file_upload(
     if not restaurants:
         return responses.ERROR_NO_OUTLETS, intent_guess
 
-    # Auto-select if only one, otherwise use from context
-    restaurant_id = context.active_restaurant_id
-    if not restaurant_id and len(restaurants) == 1:
+    restaurant_id = None
+    if len(restaurants) == 1:
         restaurant_id = restaurants[0]["id"]
+    else:
+        restaurant_id = _match_restaurant_from_message(message_text, restaurants)
 
     # Get supplier_id from context if available
     supplier_id = context.active_supplier_id

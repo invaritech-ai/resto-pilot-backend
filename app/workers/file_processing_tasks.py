@@ -26,7 +26,11 @@ from app.processing.file_processor import (
 from app.telegram.bot_api import get_file_bytes, send_message
 from app.workers.celery_app import celery_app
 from app.workers.db import worker_db_session
-from app.workers.telemetry import record_llm_call, schedule_openrouter_cost_backfill
+from app.workers.telemetry import (
+    record_llm_call,
+    record_outgoing_message,
+    schedule_openrouter_cost_backfill,
+)
 from app.workers.utils import _get_task_id, _parse_uuid
 
 logger = logging.getLogger(__name__)
@@ -170,6 +174,64 @@ def _clear_pending_file_processing_action(
     save_context(db, user, context)
 
 
+def _send_message_with_telemetry(
+    *,
+    db: Session | None,
+    chat_id: int,
+    text: str,
+    settings: Settings,
+    session_uuid: uuid.UUID | None,
+    kind: str = "reply",
+) -> None:
+    telegram_message_id = send_message(chat_id=chat_id, text=text, settings=settings)
+    if not session_uuid or db is None:
+        return
+    try:
+        record_outgoing_message(
+            db=db,
+            session_id=session_uuid,
+            chat_id=chat_id,
+            kind=kind,
+            text=text,
+            telegram_message_id=telegram_message_id,
+            llm_call_id=None,
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception(
+            "outgoing_message_record_failed",
+            extra={
+                "chat_id": chat_id,
+                "session_id": str(session_uuid),
+                "kind": kind,
+            },
+        )
+
+
+def _set_pending_file_processing_confirm_action(
+    *,
+    db: Session,
+    user_id: uuid.UUID,
+    restaurant_id: uuid.UUID,
+    staging_id: uuid.UUID,
+    supplier_id: uuid.UUID | None = None,
+) -> None:
+    user = db.get(User, user_id)
+    if not user:
+        return
+
+    context = load_context(db, user)
+    context.pending_action = {
+        "type": "file_processing_confirm",
+        "staging_id": str(staging_id),
+    }
+    context.active_restaurant_id = str(restaurant_id)
+    if supplier_id:
+        context.active_supplier_id = str(supplier_id)
+    save_context(db, user, context)
+
+
 @celery_app.task(name="process_invoice_file_task")
 def process_invoice_file_task(
     *,
@@ -193,9 +255,11 @@ def process_invoice_file_task(
     restaurant_uuid = _parse_uuid(restaurant_id)
     user_uuid = _parse_uuid(user_id)
     session_uuid = _parse_uuid(session_id) if session_id else None
+    db_session: Session | None = None
 
     try:
         with worker_db_session() as db:
+            db_session = db
             # Download file
             file_bytes = get_file_bytes(file_id=file_id, settings=settings)
             
@@ -315,10 +379,12 @@ def process_invoice_file_task(
                     supplier_id=supplier_uuid,
                 )
                 db.commit()
-                send_message(
+                _send_message_with_telemetry(
+                    db=db,
                     chat_id=chat_id,
                     text="I couldn't find the supplier in this invoice. What supplier is it from?",
                     settings=settings,
+                    session_uuid=session_uuid,
                 )
             elif status == "awaiting_currency":
                 _set_pending_file_processing_action(
@@ -330,16 +396,26 @@ def process_invoice_file_task(
                     supplier_id=supplier_uuid,
                 )
                 db.commit()
-                send_message(
+                _send_message_with_telemetry(
+                    db=db,
                     chat_id=chat_id,
                     text="What currency is this invoice in? (e.g., USD, EUR)",
                     settings=settings,
+                    session_uuid=session_uuid,
                 )
             else:
                 _clear_pending_file_processing_action(
                     db=db,
                     user_id=user_uuid,
                     restaurant_id=restaurant_uuid,
+                    supplier_id=supplier_uuid,
+                )
+                db.commit()
+                _set_pending_file_processing_confirm_action(
+                    db=db,
+                    user_id=user_uuid,
+                    restaurant_id=restaurant_uuid,
+                    staging_id=staging.id,
                     supplier_id=supplier_uuid,
                 )
                 db.commit()
@@ -390,7 +466,13 @@ def process_invoice_file_task(
                 lines.append("✏️ Tell me if anything needs correcting")
                 
                 preview_text = "\n".join(lines)
-                send_message(chat_id=chat_id, text=preview_text, settings=settings)
+                _send_message_with_telemetry(
+                    db=db,
+                    chat_id=chat_id,
+                    text=preview_text,
+                    settings=settings,
+                    session_uuid=session_uuid,
+                )
 
             # Record processing event
             db.add(
@@ -418,10 +500,12 @@ def process_invoice_file_task(
         )
         # Send error message to user
         try:
-            send_message(
+            _send_message_with_telemetry(
+                db=db_session,
                 chat_id=chat_id,
                 text=f"Sorry, I couldn't process your invoice file. Error: {str(exc)}",
                 settings=settings,
+                session_uuid=session_uuid,
             )
         except Exception:
             pass
@@ -451,9 +535,11 @@ def process_price_list_file_task(
     restaurant_uuid = _parse_uuid(restaurant_id)
     user_uuid = _parse_uuid(user_id)
     session_uuid = _parse_uuid(session_id) if session_id else None
+    db_session: Session | None = None
 
     try:
         with worker_db_session() as db:
+            db_session = db
             # Download file
             file_bytes = get_file_bytes(file_id=file_id, settings=settings)
             
@@ -573,10 +659,12 @@ def process_price_list_file_task(
                     supplier_id=supplier_uuid,
                 )
                 db.commit()
-                send_message(
+                _send_message_with_telemetry(
+                    db=db,
                     chat_id=chat_id,
                     text="I couldn't find the supplier in this price list. Which supplier is it from?",
                     settings=settings,
+                    session_uuid=session_uuid,
                 )
             elif status == "awaiting_currency":
                 _set_pending_file_processing_action(
@@ -588,16 +676,26 @@ def process_price_list_file_task(
                     supplier_id=supplier_uuid,
                 )
                 db.commit()
-                send_message(
+                _send_message_with_telemetry(
+                    db=db,
                     chat_id=chat_id,
                     text="What currency is this price list in? (e.g., USD, EUR)",
                     settings=settings,
+                    session_uuid=session_uuid,
                 )
             else:
                 _clear_pending_file_processing_action(
                     db=db,
                     user_id=user_uuid,
                     restaurant_id=restaurant_uuid,
+                    supplier_id=supplier_uuid,
+                )
+                db.commit()
+                _set_pending_file_processing_confirm_action(
+                    db=db,
+                    user_id=user_uuid,
+                    restaurant_id=restaurant_uuid,
+                    staging_id=staging.id,
                     supplier_id=supplier_uuid,
                 )
                 db.commit()
@@ -651,7 +749,13 @@ def process_price_list_file_task(
                 lines.append("✏️ Tell me if anything needs correcting")
                 
                 preview_text = "\n".join(lines)
-                send_message(chat_id=chat_id, text=preview_text, settings=settings)
+                _send_message_with_telemetry(
+                    db=db,
+                    chat_id=chat_id,
+                    text=preview_text,
+                    settings=settings,
+                    session_uuid=session_uuid,
+                )
 
             # Record processing event
             db.add(
@@ -679,10 +783,12 @@ def process_price_list_file_task(
         )
         # Send error message to user
         try:
-            send_message(
+            _send_message_with_telemetry(
+                db=db_session,
                 chat_id=chat_id,
                 text=f"Sorry, I couldn't process your price list file. Error: {str(exc)}",
                 settings=settings,
+                session_uuid=session_uuid,
             )
         except Exception:
             pass
@@ -711,9 +817,11 @@ def process_inventory_photo_task(
     restaurant_uuid = _parse_uuid(restaurant_id)
     user_uuid = _parse_uuid(user_id)
     session_uuid = _parse_uuid(session_id) if session_id else None
+    db_session: Session | None = None
 
     try:
         with worker_db_session() as db:
+            db_session = db
             # Download file
             file_bytes = get_file_bytes(file_id=file_id, settings=settings)
             
@@ -784,6 +892,13 @@ def process_inventory_photo_task(
             )
             db.add(staging)
             db.commit()
+            _set_pending_file_processing_confirm_action(
+                db=db,
+                user_id=user_uuid,
+                restaurant_id=restaurant_uuid,
+                staging_id=staging.id,
+            )
+            db.commit()
 
             # Format and send preview message with summary
             items = extracted_data.get("items", [])
@@ -811,7 +926,13 @@ def process_inventory_photo_task(
             lines.append("✏️ Tell me if anything needs correcting")
             
             preview_text = "\n".join(lines)
-            send_message(chat_id=chat_id, text=preview_text, settings=settings)
+            _send_message_with_telemetry(
+                db=db,
+                chat_id=chat_id,
+                text=preview_text,
+                settings=settings,
+                session_uuid=session_uuid,
+            )
 
             # Record processing event
             db.add(
@@ -839,10 +960,12 @@ def process_inventory_photo_task(
         )
         # Send error message to user
         try:
-            send_message(
+            _send_message_with_telemetry(
+                db=db_session,
                 chat_id=chat_id,
                 text=f"Sorry, I couldn't process your inventory photo. Error: {str(exc)}",
                 settings=settings,
+                session_uuid=session_uuid,
             )
         except Exception:
             pass

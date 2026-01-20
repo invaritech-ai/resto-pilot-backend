@@ -527,6 +527,7 @@ def process_pdf_with_vision(
     prompt: str,
     settings: Settings,
     page_by_page: bool = True,
+    structured_chunk_size: int | None = None,
 ) -> VisionDocumentResult:
     """
     Process a PDF file with a vision model, optionally page-by-page.
@@ -537,6 +538,7 @@ def process_pdf_with_vision(
         prompt: Prompt describing what to extract from the PDF
         settings: Application settings
         page_by_page: If True, process each page separately and consolidate
+        structured_chunk_size: Optional override for how many pages per extraction chunk
 
     Returns:
         VisionDocumentResult with consolidated content and telemetry for all pages
@@ -628,7 +630,10 @@ def process_pdf_with_vision(
     combined_text = "\n\n".join(page_text_blocks)
     _log_combined_text(combined_text)
 
-    chunk_size = max(1, int(getattr(settings, "vision_pdf_chunk_size", 3) or 1))
+    if structured_chunk_size is not None:
+        chunk_size = max(1, int(structured_chunk_size))
+    else:
+        chunk_size = max(1, int(getattr(settings, "vision_pdf_chunk_size", 3) or 1))
     chunk_results: list[dict[str, Any]] = []
     total_chunks = (len(page_text_blocks) + chunk_size - 1) // chunk_size
 
@@ -1126,6 +1131,7 @@ def process_document_with_vision(
     prompt: str,
     settings: Settings,
     filename: str | None = None,
+    structured_chunk_size: int | None = None,
 ) -> VisionDocumentResult:
     """
     Process a document (PDF, image, text file, etc.) appropriately.
@@ -1136,6 +1142,7 @@ def process_document_with_vision(
         prompt: Prompt describing what to extract from the document
         settings: Application settings
         filename: Optional filename (used for PDFs and to determine file type)
+        structured_chunk_size: Optional override for how many pages per extraction chunk
 
     Returns:
         VisionDocumentResult with extracted content and telemetry data
@@ -1158,7 +1165,12 @@ def process_document_with_vision(
     if mime_type == "application/pdf":
         print(f"[VISION] -> Processing as PDF (page-by-page)")
         return process_pdf_with_vision(
-            file_bytes, filename, prompt, settings, page_by_page=True
+            file_bytes,
+            filename,
+            prompt,
+            settings,
+            page_by_page=True,
+            structured_chunk_size=structured_chunk_size,
         )
 
     # For text files, extract text directly and send to LLM for processing
