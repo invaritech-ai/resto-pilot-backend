@@ -26,6 +26,8 @@ from app.db.models.price_comparisons import PriceComparisons
 from app.db.models.inventory_movements import InventoryMovements
 from app.db.models.supplier_disputes import SupplierDisputes
 from app.db.models.file_processing_staging import FileProcessingStaging
+from app.db.models.file_processing_runs import FileProcessingRuns
+from app.db.models.file_processing_steps import FileProcessingSteps
 
 
 # Map table names to their SQLAlchemy models
@@ -48,6 +50,8 @@ _TABLE_MODELS = {
     "inventory_movements": InventoryMovements,
     "supplier_disputes": SupplierDisputes,
     "file_processing_staging": FileProcessingStaging,
+    "file_processing_runs": FileProcessingRuns,
+    "file_processing_steps": FileProcessingSteps,
 }
 
 

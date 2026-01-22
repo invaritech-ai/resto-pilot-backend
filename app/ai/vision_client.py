@@ -34,6 +34,9 @@ class VisionCallResult:
     response_headers: dict[str, str]
     response_data: dict[str, Any]
     error: str | None = None
+    prompt_text: str | None = None
+    input_text: str | None = None
+    request_payload: dict[str, Any] | None = None
 
 
 @dataclass
@@ -353,6 +356,8 @@ def process_image_with_vision(
                 response_headers=dict(resp.headers),
                 response_data=data,
                 error=None,
+                prompt_text=prompt,
+                request_payload=payload,
             )
         except httpx.HTTPError as exc:
             last_exc = exc
@@ -1057,6 +1062,7 @@ def _extract_structured_from_text(
 
     model, api_key, base_url = _get_vision_settings(settings)
     start_time = time.time()
+    payload: dict[str, Any] | None = None
     try:
         url = f"{base_url.rstrip('/')}/chat/completions"
         headers = {
@@ -1108,6 +1114,9 @@ def _extract_structured_from_text(
             response_headers=dict(resp.headers),
             response_data=response,
             error=None,
+            prompt_text=prompt,
+            input_text=extracted_text,
+            request_payload=payload,
         )
     except Exception as exc:
         end_time = time.time()
@@ -1122,6 +1131,9 @@ def _extract_structured_from_text(
             response_headers={},
             response_data={},
             error=f"Text extraction failed: {exc}",
+            prompt_text=prompt,
+            input_text=extracted_text,
+            request_payload=payload,
         )
 
 

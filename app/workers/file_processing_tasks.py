@@ -11,6 +11,8 @@ from sqlalchemy.orm import Session
 from app.core.config import get_settings
 from app.db.models.documents import Documents
 from app.db.models.file_processing_staging import FileProcessingStaging
+from app.db.models.file_processing_runs import FileProcessingRuns
+from app.db.models.file_processing_steps import FileProcessingSteps
 from app.db.models.processing_events import ProcessingEvents
 from app.db.models.suppliers import Suppliers
 from app.db.models.telegram_messages import TelegramMessages
@@ -124,6 +126,36 @@ def _record_vision_telemetry(
                         "error": result.error,
                     },
                 )
+
+
+def _record_file_processing_steps(
+    run_id: uuid.UUID,
+    telemetry_results: list[VisionCallResult],
+    stage: str,
+) -> None:
+    """Persist file processing step inputs/outputs using a fresh session."""
+    if not telemetry_results:
+        return
+
+    with worker_db_session() as db:
+        for idx, result in enumerate(telemetry_results, start=1):
+            step = FileProcessingSteps(
+                run_id=run_id,
+                stage=stage,
+                status="failed" if result.error else "completed",
+                step_index=idx,
+                input_text=result.input_text,
+                prompt_text=result.prompt_text,
+                output_text=result.content or None,
+                request_json=result.request_payload,
+                response_json=result.response_data or None,
+                usage_json=result.usage,
+                model=result.model,
+                latency_ms=result.latency_ms,
+                error_message=result.error,
+            )
+            db.add(step)
+        db.commit()
 
 
 def _set_pending_file_processing_action(
@@ -260,9 +292,8 @@ def process_invoice_file_task(
     try:
         with worker_db_session() as db:
             db_session = db
-            # Download file
-            file_bytes = get_file_bytes(file_id=file_id, settings=settings)
-            
+            now = dt.datetime.now(dt.UTC)
+
             # Get actual mime type and filename from Telegram message
             telegram_msg = db.scalar(
                 select(TelegramMessages)
@@ -270,10 +301,49 @@ def process_invoice_file_task(
                 .order_by(TelegramMessages.received_at.desc())
                 .limit(1)
             )
-            mime_type = telegram_msg.mime if telegram_msg and telegram_msg.mime else "image/jpeg"
+            mime_type = (
+                telegram_msg.mime if telegram_msg and telegram_msg.mime else "image/jpeg"
+            )
             if not mime_type:
                 mime_type = "image/jpeg"  # Fallback
             filename = telegram_msg.filename if telegram_msg else None
+
+            run = FileProcessingRuns(
+                restaurant_id=restaurant_uuid,
+                user_id=user_uuid,
+                document_id=None,
+                file_id=file_id,
+                filename=filename,
+                mime_type=mime_type,
+                processing_type="invoice",
+                status="processing",
+                pages_total=None,
+                pages_processed=0,
+                current_stage="processing",
+                error_message=None,
+                started_at=now,
+            )
+            db.add(run)
+            db.flush()
+
+            staging = FileProcessingStaging(
+                restaurant_id=restaurant_uuid,
+                user_id=user_uuid,
+                run_id=run.id,
+                document_id=None,
+                processing_type="invoice",
+                extracted_data_json={},
+                product_alias_matches_json={},
+                status="processing",
+                pages_total=None,
+                pages_processed=0,
+                started_at=now,
+            )
+            db.add(staging)
+            db.commit()
+
+            # Download file
+            file_bytes = get_file_bytes(file_id=file_id, settings=settings)
 
             # Extract invoice data (with DB-aware extraction)
             try:
@@ -289,7 +359,21 @@ def process_invoice_file_task(
                         purpose_base="vision_invoice",
                         processing_type="invoice",
                     )
+                    _record_file_processing_steps(
+                        run_id=run.id,
+                        telemetry_results=telemetry_results,
+                        stage="vision_invoice",
+                    )
             except Exception as exc:
+                failed_at = dt.datetime.now(dt.UTC)
+                run.status = "failed"
+                run.current_stage = "failed"
+                run.error_message = str(exc)
+                run.finished_at = failed_at
+                staging.status = "failed"
+                staging.error_message = str(exc)
+                staging.finished_at = failed_at
+                db.commit()
                 # Record error telemetry if possible (uses fresh session internally)
                 if session_uuid:
                     try:
@@ -310,6 +394,11 @@ def process_invoice_file_task(
                             telemetry_results=[error_result],
                             purpose_base="vision_invoice",
                             processing_type="invoice",
+                        )
+                        _record_file_processing_steps(
+                            run_id=run.id,
+                            telemetry_results=[error_result],
+                            stage="vision_invoice_error",
                         )
                     except Exception:
                         logger.exception("failed_to_record_error_telemetry")
@@ -355,17 +444,31 @@ def process_invoice_file_task(
             elif not currency:
                 status = "awaiting_currency"
 
-            # Create staging record
-            staging = FileProcessingStaging(
-                restaurant_id=restaurant_uuid,
-                user_id=user_uuid,
-                document_id=document.id,
-                processing_type="invoice",
-                extracted_data_json=extracted_data,
-                product_alias_matches_json=alias_matches,
-                status=status,
-            )
-            db.add(staging)
+            line_items = extracted_data.get("line_items", [])
+            page_numbers = {
+                item.get("source_page")
+                for item in line_items
+                if isinstance(item.get("source_page"), int)
+            }
+            pages_processed = len(page_numbers)
+            pages_total = max(page_numbers) if page_numbers else None
+            finished_at = dt.datetime.now(dt.UTC)
+
+            run.document_id = document.id
+            run.status = "completed"
+            run.current_stage = status
+            run.pages_total = pages_total
+            run.pages_processed = pages_processed
+            run.finished_at = finished_at
+
+            staging.document_id = document.id
+            staging.extracted_data_json = extracted_data
+            staging.product_alias_matches_json = alias_matches
+            staging.status = status
+            staging.pages_total = pages_total
+            staging.pages_processed = pages_processed
+            staging.finished_at = finished_at
+            staging.error_message = None
             db.commit()
 
             # Send message based on status
@@ -540,9 +643,8 @@ def process_price_list_file_task(
     try:
         with worker_db_session() as db:
             db_session = db
-            # Download file
-            file_bytes = get_file_bytes(file_id=file_id, settings=settings)
-            
+            now = dt.datetime.now(dt.UTC)
+
             # Get actual mime type and filename from Telegram message
             telegram_msg = db.scalar(
                 select(TelegramMessages)
@@ -550,10 +652,49 @@ def process_price_list_file_task(
                 .order_by(TelegramMessages.received_at.desc())
                 .limit(1)
             )
-            mime_type = telegram_msg.mime if telegram_msg and telegram_msg.mime else "image/jpeg"
+            mime_type = (
+                telegram_msg.mime if telegram_msg and telegram_msg.mime else "image/jpeg"
+            )
             if not mime_type:
                 mime_type = "image/jpeg"  # Fallback
             filename = telegram_msg.filename if telegram_msg else None
+
+            run = FileProcessingRuns(
+                restaurant_id=restaurant_uuid,
+                user_id=user_uuid,
+                document_id=None,
+                file_id=file_id,
+                filename=filename,
+                mime_type=mime_type,
+                processing_type="price_list",
+                status="processing",
+                pages_total=None,
+                pages_processed=0,
+                current_stage="processing",
+                error_message=None,
+                started_at=now,
+            )
+            db.add(run)
+            db.flush()
+
+            staging = FileProcessingStaging(
+                restaurant_id=restaurant_uuid,
+                user_id=user_uuid,
+                run_id=run.id,
+                document_id=None,
+                processing_type="price_list",
+                extracted_data_json={},
+                product_alias_matches_json={},
+                status="processing",
+                pages_total=None,
+                pages_processed=0,
+                started_at=now,
+            )
+            db.add(staging)
+            db.commit()
+
+            # Download file
+            file_bytes = get_file_bytes(file_id=file_id, settings=settings)
 
             # Extract price list data (with DB-aware extraction)
             try:
@@ -569,7 +710,21 @@ def process_price_list_file_task(
                         purpose_base="vision_price_list",
                         processing_type="price_list",
                     )
+                    _record_file_processing_steps(
+                        run_id=run.id,
+                        telemetry_results=telemetry_results,
+                        stage="vision_price_list",
+                    )
             except Exception as exc:
+                failed_at = dt.datetime.now(dt.UTC)
+                run.status = "failed"
+                run.current_stage = "failed"
+                run.error_message = str(exc)
+                run.finished_at = failed_at
+                staging.status = "failed"
+                staging.error_message = str(exc)
+                staging.finished_at = failed_at
+                db.commit()
                 # Record error telemetry if possible (uses fresh session internally)
                 if session_uuid:
                     try:
@@ -590,6 +745,11 @@ def process_price_list_file_task(
                             telemetry_results=[error_result],
                             purpose_base="vision_price_list",
                             processing_type="price_list",
+                        )
+                        _record_file_processing_steps(
+                            run_id=run.id,
+                            telemetry_results=[error_result],
+                            stage="vision_price_list_error",
                         )
                     except Exception:
                         logger.exception("failed_to_record_error_telemetry")
@@ -635,17 +795,31 @@ def process_price_list_file_task(
             elif not currency:
                 status = "awaiting_currency"
 
-            # Create staging record
-            staging = FileProcessingStaging(
-                restaurant_id=restaurant_uuid,
-                user_id=user_uuid,
-                document_id=document.id,
-                processing_type="price_list",
-                extracted_data_json=extracted_data,
-                product_alias_matches_json=alias_matches,
-                status=status,
-            )
-            db.add(staging)
+            items = extracted_data.get("items", [])
+            page_numbers = {
+                item.get("source_page")
+                for item in items
+                if isinstance(item.get("source_page"), int)
+            }
+            pages_processed = len(page_numbers)
+            pages_total = max(page_numbers) if page_numbers else None
+            finished_at = dt.datetime.now(dt.UTC)
+
+            run.document_id = document.id
+            run.status = "completed"
+            run.current_stage = status
+            run.pages_total = pages_total
+            run.pages_processed = pages_processed
+            run.finished_at = finished_at
+
+            staging.document_id = document.id
+            staging.extracted_data_json = extracted_data
+            staging.product_alias_matches_json = alias_matches
+            staging.status = status
+            staging.pages_total = pages_total
+            staging.pages_processed = pages_processed
+            staging.finished_at = finished_at
+            staging.error_message = None
             db.commit()
 
             # Send message based on status
@@ -822,9 +996,8 @@ def process_inventory_photo_task(
     try:
         with worker_db_session() as db:
             db_session = db
-            # Download file
-            file_bytes = get_file_bytes(file_id=file_id, settings=settings)
-            
+            now = dt.datetime.now(dt.UTC)
+
             # Get actual mime type and filename from Telegram message
             telegram_msg = db.scalar(
                 select(TelegramMessages)
@@ -832,10 +1005,49 @@ def process_inventory_photo_task(
                 .order_by(TelegramMessages.received_at.desc())
                 .limit(1)
             )
-            mime_type = telegram_msg.mime if telegram_msg and telegram_msg.mime else "image/jpeg"
+            mime_type = (
+                telegram_msg.mime if telegram_msg and telegram_msg.mime else "image/jpeg"
+            )
             if not mime_type:
                 mime_type = "image/jpeg"  # Fallback
             filename = telegram_msg.filename if telegram_msg else None
+
+            run = FileProcessingRuns(
+                restaurant_id=restaurant_uuid,
+                user_id=user_uuid,
+                document_id=None,
+                file_id=file_id,
+                filename=filename,
+                mime_type=mime_type,
+                processing_type="inventory",
+                status="processing",
+                pages_total=1,
+                pages_processed=0,
+                current_stage="processing",
+                error_message=None,
+                started_at=now,
+            )
+            db.add(run)
+            db.flush()
+
+            staging = FileProcessingStaging(
+                restaurant_id=restaurant_uuid,
+                user_id=user_uuid,
+                run_id=run.id,
+                document_id=None,
+                processing_type="inventory",
+                extracted_data_json={},
+                product_alias_matches_json={},
+                status="processing",
+                pages_total=1,
+                pages_processed=0,
+                started_at=now,
+            )
+            db.add(staging)
+            db.commit()
+
+            # Download file
+            file_bytes = get_file_bytes(file_id=file_id, settings=settings)
 
             # Extract inventory data (with DB-aware extraction)
             try:
@@ -851,7 +1063,21 @@ def process_inventory_photo_task(
                         purpose_base="vision_inventory",
                         processing_type="inventory",
                     )
+                    _record_file_processing_steps(
+                        run_id=run.id,
+                        telemetry_results=telemetry_results,
+                        stage="vision_inventory",
+                    )
             except Exception as exc:
+                failed_at = dt.datetime.now(dt.UTC)
+                run.status = "failed"
+                run.current_stage = "failed"
+                run.error_message = str(exc)
+                run.finished_at = failed_at
+                staging.status = "failed"
+                staging.error_message = str(exc)
+                staging.finished_at = failed_at
+                db.commit()
                 # Record error telemetry if possible (uses fresh session internally)
                 if session_uuid:
                     try:
@@ -873,6 +1099,11 @@ def process_inventory_photo_task(
                             purpose_base="vision_inventory",
                             processing_type="inventory",
                         )
+                        _record_file_processing_steps(
+                            run_id=run.id,
+                            telemetry_results=[error_result],
+                            stage="vision_inventory_error",
+                        )
                     except Exception:
                         logger.exception("failed_to_record_error_telemetry")
                 raise
@@ -880,17 +1111,18 @@ def process_inventory_photo_task(
             # No longer matching product aliases - we store raw names and search when user asks
             alias_matches = {}
 
-            # Create staging record (no document for inventory photos)
-            staging = FileProcessingStaging(
-                restaurant_id=restaurant_uuid,
-                user_id=user_uuid,
-                document_id=None,
-                processing_type="inventory",
-                extracted_data_json=extracted_data,
-                product_alias_matches_json=alias_matches,
-                status="pending_review",
-            )
-            db.add(staging)
+            finished_at = dt.datetime.now(dt.UTC)
+            run.status = "completed"
+            run.current_stage = "pending_review"
+            run.pages_processed = 1
+            run.finished_at = finished_at
+
+            staging.extracted_data_json = extracted_data
+            staging.product_alias_matches_json = alias_matches
+            staging.status = "pending_review"
+            staging.pages_processed = 1
+            staging.finished_at = finished_at
+            staging.error_message = None
             db.commit()
             _set_pending_file_processing_confirm_action(
                 db=db,

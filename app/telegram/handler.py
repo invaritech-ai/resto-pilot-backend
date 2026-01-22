@@ -28,6 +28,8 @@ from app.conversation.processor import (
     send_ack_message,
 )
 from app.core.config import Settings
+from app.db.models.file_processing_runs import FileProcessingRuns
+from app.db.models.file_processing_staging import FileProcessingStaging
 from app.db.models.processing_events import ProcessingEvents
 from app.db.models.telegram_messages import TelegramMessages
 from app.db.models.telegram_outgoing_messages import TelegramOutgoingMessages
@@ -326,6 +328,75 @@ def handle_update_v2(update: dict, db: Session, settings: Settings) -> None:
             session_id=session.id,
         )
         db.commit()
+
+    if command == "/status":
+        context = load_context(db, user)
+        query = select(FileProcessingRuns).where(FileProcessingRuns.user_id == user.id)
+        if context.active_restaurant_id:
+            try:
+                restaurant_uuid = uuid.UUID(context.active_restaurant_id)
+                query = query.where(FileProcessingRuns.restaurant_id == restaurant_uuid)
+            except ValueError:
+                pass
+        run = db.scalar(
+            query.order_by(FileProcessingRuns.created_at.desc()).limit(1)
+        )
+
+        if run is None:
+            response_text = "No recent file processing found."
+        else:
+            staging = db.scalar(
+                select(FileProcessingStaging)
+                .where(FileProcessingStaging.run_id == run.id)
+                .limit(1)
+            )
+            status = staging.status if staging else run.status
+            status_line = status or "unknown"
+            if status == "processing":
+                status_line = "⏳ Processing"
+            elif status in ("failed", "cancelled"):
+                status_line = "❌ Failed"
+            elif status in ("awaiting_supplier", "awaiting_currency", "pending_review"):
+                status_line = "⚠️ Needs input"
+            elif status in ("confirmed", "completed"):
+                status_line = "✅ Completed"
+
+            lines = [f"Status: {status_line}"]
+            lines.append(f"Type: {run.processing_type}")
+            if run.pages_total is not None:
+                lines.append(f"Pages: {run.pages_processed}/{run.pages_total}")
+            elif run.pages_processed:
+                lines.append(f"Pages processed: {run.pages_processed}")
+            if run.error_message and status in ("failed", "cancelled"):
+                lines.append(f"Error: {run.error_message}")
+            response_text = "\n".join(lines)
+
+        try:
+            telegram_message_id = send_message(
+                chat_id=parsed.chat_id,
+                text=response_text,
+                settings=settings,
+            )
+            record_outgoing_message(
+                db=db,
+                session_id=session.id,
+                chat_id=parsed.chat_id,
+                kind="reply",
+                text=response_text,
+                telegram_message_id=telegram_message_id,
+                llm_call_id=None,
+            )
+            db.commit()
+        except Exception as exc:
+            logger.exception(
+                "handle_update_v2_status_reply_failed",
+                extra={
+                    "error": repr(exc),
+                    "chat_id": parsed.chat_id,
+                    "session_id": str(session.id),
+                },
+            )
+        return
 
     # Process the message
     try:

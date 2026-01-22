@@ -271,16 +271,63 @@ Table: documents
 - uploaded_at: TIMESTAMP WITH TIME ZONE (not null, default: now())
 
 
+Table: file_processing_runs
+----------------------------
+- id: UUID (primary key)
+- restaurant_id: UUID (foreign key -> restaurants.id, on delete: CASCADE, not null)
+- user_id: UUID (foreign key -> users.id, on delete: CASCADE, not null)
+- document_id: UUID (foreign key -> documents.id, on delete: SET NULL, nullable)
+- file_id: STRING (not null)
+- filename: STRING (nullable)
+- mime_type: STRING (nullable)
+- processing_type: ENUM('invoice', 'price_list', 'inventory') (not null) [enum name: processing_type]
+- status: ENUM('processing', 'completed', 'failed', 'cancelled') (not null, default: 'processing') [enum name: file_processing_run_status]
+- pages_total: INTEGER (nullable)
+- pages_processed: INTEGER (not null, default: 0)
+- current_stage: STRING (nullable)
+- error_message: STRING (nullable)
+- started_at: TIMESTAMP WITH TIME ZONE (nullable)
+- finished_at: TIMESTAMP WITH TIME ZONE (nullable)
+- created_at: TIMESTAMP WITH TIME ZONE (not null, default: now())
+- updated_at: TIMESTAMP WITH TIME ZONE (not null, default: now(), auto-update)
+
+
+Table: file_processing_steps
+-----------------------------
+- id: UUID (primary key)
+- run_id: UUID (foreign key -> file_processing_runs.id, on delete: CASCADE, not null)
+- stage: STRING (not null)
+- status: ENUM('started', 'completed', 'failed') (not null, default: 'started') [enum name: file_processing_step_status]
+- step_index: INTEGER (nullable)
+- page_index: INTEGER (nullable)
+- input_text: TEXT (nullable)
+- prompt_text: TEXT (nullable)
+- output_text: TEXT (nullable)
+- request_json: JSON/JSONB (nullable)
+- response_json: JSON/JSONB (nullable)
+- usage_json: JSON/JSONB (nullable)
+- model: STRING (nullable)
+- latency_ms: INTEGER (nullable)
+- error_message: STRING (nullable)
+- created_at: TIMESTAMP WITH TIME ZONE (not null, default: now())
+
+
 Table: file_processing_staging
 -------------------------------
 - id: UUID (primary key)
 - restaurant_id: UUID (foreign key -> restaurants.id, on delete: CASCADE, not null)
 - user_id: UUID (foreign key -> users.id, on delete: CASCADE, not null)
+- run_id: UUID (foreign key -> file_processing_runs.id, on delete: SET NULL, nullable)
 - document_id: UUID (foreign key -> documents.id, on delete: SET NULL, nullable)
 - processing_type: ENUM('invoice', 'price_list', 'inventory') (not null) [enum name: processing_type]
 - extracted_data_json: JSON/JSONB (not null)
 - product_alias_matches_json: JSON/JSONB (not null, default: {})
-- status: ENUM('pending_review', 'confirmed', 'cancelled', 'awaiting_supplier', 'awaiting_currency') (not null, default: 'pending_review') [enum name: staging_status]
+- status: ENUM('processing', 'pending_review', 'confirmed', 'cancelled', 'awaiting_supplier', 'awaiting_currency', 'failed') (not null, default: 'pending_review') [enum name: staging_status]
+- pages_total: INTEGER (nullable)
+- pages_processed: INTEGER (not null, default: 0)
+- started_at: TIMESTAMP WITH TIME ZONE (nullable)
+- finished_at: TIMESTAMP WITH TIME ZONE (nullable)
+- error_message: STRING (nullable)
 - authorized_by_user_id: UUID (foreign key -> users.id, on delete: SET NULL, nullable)
 - confirmed_at: TIMESTAMP WITH TIME ZONE (nullable)
 - cancelled_at: TIMESTAMP WITH TIME ZONE (nullable)

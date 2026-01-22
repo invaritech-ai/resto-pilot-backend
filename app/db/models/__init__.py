@@ -21,6 +21,8 @@ from app.db.models.price_comparisons import PriceComparisons
 from app.db.models.inventory_movements import InventoryMovements
 from app.db.models.supplier_disputes import SupplierDisputes
 from app.db.models.file_processing_staging import FileProcessingStaging
+from app.db.models.file_processing_runs import FileProcessingRuns
+from app.db.models.file_processing_steps import FileProcessingSteps
 
 __all__ = [
     "Restaurant",
@@ -46,4 +48,6 @@ __all__ = [
     "InventoryMovements",
     "SupplierDisputes",
     "FileProcessingStaging",
+    "FileProcessingRuns",
+    "FileProcessingSteps",
 ]
