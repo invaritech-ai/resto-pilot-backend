@@ -233,6 +233,80 @@ def _get_vision_settings(settings: Settings) -> tuple[str, str, str]:
     return model, api_key, base_url
 
 
+def ocr_page_to_markdown(
+    *,
+    page_image_bytes: bytes,
+    page_num: int,
+    total_pages: int,
+    settings: Settings,
+) -> VisionCallResult:
+    """
+    OCR a single page and return Markdown output.
+
+    Optimized prompt for pure OCR:
+    - Preserve tables, headers, footers
+    - Use Markdown formatting
+    - Don't summarize or interpret
+
+    Args:
+        page_image_bytes: Image bytes for the page
+        page_num: Page number (for logging)
+        total_pages: Total number of pages (for logging)
+        settings: Application settings
+
+    Returns:
+        VisionCallResult with Markdown content
+    """
+    prompt = (
+        f"Extract all text from this page ({page_num}/{total_pages}). "
+        "Preserve tables using Markdown table syntax. "
+        "Keep all headers, footers, and page numbers. "
+        "Use headings (##, ###) for section titles. "
+        "Return ONLY Markdown - no commentary."
+    )
+    return process_image_with_vision(page_image_bytes, prompt, settings, "image/png")
+
+
+def extract_json_from_markdown(
+    *,
+    markdown_text: str,
+    page_num: int,
+    processing_type: str,
+    db_schema: str,
+    settings: Settings,
+) -> VisionCallResult:
+    """
+    Extract structured JSON from Markdown text for a single page.
+
+    Uses text LLM (not vision) with schema-aware prompt.
+    Returns JSON aligned with database columns.
+
+    Args:
+        markdown_text: Markdown text from OCR
+        page_num: Page number (for context)
+        processing_type: "invoice", "price_list", or "inventory"
+        db_schema: Database schema text for extraction guidance
+        settings: Application settings
+
+    Returns:
+        VisionCallResult with JSON content
+    """
+    prompt = f"""Extract data from this page ({page_num}) into JSON matching this database schema:
+
+{db_schema}
+
+Page content (Markdown):
+{markdown_text}
+
+Return a JSON object with appropriate fields.
+For line items/products, include source_page={page_num} for each item.
+If the page has no relevant data, return {{"items": [], "line_items": []}}.
+"""
+
+    # Use text LLM, not vision model (cheaper & faster)
+    return _extract_structured_from_text(prompt, markdown_text, settings)
+
+
 def process_image_with_vision(
     file_bytes: bytes, prompt: str, settings: Settings, mime_type: str | None = None
 ) -> VisionCallResult:

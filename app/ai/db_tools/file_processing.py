@@ -477,6 +477,71 @@ def create_file_processing_tools(
             logger.exception("update_file_processing_data_failed")
             return f"Error updating data: {str(e)}"
 
+    def check_file_processing_status(args: dict[str, Any]) -> str:
+        """
+        Check the status of a file processing job.
+
+        User can ask: "How's my invoice processing going?" or "What's the status of my file?"
+        """
+        from app.db.queries.file_processing import (
+            get_processing_status,
+            get_user_processing_jobs,
+        )
+
+        run_id_str = args.get("run_id", "").strip()
+
+        try:
+            if run_id_str:
+                # Check specific run
+                run_id = uuid.UUID(run_id_str)
+                status = get_processing_status(run_id, db)
+            else:
+                # Get latest job for current user
+                jobs = get_user_processing_jobs(user_id, db, limit=1)
+                if not jobs:
+                    return "No file processing jobs found for your account."
+                status = jobs[0]
+
+            # Format response based on status
+            if status["status"] == "completed":
+                msg = "✅ Your file processing is complete!\n\n"
+                msg += f"Pages processed: {status['pages_processed']}/{status['pages_total']}\n"
+                msg += f"Time taken: {status['elapsed_seconds']} seconds\n\n"
+                msg += "Use review_file_processing to see the extracted data."
+                return msg
+
+            elif status["status"] == "failed":
+                msg = "❌ File processing failed.\n\n"
+                if status["error_message"]:
+                    msg += f"Error: {status['error_message']}\n\n"
+                msg += "Please try uploading the file again."
+                return msg
+
+            elif status["status"] == "processing":
+                msg = "⏳ Your file is being processed...\n\n"
+                msg += f"Progress: {status['progress_percentage']:.0f}% complete\n"
+                msg += f"Pages: {status['pages_processed']}/{status['pages_total']}\n"
+                msg += f"Current stage: {status['current_stage']}\n"
+
+                if status["estimated_seconds_remaining"]:
+                    eta_minutes = status["estimated_seconds_remaining"] // 60
+                    msg += f"\nEstimated time remaining: ~{eta_minutes} minutes"
+
+                return msg
+
+            else:
+                # Pending or other status
+                msg = f"Status: {status['status']}\n"
+                if status['pages_total']:
+                    msg += f"Pages: {status['pages_processed']}/{status['pages_total']}\n"
+                return msg
+
+        except ValueError as e:
+            return f"Error: {str(e)}"
+        except Exception as e:
+            logger.exception("check_file_processing_status_failed")
+            return f"Error checking status: {str(e)}"
+
     def confirm_file_processing(args: dict[str, Any]) -> str:
         """Confirm and write extracted data to final tables. Both owners and staff can confirm (attribution is tracked)."""
         staging_id_str = args.get("staging_id", "").strip()
@@ -971,6 +1036,22 @@ def create_file_processing_tools(
                 "additionalProperties": False,
             },
             handler=update_missing_field,
+        ),
+        "check_file_processing_status": Tool(
+            name="check_file_processing_status",
+            description="Check the status of a file processing job. Use this when user asks 'how's my file?', 'what's the status?', or similar questions.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "run_id": {
+                        "type": "string",
+                        "description": "The file processing run UUID (optional - if not provided, returns latest job for user).",
+                    },
+                },
+                "required": [],
+                "additionalProperties": False,
+            },
+            handler=check_file_processing_status,
         ),
         "confirm_file_processing": Tool(
             name="confirm_file_processing",

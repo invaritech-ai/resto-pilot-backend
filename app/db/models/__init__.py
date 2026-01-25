@@ -23,6 +23,7 @@ from app.db.models.supplier_disputes import SupplierDisputes
 from app.db.models.file_processing_staging import FileProcessingStaging
 from app.db.models.file_processing_runs import FileProcessingRuns
 from app.db.models.file_processing_steps import FileProcessingSteps
+from app.db.models.user_upload_limits import UserUploadLimits
 
 __all__ = [
     "Restaurant",
@@ -50,4 +51,5 @@ __all__ = [
     "FileProcessingStaging",
     "FileProcessingRuns",
     "FileProcessingSteps",
+    "UserUploadLimits",
 ]

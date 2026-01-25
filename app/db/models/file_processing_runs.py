@@ -26,6 +26,7 @@ class FileProcessingRuns(Base):
     file_id: Mapped[str] = mapped_column(String, nullable=False)
     filename: Mapped[str | None] = mapped_column(String, nullable=True)
     mime_type: Mapped[str | None] = mapped_column(String, nullable=True)
+    webhook_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
     processing_type: Mapped[str] = mapped_column(
         Enum("invoice", "price_list", "inventory", name="processing_type"),

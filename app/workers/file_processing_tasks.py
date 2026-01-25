@@ -25,7 +25,14 @@ from app.processing.file_processor import (
     extract_invoice_data,
     extract_price_list_data,
 )
-from app.telegram.bot_api import get_file_bytes, send_message
+from app.telegram.bot_api import (
+    TelegramFileError,
+    TelegramFileExpiredError,
+    TelegramFileNetworkError,
+    TelegramFileTooBigError,
+    get_file_bytes,
+    send_message,
+)
 from app.workers.celery_app import celery_app
 from app.workers.db import worker_db_session
 from app.workers.telemetry import (
@@ -345,12 +352,24 @@ def process_invoice_file_task(
             # Download file
             file_bytes = get_file_bytes(file_id=file_id, settings=settings)
 
-            # Extract invoice data (with DB-aware extraction)
+            # Extract invoice data using new page-by-page processor with snapshots
             try:
-                extracted_data = extract_invoice_data(file_bytes, mime_type, settings, db, filename)
+                from app.processing.page_processor import process_file_with_snapshots
+
+                result = process_file_with_snapshots(
+                    run_id=run.id,
+                    file_bytes=file_bytes,
+                    mime_type=mime_type,
+                    filename=filename,
+                    processing_type="invoice",
+                    db=db,
+                    settings=settings,
+                )
+
+                extracted_data = result["data"]
+                telemetry_results = result.get("telemetry", [])
 
                 # Record telemetry for vision calls (uses fresh session internally)
-                telemetry_results = extracted_data.pop("_telemetry_results", [])
                 if telemetry_results:
                     _record_vision_telemetry(
                         session_uuid=session_uuid,
@@ -359,11 +378,8 @@ def process_invoice_file_task(
                         purpose_base="vision_invoice",
                         processing_type="invoice",
                     )
-                    _record_file_processing_steps(
-                        run_id=run.id,
-                        telemetry_results=telemetry_results,
-                        stage="vision_invoice",
-                    )
+                    # Note: File processing steps are now recorded by page_processor itself
+
             except Exception as exc:
                 failed_at = dt.datetime.now(dt.UTC)
                 run.status = "failed"
@@ -591,7 +607,91 @@ def process_invoice_file_task(
             )
             db.commit()
 
+    except TelegramFileExpiredError as exc:
+        # File no longer available - clear, actionable message
+        logger.error(
+            "process_invoice_file_task_file_expired",
+            extra={
+                "error": repr(exc),
+                "restaurant_id": restaurant_id,
+                "file_id": file_id,
+                "chat_id": chat_id,
+            },
+        )
+        try:
+            _send_message_with_telemetry(
+                db=db_session,
+                chat_id=chat_id,
+                text=(
+                    "⏰ Your invoice file is no longer available on Telegram.\n\n"
+                    "Telegram files expire after 24-48 hours. To process this invoice, "
+                    "please re-upload the PDF.\n\n"
+                    "💡 Tip: If you were resuming processing, I'll pick up where we left off "
+                    "after you re-upload."
+                ),
+                settings=settings,
+                session_uuid=session_uuid,
+            )
+        except Exception:
+            pass
+        raise
+
+    except TelegramFileTooBigError as exc:
+        # File too large - clear message
+        logger.error(
+            "process_invoice_file_task_file_too_big",
+            extra={
+                "error": repr(exc),
+                "restaurant_id": restaurant_id,
+                "file_id": file_id,
+                "chat_id": chat_id,
+            },
+        )
+        try:
+            _send_message_with_telemetry(
+                db=db_session,
+                chat_id=chat_id,
+                text=(
+                    "📦 Your invoice file is too large.\n\n"
+                    f"{str(exc)}\n\n"
+                    "Please try splitting the PDF into smaller files or compressing it."
+                ),
+                settings=settings,
+                session_uuid=session_uuid,
+            )
+        except Exception:
+            pass
+        raise
+
+    except TelegramFileNetworkError as exc:
+        # Transient error - suggest retry
+        logger.warning(
+            "process_invoice_file_task_network_error",
+            extra={
+                "error": repr(exc),
+                "restaurant_id": restaurant_id,
+                "file_id": file_id,
+                "chat_id": chat_id,
+            },
+        )
+        try:
+            _send_message_with_telemetry(
+                db=db_session,
+                chat_id=chat_id,
+                text=(
+                    "⚠️ Temporary error downloading your invoice.\n\n"
+                    "This is usually a temporary issue with Telegram's servers. "
+                    "Please try re-uploading the file in a few minutes."
+                ),
+                settings=settings,
+                session_uuid=session_uuid,
+            )
+        except Exception:
+            pass
+        raise
+
     except Exception as exc:
+        # Unknown error - generic message
         logger.exception(
             "process_invoice_file_task_failed",
             extra={
@@ -696,12 +796,24 @@ def process_price_list_file_task(
             # Download file
             file_bytes = get_file_bytes(file_id=file_id, settings=settings)
 
-            # Extract price list data (with DB-aware extraction)
+            # Extract price list data using new page-by-page processor with snapshots
             try:
-                extracted_data = extract_price_list_data(file_bytes, mime_type, settings, db, filename)
+                from app.processing.page_processor import process_file_with_snapshots
+
+                result = process_file_with_snapshots(
+                    run_id=run.id,
+                    file_bytes=file_bytes,
+                    mime_type=mime_type,
+                    filename=filename,
+                    processing_type="price_list",
+                    db=db,
+                    settings=settings,
+                )
+
+                extracted_data = result["data"]
+                telemetry_results = result.get("telemetry", [])
 
                 # Record telemetry for vision calls (uses fresh session internally)
-                telemetry_results = extracted_data.pop("_telemetry_results", [])
                 if telemetry_results:
                     _record_vision_telemetry(
                         session_uuid=session_uuid,
@@ -710,11 +822,8 @@ def process_price_list_file_task(
                         purpose_base="vision_price_list",
                         processing_type="price_list",
                     )
-                    _record_file_processing_steps(
-                        run_id=run.id,
-                        telemetry_results=telemetry_results,
-                        stage="vision_price_list",
-                    )
+                    # Note: File processing steps are now recorded by page_processor itself
+
             except Exception as exc:
                 failed_at = dt.datetime.now(dt.UTC)
                 run.status = "failed"
@@ -945,6 +1054,89 @@ def process_price_list_file_task(
             )
             db.commit()
 
+    except TelegramFileExpiredError as exc:
+        # File no longer available - clear, actionable message
+        logger.error(
+            "process_price_list_file_task_file_expired",
+            extra={
+                "error": repr(exc),
+                "restaurant_id": restaurant_id,
+                "file_id": file_id,
+                "chat_id": chat_id,
+            },
+        )
+        try:
+            _send_message_with_telemetry(
+                db=db_session,
+                chat_id=chat_id,
+                text=(
+                    "⏰ Your price list file is no longer available on Telegram.\n\n"
+                    "Telegram files expire after 24-48 hours. To process this price list, "
+                    "please re-upload the file.\n\n"
+                    "💡 Tip: If you were resuming processing, I'll pick up where we left off "
+                    "after you re-upload."
+                ),
+                settings=settings,
+                session_uuid=session_uuid,
+            )
+        except Exception:
+            pass
+        raise
+
+    except TelegramFileTooBigError as exc:
+        # File too large - clear message
+        logger.error(
+            "process_price_list_file_task_file_too_big",
+            extra={
+                "error": repr(exc),
+                "restaurant_id": restaurant_id,
+                "file_id": file_id,
+                "chat_id": chat_id,
+            },
+        )
+        try:
+            _send_message_with_telemetry(
+                db=db_session,
+                chat_id=chat_id,
+                text=(
+                    "📦 Your price list file is too large.\n\n"
+                    f"{str(exc)}\n\n"
+                    "Please try splitting the file into smaller files or compressing it."
+                ),
+                settings=settings,
+                session_uuid=session_uuid,
+            )
+        except Exception:
+            pass
+        raise
+
+    except TelegramFileNetworkError as exc:
+        # Transient error - suggest retry
+        logger.warning(
+            "process_price_list_file_task_network_error",
+            extra={
+                "error": repr(exc),
+                "restaurant_id": restaurant_id,
+                "file_id": file_id,
+                "chat_id": chat_id,
+            },
+        )
+        try:
+            _send_message_with_telemetry(
+                db=db_session,
+                chat_id=chat_id,
+                text=(
+                    "⚠️ Temporary error downloading your price list.\n\n"
+                    "This is usually a temporary issue with Telegram's servers. "
+                    "Please try re-uploading the file in a few minutes."
+                ),
+                settings=settings,
+                session_uuid=session_uuid,
+            )
+        except Exception:
+            pass
+        raise
+
     except Exception as exc:
         logger.exception(
             "process_price_list_file_task_failed",
@@ -1049,12 +1241,24 @@ def process_inventory_photo_task(
             # Download file
             file_bytes = get_file_bytes(file_id=file_id, settings=settings)
 
-            # Extract inventory data (with DB-aware extraction)
+            # Extract inventory data using new page-by-page processor with snapshots
             try:
-                extracted_data = extract_inventory_data(file_bytes, mime_type, settings, db, filename)
+                from app.processing.page_processor import process_file_with_snapshots
+
+                result = process_file_with_snapshots(
+                    run_id=run.id,
+                    file_bytes=file_bytes,
+                    mime_type=mime_type,
+                    filename=filename,
+                    processing_type="inventory",
+                    db=db,
+                    settings=settings,
+                )
+
+                extracted_data = result["data"]
+                telemetry_results = result.get("telemetry", [])
 
                 # Record telemetry for vision calls (uses fresh session internally)
-                telemetry_results = extracted_data.pop("_telemetry_results", [])
                 if telemetry_results:
                     _record_vision_telemetry(
                         session_uuid=session_uuid,
@@ -1063,11 +1267,8 @@ def process_inventory_photo_task(
                         purpose_base="vision_inventory",
                         processing_type="inventory",
                     )
-                    _record_file_processing_steps(
-                        run_id=run.id,
-                        telemetry_results=telemetry_results,
-                        stage="vision_inventory",
-                    )
+                    # Note: File processing steps are now recorded by page_processor itself
+
             except Exception as exc:
                 failed_at = dt.datetime.now(dt.UTC)
                 run.status = "failed"
@@ -1180,6 +1381,87 @@ def process_inventory_photo_task(
             )
             db.commit()
 
+    except TelegramFileExpiredError as exc:
+        # File no longer available - clear, actionable message
+        logger.error(
+            "process_inventory_photo_task_file_expired",
+            extra={
+                "error": repr(exc),
+                "restaurant_id": restaurant_id,
+                "file_id": file_id,
+                "chat_id": chat_id,
+            },
+        )
+        try:
+            _send_message_with_telemetry(
+                db=db_session,
+                chat_id=chat_id,
+                text=(
+                    "⏰ Your inventory photo is no longer available on Telegram.\n\n"
+                    "Telegram files expire after 24-48 hours. To process this inventory, "
+                    "please re-upload the photo."
+                ),
+                settings=settings,
+                session_uuid=session_uuid,
+            )
+        except Exception:
+            pass
+        raise
+
+    except TelegramFileTooBigError as exc:
+        # File too large - clear message
+        logger.error(
+            "process_inventory_photo_task_file_too_big",
+            extra={
+                "error": repr(exc),
+                "restaurant_id": restaurant_id,
+                "file_id": file_id,
+                "chat_id": chat_id,
+            },
+        )
+        try:
+            _send_message_with_telemetry(
+                db=db_session,
+                chat_id=chat_id,
+                text=(
+                    "📦 Your inventory photo is too large.\n\n"
+                    f"{str(exc)}\n\n"
+                    "Please try compressing the image or taking a new photo."
+                ),
+                settings=settings,
+                session_uuid=session_uuid,
+            )
+        except Exception:
+            pass
+        raise
+
+    except TelegramFileNetworkError as exc:
+        # Transient error - suggest retry
+        logger.warning(
+            "process_inventory_photo_task_network_error",
+            extra={
+                "error": repr(exc),
+                "restaurant_id": restaurant_id,
+                "file_id": file_id,
+                "chat_id": chat_id,
+            },
+        )
+        try:
+            _send_message_with_telemetry(
+                db=db_session,
+                chat_id=chat_id,
+                text=(
+                    "⚠️ Temporary error downloading your inventory photo.\n\n"
+                    "This is usually a temporary issue with Telegram's servers. "
+                    "Please try re-uploading the photo in a few minutes."
+                ),
+                settings=settings,
+                session_uuid=session_uuid,
+            )
+        except Exception:
+            pass
+        raise
+
     except Exception as exc:
         logger.exception(
             "process_inventory_photo_task_failed",
@@ -1202,3 +1484,113 @@ def process_inventory_photo_task(
         except Exception:
             pass
         raise
+
+
+@celery_app.task(name="process_file_api_task")
+def process_file_api_task(
+    run_id: str,
+    file_bytes_base64: str,
+    mime_type: str,
+    filename: str,
+) -> dict[str, Any]:
+    """
+    Process file uploaded via API.
+
+    Similar to Telegram tasks but accepts base64-encoded file bytes
+    instead of Telegram file_id.
+
+    Args:
+        run_id: FileProcessingRuns UUID as string
+        file_bytes_base64: Base64-encoded file bytes
+        mime_type: MIME type of file
+        filename: Original filename
+
+    Returns:
+        {
+            "run_id": "...",
+            "status": "completed",
+            "staging_id": "..."
+        }
+    """
+    import base64
+    from uuid import UUID
+
+    from app.processing.page_processor import process_file_with_snapshots
+
+    logger.info(
+        "process_file_api_task_started",
+        extra={
+            "run_id": run_id,
+            "mime_type": mime_type,
+            "filename": filename,
+        },
+    )
+
+    # Decode file bytes
+    file_bytes = base64.b64decode(file_bytes_base64)
+
+    # Get database session
+    with worker_db_session() as db:
+        settings = get_settings()
+
+        # Get run record
+        run = db.get(FileProcessingRuns, UUID(run_id))
+        if not run:
+            raise ValueError(f"FileProcessingRun not found: {run_id}")
+
+        try:
+            # Process with snapshots
+            result = process_file_with_snapshots(
+                run_id=run.id,
+                file_bytes=file_bytes,
+                mime_type=mime_type,
+                filename=filename,
+                processing_type=run.processing_type,
+                db=db,
+                settings=settings,
+            )
+
+            # Update staging with extracted data
+            staging = db.query(FileProcessingStaging).filter_by(
+                run_id=run.id
+            ).first()
+
+            if staging:
+                staging.extracted_data_json = result["data"]
+                staging.status = "pending_review"
+                db.commit()
+
+                logger.info(
+                    "process_file_api_task_completed",
+                    extra={
+                        "run_id": run_id,
+                        "staging_id": str(staging.id),
+                        "status": "completed",
+                    },
+                )
+
+                return {
+                    "run_id": run_id,
+                    "status": "completed",
+                    "staging_id": str(staging.id),
+                }
+            else:
+                logger.error(
+                    "process_file_api_task_no_staging",
+                    extra={"run_id": run_id},
+                )
+                return {
+                    "run_id": run_id,
+                    "status": "completed_no_staging",
+                }
+
+        except Exception as exc:
+            logger.exception(
+                "process_file_api_task_failed",
+                extra={
+                    "error": repr(exc),
+                    "run_id": run_id,
+                    "filename": filename,
+                },
+            )
+            raise
