@@ -12,7 +12,7 @@ from app.db.models.restaurant_user import RestaurantUser
 from app.db.models.user import User
 
 
-def test_link_supplier_to_all_outlets_requires_confirmation() -> None:
+def test_link_supplier_to_outlets_requires_confirmation() -> None:
     engine = create_engine(
         "sqlite+pysqlite:///:memory:",
         future=True,
@@ -26,25 +26,24 @@ def test_link_supplier_to_all_outlets_requires_confirmation() -> None:
         db.add(owner)
         db.flush()
 
-        a = Restaurant(
-            name="A",
-            restaurant_code="A",
+        merc = Restaurant(
+            name="Mercato",
+            restaurant_code="MERC",
             owner_user_id=owner.id,
             onboarding_status={},
         )
-        b = Restaurant(
-            name="B",
-            restaurant_code="B",
+        ktm = Restaurant(
+            name="KTM",
+            restaurant_code="KTM",
             owner_user_id=owner.id,
             onboarding_status={},
         )
-        db.add_all([a, b])
+        db.add_all([merc, ktm])
         db.flush()
-
         db.add_all(
             [
-                RestaurantUser(restaurant_id=a.id, user_id=owner.id, role="owner", status="active"),
-                RestaurantUser(restaurant_id=b.id, user_id=owner.id, role="owner", status="active"),
+                RestaurantUser(restaurant_id=merc.id, user_id=owner.id, role="owner", status="active"),
+                RestaurantUser(restaurant_id=ktm.id, user_id=owner.id, role="owner", status="active"),
             ]
         )
         db.commit()
@@ -53,12 +52,12 @@ def test_link_supplier_to_all_outlets_requires_confirmation() -> None:
             db=db,
             user_id=owner.id,
             actor_role="owner",
-            restaurant_roles={str(a.id): "owner", str(b.id): "owner"},
+            restaurant_roles={str(merc.id): "owner", str(ktm.id): "owner"},
             pending_action=None,
-            user_message="Add supplier Cheong Hing to all my outlets",
+            user_message="link supplier Fresh Farms for Mercato, KTM",
         )
         raw = tools["link_suppliers"].handler(
-            {"supplier_name": "Cheong Hing", "all_outlets": True}
+            {"supplier_name": "Fresh Farms", "restaurant_names": ["Mercato", "KTM"]}
         )
         payload = json.loads(raw)
         assert payload["status"] == "needs_confirmation"

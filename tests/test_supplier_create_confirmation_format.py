@@ -12,7 +12,7 @@ from app.db.models.restaurant_user import RestaurantUser
 from app.db.models.user import User
 
 
-def test_link_supplier_to_all_outlets_requires_confirmation() -> None:
+def test_create_supplier_confirmation_does_not_keyerror() -> None:
     engine = create_engine(
         "sqlite+pysqlite:///:memory:",
         future=True,
@@ -26,26 +26,21 @@ def test_link_supplier_to_all_outlets_requires_confirmation() -> None:
         db.add(owner)
         db.flush()
 
-        a = Restaurant(
-            name="A",
-            restaurant_code="A",
+        restaurant = Restaurant(
+            name="KTM",
+            restaurant_code="KTM",
             owner_user_id=owner.id,
             onboarding_status={},
         )
-        b = Restaurant(
-            name="B",
-            restaurant_code="B",
-            owner_user_id=owner.id,
-            onboarding_status={},
-        )
-        db.add_all([a, b])
+        db.add(restaurant)
         db.flush()
-
-        db.add_all(
-            [
-                RestaurantUser(restaurant_id=a.id, user_id=owner.id, role="owner", status="active"),
-                RestaurantUser(restaurant_id=b.id, user_id=owner.id, role="owner", status="active"),
-            ]
+        db.add(
+            RestaurantUser(
+                restaurant_id=restaurant.id,
+                user_id=owner.id,
+                role="owner",
+                status="active",
+            )
         )
         db.commit()
 
@@ -53,13 +48,14 @@ def test_link_supplier_to_all_outlets_requires_confirmation() -> None:
             db=db,
             user_id=owner.id,
             actor_role="owner",
-            restaurant_roles={str(a.id): "owner", str(b.id): "owner"},
+            restaurant_roles={str(restaurant.id): "owner"},
             pending_action=None,
-            user_message="Add supplier Cheong Hing to all my outlets",
+            user_message="add supplier Cheong Hing to KTM",
         )
-        raw = tools["link_suppliers"].handler(
-            {"supplier_name": "Cheong Hing", "all_outlets": True}
+        raw = tools["create_supplier"].handler(
+            {"restaurant_id": str(restaurant.id), "name": "Cheong Hing"}
         )
         payload = json.loads(raw)
-        assert payload["status"] == "needs_confirmation"
-        assert "pending_action" in payload["context_update"]
+        assert payload["status"] == "pending_confirmation"
+        assert "KTM" in payload["message"]
+

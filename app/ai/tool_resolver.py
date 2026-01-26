@@ -44,6 +44,8 @@ class ToolResolutionResult:
     llm_calls: list[LLMCallTelemetry] = field(default_factory=list)
     context_update: dict[str, Any] = field(default_factory=dict)
     tool_calls: int = 0
+    tool_names: list[str] = field(default_factory=list)
+    exit_reason: str | None = None
 
 
 RESOLVER_SYSTEM_PROMPT = """You are a restaurant management assistant.
@@ -59,7 +61,7 @@ If there is a pending action and the user says yes/no, call the relevant tool to
 When listing staff, include the outlet name if provided by the tool.
 When the user says "list suppliers" without specifying an outlet, call list_my_suppliers.
 When the user specifies an outlet (e.g., "for Mercato"), call list_suppliers with restaurant_id.
-When the user asks to add/link a supplier to all outlets, call link_supplier_to_all_outlets.
+When the user asks to link suppliers and outlets in any combination (1→1, 1→many, many→many, many→1, or all outlets), call link_suppliers.
 """
 
 
@@ -155,12 +157,16 @@ def resolve_with_tools(
     if normalized_message in {"list suppliers", "list my suppliers"}:
         tool = merged_tools.get("list_my_suppliers")
         if tool is None:
-            return ToolResolutionResult(response_text=responses.ERROR_GENERIC)
+            return ToolResolutionResult(
+                response_text=responses.ERROR_GENERIC, exit_reason="tool_missing"
+            )
         return ToolResolutionResult(
             response_text=tool.handler({}),
             llm_calls=[],
             context_update={},
             tool_calls=1,
+            tool_names=["list_my_suppliers"],
+            exit_reason="fast_path",
         )
 
     messages: list[dict[str, Any]] = [
@@ -170,6 +176,7 @@ def resolve_with_tools(
 
     llm_calls: list[LLMCallTelemetry] = []
     tool_calls_count = 0
+    tool_names: list[str] = []
     last_restaurant_id: str | None = None
     last_supplier_id: str | None = None
     context_update: dict[str, Any] = {}
@@ -213,6 +220,8 @@ def resolve_with_tools(
                 call_id = call.get("id")
                 fn = call.get("function", {})
                 name = fn.get("name")
+                if isinstance(name, str) and name:
+                    tool_names.append(name)
                 args = _parse_tool_args(fn.get("arguments"))
                 if isinstance(args.get("restaurant_id"), str):
                     last_restaurant_id = args["restaurant_id"].strip()
@@ -248,12 +257,16 @@ def resolve_with_tools(
                     llm_calls=llm_calls,
                     context_update=context_update,
                     tool_calls=tool_calls_count,
+                    tool_names=tool_names,
+                    exit_reason="no_tool_calls",
                 )
             return ToolResolutionResult(
                 response_text=content.strip(),
                 llm_calls=llm_calls,
                 context_update=context_update,
                 tool_calls=tool_calls_count,
+                tool_names=tool_names,
+                exit_reason="ok",
             )
 
         break
@@ -262,4 +275,6 @@ def resolve_with_tools(
         response_text=responses.ERROR_GENERIC,
         llm_calls=llm_calls,
         tool_calls=tool_calls_count,
+        tool_names=tool_names,
+        exit_reason="max_steps_exhausted",
     )

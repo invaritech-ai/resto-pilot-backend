@@ -44,6 +44,9 @@ def get_menu_paths() -> str:
                 "show unlinked suppliers for outlet Mercato",
                 "view supplier price list Fresh Farms",
                 "link supplier Fresh Farms to outlet Mercato",
+                "link supplier Fresh Farms for Mercato, KTM, Gupshup",
+                "link supplier Fresh Farms, Cheong Hing to Mercato, KTM",
+                "link suppliers Fresh Farms, Cheong Hing to all outlets",
             ],
         },
         {

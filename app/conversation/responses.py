@@ -241,17 +241,13 @@ def suppliers_list(suppliers: list[dict[str, Any]]) -> str:
 
 SUPPLIER_CREATED = "Added supplier '{name}'."
 
-SUPPLIER_CREATE_CONFIRMATION = "I'll add supplier '{name}' to {restaurant}. Confirm?"
+SUPPLIER_CREATE_CONFIRMATION = "I'll add supplier '{name}' to {restaurant_name}. Confirm?"
 
 SUPPLIER_CREATE_CANCELLED = "Cancelled supplier creation."
 
 SUPPLIER_UPDATED = "Updated supplier '{name}'."
 
 SUPPLIER_CREATE_ERROR = "Couldn't add the supplier. Please try again."
-
-SUPPLIER_CREATE_CONFIRMATION = "I'll add supplier '{name}' to {restaurant_name}. Confirm?"
-
-SUPPLIER_CREATE_CANCELLED = "Cancelled adding supplier."
 
 SUPPLIER_NOT_FOUND = "Supplier not found."
 
@@ -264,6 +260,18 @@ SUPPLIER_LINK_ALL_CONFIRMATION = (
 )
 
 SUPPLIER_LINK_ALL_CANCELLED = "Cancelled linking supplier to all outlets."
+
+SUPPLIER_LINK_MULTI_CONFIRMATION = (
+    "I'll link supplier '{name}' to these outlets: {outlets}. Confirm?"
+)
+
+SUPPLIER_LINK_MULTI_CANCELLED = "Cancelled linking supplier to selected outlets."
+
+SUPPLIER_LINK_MULTI_SUPPLIERS_CONFIRMATION = (
+    "I'll link suppliers {suppliers} to these outlets: {outlets}. Confirm?"
+)
+
+SUPPLIER_LINK_MULTI_SUPPLIERS_CANCELLED = "Cancelled linking suppliers to selected outlets."
 
 
 def supplier_details(supplier: dict[str, Any]) -> str:

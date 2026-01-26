@@ -163,7 +163,7 @@ def _format_tool_response_with_llm(
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.2,
-            extra_body={"max_tokens": 200},
+            extra_body={"max_tokens": 400},
         )
     except OpenAIError as exc:
         logger.exception("final_response_failed", extra={"error": str(exc)})
@@ -259,7 +259,7 @@ def _generate_ack_text(
 
     content = text.strip() if isinstance(text, str) else None
     if content:
-        content = " ".join(content.splitlines()).strip()
+        content = content.strip()
 
     llm_call_id = None
     if db is not None and session_id is not None:
@@ -553,6 +553,8 @@ def process_message_instant(
             payload_json=json.dumps({
                 "tool_calls": tool_result.tool_calls,
                 "llm_calls": len(tool_result.llm_calls),
+                "tool_names": getattr(tool_result, "tool_names", []),
+                "exit_reason": getattr(tool_result, "exit_reason", None),
             }),
             error=None,
         )

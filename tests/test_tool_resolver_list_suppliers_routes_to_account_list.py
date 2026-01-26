@@ -80,5 +80,5 @@ def test_list_suppliers_routes_to_list_my_suppliers() -> None:
         payload = json.loads(result.response_text)
         assert result.tool_calls == 1
         assert result.llm_calls == []
+        assert result.tool_names == ["list_my_suppliers"]
         assert [s["name"] for s in payload["suppliers"]] == ["Cheong Hing Company"]
-
