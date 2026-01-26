@@ -14,9 +14,6 @@ from sqlalchemy.orm import Session
 
 from app.ai.tools import Tool
 from app.db.models.file_processing_staging import FileProcessingStaging
-from app.db.models.restaurant_suppliers import RestaurantSuppliers
-from app.db.models.supplier_item_products import SupplierItemProducts
-from app.db.models.suppliers import normalize_supplier_name
 from app.workers.celery_types import CeleryApplyAsync
 
 from .base import has_restaurant_access
@@ -560,6 +557,9 @@ def create_file_processing_tools(
         if not staging:
             return "Error: File processing record not found."
 
+        if not staging.restaurant_id:
+            return "Error: This record is missing restaurant_id."
+
         # Allow both owners and staff to confirm - attribution is tracked via authorized_by_user_id
         if not has_restaurant_access(db, user_id, staging.restaurant_id):
             return "Error: You don't have access to this restaurant."
@@ -567,438 +567,48 @@ def create_file_processing_tools(
         if staging.status != "pending_review":
             return f"Error: This record is already {staging.status}. Cannot confirm."
 
-        # Write to final tables based on processing type
-        import datetime as dt
-
-        extracted_data = staging.extracted_data_json
-        processing_type = staging.processing_type
-
-        # Helper function to parse dates
-        def parse_date(date_str: str | None) -> dt.datetime | None:
-            if not date_str:
-                return None
-            try:
-                # Try ISO format first
-                date_str_clean = date_str.replace("Z", "+00:00")
-                return dt.datetime.fromisoformat(date_str_clean)
-            except (ValueError, AttributeError):
-                # Try simple date formats
-                try:
-                    # Try YYYY-MM-DD format
-                    if len(date_str) >= 10:
-                        date_part = date_str[:10]
-                        return dt.datetime.strptime(date_part, "%Y-%m-%d").replace(
-                            tzinfo=dt.UTC
-                        )
-                except ValueError:
-                    pass
-                return None
-
         try:
+            from app.db.queries.file_processing_confirm import (
+                FileProcessingConfirmError,
+                confirm_file_processing_staging,
+            )
+
+            result = confirm_file_processing_staging(
+                db=db,
+                staging=staging,
+                owner_user_id=staging.user_id,
+                authorized_by_user_id=user_id,
+            )
+            processing_type = result.get("processing_type")
+            summary = result.get("summary") or {}
+
             if processing_type == "invoice":
-                from app.db.models.documents import Documents
-                from app.db.models.invoices import Invoices
-                from app.db.models.invoice_line_items import InvoiceLineItems
-                from app.db.models.suppliers import Suppliers
-
-                # Get document (should already exist from processing task)
-                document = None
-                if staging.document_id:
-                    document = db.get(Documents, staging.document_id)
-
-                if not document:
-                    return "Error: Document record not found. The file processing may not have completed correctly."
-
-                # Find or create supplier by name
-                supplier_name = extracted_data.get("supplier_name", "").strip()
-                if not supplier_name and staging.supplier_id:
-                    existing_supplier = db.get(Suppliers, staging.supplier_id)
-                    if existing_supplier:
-                        supplier_name = existing_supplier.name
-                if not supplier_name:
-                    return "Error: Supplier name is required for invoice processing."
-
-                supplier = db.get(Suppliers, staging.supplier_id) if staging.supplier_id else None
-                if not supplier:
-                    normalized = normalize_supplier_name(supplier_name)
-                    supplier = db.scalar(
-                        select(Suppliers).where(
-                            Suppliers.user_id == user_id,
-                            Suppliers.name_normalized == normalized,
-                            Suppliers.is_active,
-                        )
-                    )
-
-                if not supplier:
-                    supplier = Suppliers(
-                        user_id=user_id,
-                        name=supplier_name,
-                        name_normalized=normalize_supplier_name(supplier_name),
-                        currency=extracted_data.get("currency", "USD"),
-                        is_active=True,
-                    )
-                    db.add(supplier)
-                    db.flush()
-                elif not supplier.name_normalized:
-                    supplier.name_normalized = normalize_supplier_name(supplier_name)
-
-                link = db.scalar(
-                    select(RestaurantSuppliers).where(
-                        RestaurantSuppliers.restaurant_id == staging.restaurant_id,
-                        RestaurantSuppliers.supplier_id == supplier.id,
-                    )
+                return (
+                    "Confirmed! "
+                    f"Invoice created: {summary.get('invoice_number')}, "
+                    f"{summary.get('line_items_created')} line items, "
+                    f"Total: {summary.get('total')} {summary.get('currency')}"
                 )
-                if not link:
-                    link = RestaurantSuppliers(
-                        restaurant_id=staging.restaurant_id,
-                        supplier_id=supplier.id,
-                        status="active",
-                        default_currency=extracted_data.get("currency", "USD"),
-                    )
-                    db.add(link)
-                elif extracted_data.get("currency") and not link.default_currency:
-                    link.default_currency = extracted_data.get("currency")
-
-                supplier_id = supplier.id
-
-                # Update document with supplier_id
-                document.supplier_id = supplier_id
-
-                invoice_date = parse_date(
-                    extracted_data.get("invoice_date")
-                ) or dt.datetime.now(dt.UTC)
-                due_date = parse_date(extracted_data.get("due_date"))
-
-                # Create invoice
-                invoice = Invoices(
-                    restaurant_id=staging.restaurant_id,
-                    supplier_id=supplier_id,
-                    invoice_number=extracted_data.get("invoice_number", ""),
-                    invoice_date=invoice_date,
-                    due_date=due_date,
-                    currency=extracted_data.get("currency", "USD"),
-                    subtotal=float(extracted_data.get("subtotal", 0)),
-                    tax=float(extracted_data.get("tax", 0)),
-                    total=float(extracted_data.get("total", 0)),
-                    document_id=document.id,
-                    status="received",
-                    authorized_by_user_id=user_id,
+            if processing_type == "price_list":
+                return (
+                    "Confirmed! "
+                    f"Price list saved: {summary.get('prices_created')} prices "
+                    f"({summary.get('items_created')} new items, {summary.get('items_updated')} updated)"
                 )
-                db.add(invoice)
-                db.flush()
-
-                # Create line items
-                for item in extracted_data.get("line_items", []):
-                    line_item = InvoiceLineItems(
-                        invoice_id=invoice.id,
-                        supplier_id=supplier_id,
-                        description_raw=item.get(
-                            "description_raw", item.get("description", "")
-                        ),
-                        quantity=float(item.get("quantity", 0)),
-                        unit=item.get("unit", ""),
-                        unit_price=float(item.get("unit_price", 0)),
-                        line_total=float(item.get("line_total", 0)),
-                        currency=extracted_data.get("currency", "USD"),
-                        tax_amount=float(item.get("tax_amount", 0)),
+            if processing_type == "inventory":
+                suffix = ""
+                if summary.get("skipped_no_product"):
+                    suffix = (
+                        f", {summary.get('skipped_no_product')} items skipped (no matching product)"
                     )
-                    db.add(line_item)
-
-                summary = f"Invoice created: {invoice.invoice_number}, {len(extracted_data.get('line_items', []))} line items, Total: {invoice.total} {invoice.currency}"
-
-            elif processing_type == "price_list":
-                from app.db.models.documents import Documents
-                from app.db.models.suppliers import Suppliers
-                from app.db.models.supplier_items import SupplierItems
-                from app.db.models.supplier_prices import SupplierPrices
-
-                # Get document (should already exist from processing task)
-                document = None
-                if staging.document_id:
-                    document = db.get(Documents, staging.document_id)
-
-                if not document:
-                    return "Error: Document record not found. The file processing may not have completed correctly."
-
-                # Find or create supplier by name
-                supplier_name = extracted_data.get("supplier_name", "").strip()
-                if not supplier_name and staging.supplier_id:
-                    existing_supplier = db.get(Suppliers, staging.supplier_id)
-                    if existing_supplier:
-                        supplier_name = existing_supplier.name
-                if not supplier_name:
-                    return "Error: Supplier name is required for price list processing."
-
-                supplier = db.get(Suppliers, staging.supplier_id) if staging.supplier_id else None
-                if not supplier:
-                    normalized = normalize_supplier_name(supplier_name)
-                    supplier = db.scalar(
-                        select(Suppliers).where(
-                            Suppliers.user_id == user_id,
-                            Suppliers.name_normalized == normalized,
-                            Suppliers.is_active,
-                        )
-                    )
-
-                if not supplier:
-                    supplier = Suppliers(
-                        user_id=user_id,
-                        name=supplier_name,
-                        name_normalized=normalize_supplier_name(supplier_name),
-                        contact_name=extracted_data.get("contact_name"),
-                        contact_email=extracted_data.get("contact_email"),
-                        contact_phone=extracted_data.get("contact_phone"),
-                        currency=extracted_data.get("currency", "USD"),
-                        is_active=True,
-                    )
-                    db.add(supplier)
-                    db.flush()
-                else:
-                    if not supplier.name_normalized:
-                        supplier.name_normalized = normalize_supplier_name(supplier_name)
-                    if extracted_data.get("contact_name") and not supplier.contact_name:
-                        supplier.contact_name = extracted_data.get("contact_name")
-                    if (
-                        extracted_data.get("contact_email")
-                        and not supplier.contact_email
-                    ):
-                        supplier.contact_email = extracted_data.get("contact_email")
-                    if (
-                        extracted_data.get("contact_phone")
-                        and not supplier.contact_phone
-                    ):
-                        supplier.contact_phone = extracted_data.get("contact_phone")
-                    if extracted_data.get("currency") and not supplier.currency:
-                        supplier.currency = extracted_data.get("currency")
-
-                link = db.scalar(
-                    select(RestaurantSuppliers).where(
-                        RestaurantSuppliers.restaurant_id == staging.restaurant_id,
-                        RestaurantSuppliers.supplier_id == supplier.id,
-                    )
+                return (
+                    f"Confirmed! Inventory saved: {summary.get('batches_created')} batches created{suffix}"
                 )
-                if not link:
-                    link = RestaurantSuppliers(
-                        restaurant_id=staging.restaurant_id,
-                        supplier_id=supplier.id,
-                        status="active",
-                        default_currency=extracted_data.get("currency", "USD"),
-                    )
-                    db.add(link)
-                elif extracted_data.get("currency") and not link.default_currency:
-                    link.default_currency = extracted_data.get("currency")
 
-                supplier_id = supplier.id
-
-                # Update document with supplier_id
-                document.supplier_id = supplier_id
-
-                # Parse effective date
-                effective_date = parse_date(
-                    extracted_data.get("effective_date")
-                ) or dt.datetime.now(dt.UTC)
-
-                # Create supplier items and prices
-                items_created = 0
-                prices_created = 0
-
-                for item_data in extracted_data.get("items", []):
-                    supplier_name_raw = item_data.get(
-                        "supplier_name_raw", item_data.get("name", "")
-                    )
-                    if not supplier_name_raw:
-                        continue
-
-                    # Check if item already exists (de-duplicate by supplier_name_raw + supplier_id)
-                    existing_item = db.scalar(
-                        select(SupplierItems).where(
-                            SupplierItems.supplier_id == supplier_id,
-                            SupplierItems.supplier_name_raw.ilike(supplier_name_raw),
-                            SupplierItems.status == "active",
-                        )
-                    )
-
-                    if existing_item:
-                        supplier_item = existing_item
-                    else:
-                        # Create new supplier item WITHOUT product_id
-                        # We store raw names and search when user asks "who has item X?"
-                        supplier_item = SupplierItems(
-                            supplier_id=supplier_id,
-                            product_id=None,  # No product matching - store raw names only
-                            supplier_sku=item_data.get("supplier_sku"),
-                            supplier_name_raw=supplier_name_raw,
-                            pack_size_text=item_data.get("pack_size_text"),
-                            unit_basis=item_data.get("unit_basis"),
-                            min_order_qty=float(item_data.get("min_order_qty", 0))
-                            if item_data.get("min_order_qty") is not None
-                            else None,
-                            status="active",
-                            source_document_id=document.id,
-                        )
-                        db.add(supplier_item)
-                        db.flush()
-                        items_created += 1
-
-                    product_id_value = item_data.get("product_id")
-                    if product_id_value:
-                        try:
-                            product_uuid = uuid.UUID(str(product_id_value))
-                        except ValueError:
-                            product_uuid = None
-                        if product_uuid:
-                            link = db.scalar(
-                                select(SupplierItemProducts).where(
-                                    SupplierItemProducts.supplier_item_id == supplier_item.id,
-                                    SupplierItemProducts.restaurant_id == staging.restaurant_id,
-                                )
-                            )
-                            if link:
-                                link.product_id = product_uuid
-                            else:
-                                link = SupplierItemProducts(
-                                    supplier_item_id=supplier_item.id,
-                                    restaurant_id=staging.restaurant_id,
-                                    product_id=product_uuid,
-                                )
-                                db.add(link)
-
-                    # Create price entry
-                    valid_from = (
-                        parse_date(item_data.get("valid_from")) or effective_date
-                    )
-                    valid_to = parse_date(item_data.get("valid_to"))
-
-                    price = SupplierPrices(
-                        supplier_item_id=supplier_item.id,
-                        price=float(item_data.get("price", 0)),
-                        currency=item_data.get(
-                            "currency", extracted_data.get("currency", "USD")
-                        ),
-                        price_type=item_data.get("price_type", "standard"),
-                        valid_from=valid_from,
-                        valid_to=valid_to,
-                        min_qty=float(item_data.get("min_qty", 0))
-                        if item_data.get("min_qty") is not None
-                        else None,
-                        source_document_id=document.id,
-                    )
-                    db.add(price)
-                    prices_created += 1
-
-                summary = f"Price list confirmed: {items_created} items, {prices_created} prices for {supplier_name}"
-
-            elif processing_type == "inventory":
-                from app.db.models.inventory_batches import InventoryBatches
-                from app.db.models.products import Products
-                from app.db.models.suppliers import Suppliers
-
-                # For inventory, we need product_id - user will need to match products
-                # For now, we'll create batches but they need product_id
-                # TODO: Consider making product_id optional or handling unmatched items differently
-
-                batches_created = 0
-                skipped_no_product = 0
-
-                for item_data in extracted_data.get("items", []):
-                    product_name = item_data.get("product_name", "").strip()
-                    if not product_name:
-                        continue
-
-                    # Try to find product by name
-                    product = db.scalar(
-                        select(Products).where(
-                            Products.restaurant_id == staging.restaurant_id,
-                            (
-                                Products.name_en.ilike(product_name)
-                                | Products.name_local.ilike(product_name)
-                            ),
-                            Products.is_active,
-                        )
-                    )
-
-                    if not product:
-                        skipped_no_product += 1
-                        continue  # Skip items without matching product
-
-                    # Find or use default supplier (inventory may not have supplier info)
-                    supplier_id = None
-                    if item_data.get("supplier_id"):
-                        supplier_id = uuid.UUID(item_data.get("supplier_id"))
-                    elif staging.supplier_id:
-                        supplier_id = staging.supplier_id
-                    else:
-                        # Try to find supplier by name if provided
-                        supplier_name = extracted_data.get("supplier_name")
-                        if supplier_name:
-                            normalized = normalize_supplier_name(supplier_name)
-                            supplier = db.scalar(
-                                select(Suppliers).where(
-                                    Suppliers.user_id == user_id,
-                                    Suppliers.name_normalized == normalized,
-                                    Suppliers.is_active,
-                                )
-                            )
-                            if supplier:
-                                link = db.scalar(
-                                    select(RestaurantSuppliers).where(
-                                        RestaurantSuppliers.restaurant_id == staging.restaurant_id,
-                                        RestaurantSuppliers.supplier_id == supplier.id,
-                                    )
-                                )
-                                if not link:
-                                    link = RestaurantSuppliers(
-                                        restaurant_id=staging.restaurant_id,
-                                        supplier_id=supplier.id,
-                                        status="active",
-                                    )
-                                    db.add(link)
-                                supplier_id = supplier.id
-
-                    if not supplier_id:
-                        skipped_no_product += 1
-                        continue  # Need supplier for inventory batch
-
-                    received_date = parse_date(
-                        item_data.get("received_date")
-                    ) or dt.datetime.now(dt.UTC)
-                    expiry_date = parse_date(item_data.get("expiry_date"))
-
-                    batch = InventoryBatches(
-                        restaurant_id=staging.restaurant_id,
-                        product_id=product.id,
-                        supplier_id=supplier_id,
-                        quantity=float(item_data.get("quantity", 0)),
-                        unit=item_data.get("unit", ""),
-                        unit_cost=float(item_data.get("unit_cost", 0))
-                        if item_data.get("unit_cost") is not None
-                        else 0.0,
-                        received_date=received_date,
-                        expiry_date=expiry_date,
-                        status=item_data.get("status", "available"),
-                    )
-                    db.add(batch)
-                    batches_created += 1
-
-                summary = f"Inventory confirmed: {batches_created} batches created"
-                if skipped_no_product > 0:
-                    summary += (
-                        f", {skipped_no_product} items skipped (no matching product)"
-                    )
-
-            else:
-                return f"Error: Unknown processing type: {processing_type}"
-
-            # Update staging record
-            staging.status = "confirmed"
-            staging.authorized_by_user_id = user_id
-            staging.confirmed_at = dt.datetime.now(dt.UTC)
-            db.commit()
-
-            return f"Confirmed! {summary}"
-
+            return "Confirmed!"
+        except FileProcessingConfirmError as e:
+            return f"Error: {str(e)}"
         except Exception as e:
-            db.rollback()
             logger.exception("confirm_file_processing_failed")
             return f"Error confirming file processing: {str(e)}"
 

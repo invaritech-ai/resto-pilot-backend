@@ -10,6 +10,7 @@ from typing import Any, cast
 
 from fastapi import (
     APIRouter,
+    Body,
     Depends,
     File,
     Form,
@@ -25,6 +26,11 @@ from app.core.config import Settings
 from app.db.models.file_processing_page_jobs import FileProcessingPageJobs
 from app.db.models.file_processing_runs import FileProcessingRuns
 from app.db.models.file_processing_staging import FileProcessingStaging
+from app.db.models.suppliers import Suppliers
+from app.db.queries.file_processing_confirm import (
+    FileProcessingConfirmError,
+    confirm_file_processing_staging,
+)
 from app.db.queries.file_processing import (
     get_processing_result,
     get_processing_status,
@@ -117,6 +123,21 @@ async def upload_file(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="restaurant_id is required for invoice and inventory processing",
         )
+
+    if supplier_uuid:
+        supplier = db.get(Suppliers, supplier_uuid)
+        if not supplier:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Supplier not found",
+            )
+        if supplier.user_id is None:
+            supplier.user_id = user_uuid
+        elif supplier.user_id != user_uuid:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Supplier does not belong to this user",
+            )
 
     # Create processing run
     file_id = f"api_{uuid.uuid4().hex[:12]}"
@@ -329,7 +350,7 @@ async def get_extracted_data(
 @router.post("/files/{staging_id}/confirm")
 async def confirm_file_processing(
     staging_id: str,
-    edits: dict[str, Any] | None = None,
+    payload: dict[str, Any] | None = Body(default=None),
     db: Session = Depends(get_db_dep),
 ) -> dict[str, Any]:
     """
@@ -372,30 +393,52 @@ async def confirm_file_processing(
             detail="Staging record not found",
         )
 
-    # Apply edits if provided
+    edits: dict[str, Any] | None = None
+    authorized_by_user_id: uuid.UUID = staging.user_id
+    if payload:
+        body_edits = payload.get("edits")
+        if isinstance(body_edits, dict):
+            edits = cast(dict[str, Any], body_edits)
+        elif isinstance(payload, dict):
+            edits = payload
+
+        auth_value = payload.get("authorized_by_user_id") or payload.get("user_id")
+        if auth_value:
+            try:
+                authorized_by_user_id = uuid.UUID(str(auth_value))
+            except ValueError as e:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid authorized_by_user_id format: {e}",
+                ) from e
+
     if edits:
-        # Update staging.extracted_data_json with edits
-        # This is a simplified version - full implementation would need
-        # proper field path parsing and validation
-        for field_path, new_value in edits.items():
-            # Simple field update (not handling nested paths yet)
-            if field_path in staging.extracted_data_json:
-                staging.extracted_data_json[field_path] = new_value
+        if not isinstance(staging.extracted_data_json, dict):
+            staging.extracted_data_json = {}
+        for key, value in edits.items():
+            if key in {"edits", "authorized_by_user_id", "user_id"}:
+                continue
+            staging.extracted_data_json[key] = value
 
-        db.commit()
-
-    # Call existing confirmation logic
-    # This would need to be implemented based on your existing confirmation flow
-    # For now, just mark as confirmed
-    staging.status = "confirmed"
-    db.commit()
+    try:
+        result = confirm_file_processing_staging(
+            db=db,
+            staging=staging,
+            owner_user_id=staging.user_id,
+            authorized_by_user_id=authorized_by_user_id,
+        )
+    except FileProcessingConfirmError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        ) from e
 
     logger.info("api_file_confirmed staging_id=%s", staging_id)
-
     return {
         "status": "confirmed",
         "staging_id": str(staging.id),
-        "message": "Data confirmed and saved to final tables",
+        "processing_type": result.get("processing_type"),
+        **cast(dict[str, Any], result.get("summary") or {}),
     }
 
 

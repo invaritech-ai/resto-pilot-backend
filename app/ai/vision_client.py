@@ -16,7 +16,6 @@ from app.ai.openai_client import (
     _apply_reasoning_policy,
     _is_retryable_exception,
     _is_retryable_status,
-    _should_control_reasoning,
 )
 from app.core.config import Settings
 
@@ -1300,8 +1299,9 @@ def _extract_structured_from_text(
             "temperature": 0.2,
         }
 
-        # Prefer disabling reasoning for fast/cheap extraction. Some providers may
-        # reject this, so fall back to low-effort reasoning on 4xx errors.
+        # Keep extraction fast/cheap by applying low-effort reasoning controls on
+        # providers that support it (e.g. OpenRouter). Avoid "enabled": false, as
+        # some models reject it.
         def _post_once(local_payload: dict[str, Any]) -> httpx.Response:
             timeout = httpx.Timeout(
                 connect=10.0,
@@ -1311,23 +1311,9 @@ def _extract_structured_from_text(
             )
             return httpx.post(url, headers=headers, json=local_payload, timeout=timeout)
 
-        should_control_reasoning = _should_control_reasoning(base_url)
-        if should_control_reasoning:
-            payload["reasoning"] = {"enabled": False}
-
+        _apply_reasoning_policy(payload, settings, base_url)
         resp = _post_once(payload)
-        try:
-            resp.raise_for_status()
-        except httpx.HTTPStatusError:
-            if should_control_reasoning:
-                # Retry once with low-effort reasoning (OpenRouter default policy) if the
-                # upstream rejects "enabled": false.
-                payload.pop("reasoning", None)
-                _apply_reasoning_policy(payload, settings, base_url)
-                resp = _post_once(payload)
-                resp.raise_for_status()
-            else:
-                raise
+        resp.raise_for_status()
         response = resp.json()
         end_time = time.time()
         latency_ms = int((end_time - start_time) * 1000)
