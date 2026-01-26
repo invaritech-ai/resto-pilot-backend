@@ -72,6 +72,7 @@ def create_supplier_tools(
             .where(
                 RestaurantSuppliers.restaurant_id == restaurant_id,
                 RestaurantSuppliers.status == "active",
+                Suppliers.user_id == user_id,
                 Suppliers.is_active == True,
             )
             .order_by(Suppliers.name.asc())
@@ -140,12 +141,14 @@ def create_supplier_tools(
                 normalized = normalize_supplier_name(name)
                 supplier = db.scalar(
                     select(Suppliers).where(
+                        Suppliers.user_id == user_id,
                         Suppliers.name_normalized == normalized,
                         Suppliers.is_active == True,
                     )
                 )
                 if not supplier:
                     supplier = Suppliers(
+                        user_id=user_id,
                         name=name,
                         name_normalized=normalized,
                         language=pending_language,

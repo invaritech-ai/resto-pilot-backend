@@ -623,6 +623,7 @@ def create_file_processing_tools(
                     normalized = normalize_supplier_name(supplier_name)
                     supplier = db.scalar(
                         select(Suppliers).where(
+                            Suppliers.user_id == user_id,
                             Suppliers.name_normalized == normalized,
                             Suppliers.is_active,
                         )
@@ -630,6 +631,7 @@ def create_file_processing_tools(
 
                 if not supplier:
                     supplier = Suppliers(
+                        user_id=user_id,
                         name=supplier_name,
                         name_normalized=normalize_supplier_name(supplier_name),
                         currency=extracted_data.get("currency", "USD"),
@@ -732,6 +734,7 @@ def create_file_processing_tools(
                     normalized = normalize_supplier_name(supplier_name)
                     supplier = db.scalar(
                         select(Suppliers).where(
+                            Suppliers.user_id == user_id,
                             Suppliers.name_normalized == normalized,
                             Suppliers.is_active,
                         )
@@ -739,6 +742,7 @@ def create_file_processing_tools(
 
                 if not supplier:
                     supplier = Suppliers(
+                        user_id=user_id,
                         name=supplier_name,
                         name_normalized=normalize_supplier_name(supplier_name),
                         contact_name=extracted_data.get("contact_name"),
@@ -930,6 +934,7 @@ def create_file_processing_tools(
                             normalized = normalize_supplier_name(supplier_name)
                             supplier = db.scalar(
                                 select(Suppliers).where(
+                                    Suppliers.user_id == user_id,
                                     Suppliers.name_normalized == normalized,
                                     Suppliers.is_active,
                                 )

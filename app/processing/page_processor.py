@@ -72,6 +72,7 @@ def ocr_page_with_retries(
     page_num: int,
     total_pages: int,
     settings: Settings,
+    mime_type: str | None = None,
     max_attempts: int = 3,
     base_delay_seconds: float = 1.0,
 ) -> tuple[VisionCallResult, int]:
@@ -83,6 +84,7 @@ def ocr_page_with_retries(
                 page_num=page_num,
                 total_pages=total_pages,
                 settings=settings,
+                mime_type=mime_type,
             )
             return result, attempt
         except Exception as exc:
@@ -311,6 +313,7 @@ def process_pdf_page_by_page(
             page_num=page_num,
             total_pages=total_pages,
             settings=settings,
+            mime_type="image/png",
         )
         telemetry_results.append(ocr_result)
 
@@ -449,6 +452,7 @@ def process_image_file(
         page_num=1,
         total_pages=1,
         settings=settings,
+        mime_type=mime_type,
     )
     telemetry_results.append(ocr_result)
 

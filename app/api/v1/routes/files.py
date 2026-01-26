@@ -50,7 +50,7 @@ MAX_FILE_SIZE = 20 * 1024 * 1024
 @router.post("/files/upload")
 async def upload_file(
     file: UploadFile = File(...),
-    restaurant_id: str = Form(...),
+    restaurant_id: str | None = Form(None),
     user_id: str = Form(...),
     processing_type: str = Form(...),
     supplier_id: str | None = Form(None),
@@ -103,13 +103,19 @@ async def upload_file(
 
     # Validate UUIDs
     try:
-        restaurant_uuid = uuid.UUID(restaurant_id)
+        restaurant_uuid = uuid.UUID(restaurant_id) if restaurant_id else None
         user_uuid = uuid.UUID(user_id)
         supplier_uuid = uuid.UUID(supplier_id) if supplier_id else None
     except ValueError as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Invalid UUID format: {e}",
+        )
+
+    if processing_type in {"invoice", "inventory"} and restaurant_uuid is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="restaurant_id is required for invoice and inventory processing",
         )
 
     # Create processing run
@@ -312,6 +318,9 @@ async def get_extracted_data(
         "staging_id": str(staging.id),
         "status": staging.status,
         "processing_type": staging.processing_type,
+        "run_id": str(staging.run_id) if staging.run_id else None,
+        "restaurant_id": str(staging.restaurant_id) if staging.restaurant_id else None,
+        "supplier_id": str(staging.supplier_id) if staging.supplier_id else None,
         "extracted_data": staging.extracted_data_json,
         "created_at": staging.created_at.isoformat() if staging.created_at else None,
     }

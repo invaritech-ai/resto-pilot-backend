@@ -1,4 +1,4 @@
-from app.api.v1.routes import auth, files, restaurants, telegram, users
+from app.api.v1.routes import auth, files, restaurants, suppliers, telegram, users
 
 
-__all__ = ["auth", "files", "restaurants", "telegram", "users"]
+__all__ = ["auth", "files", "restaurants", "suppliers", "telegram", "users"]

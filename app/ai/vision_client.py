@@ -16,6 +16,7 @@ from app.ai.openai_client import (
     _apply_reasoning_policy,
     _is_retryable_exception,
     _is_retryable_status,
+    _should_control_reasoning,
 )
 from app.core.config import Settings
 
@@ -173,10 +174,29 @@ def _merge_structured_results(results: list[dict[str, Any]]) -> dict[str, Any]:
             if not isinstance(item, dict):
                 continue
             name = item.get("supplier_name_raw", item.get("name", ""))
+            sku = item.get("supplier_sku", "")
             pack_size = item.get("pack_size_text", "")
             unit_basis = item.get("unit_basis", "")
             min_order_qty = item.get("min_order_qty")
-            dedup_key = (name, pack_size, unit_basis, min_order_qty)
+            price = item.get("price")
+            currency = item.get("currency", "")
+            price_type = item.get("price_type", "")
+            min_qty = item.get("min_qty")
+            valid_from = item.get("valid_from")
+            valid_to = item.get("valid_to")
+            dedup_key = (
+                name,
+                sku,
+                pack_size,
+                unit_basis,
+                min_order_qty,
+                price,
+                currency,
+                price_type,
+                min_qty,
+                valid_from,
+                valid_to,
+            )
             if dedup_key not in seen:
                 seen.add(dedup_key)
                 deduplicated.append(item)
@@ -233,12 +253,32 @@ def _get_vision_settings(settings: Settings) -> tuple[str, str, str]:
     return model, api_key, base_url
 
 
+def _get_text_settings(settings: Settings) -> tuple[str, str, str]:
+    """
+    Get text model settings for extraction (cheaper than vision).
+
+    Uses APP_OPENAI_* config (model, api_key, base_url). Model defaults to
+    openai_response_model (if set) to keep extraction fast/cheap.
+    """
+    model = (settings.openai_response_model or settings.openai_model).strip()
+    api_key = settings.openai_api_key
+    base_url = settings.openai_base_url
+
+    if not api_key:
+        raise OpenAIError(
+            "OpenAI API key is not configured (APP_OPENAI_API_KEY)"
+        )
+
+    return model, api_key, base_url
+
+
 def ocr_page_to_markdown(
     *,
     page_image_bytes: bytes,
     page_num: int,
     total_pages: int,
     settings: Settings,
+    mime_type: str | None = None,
 ) -> VisionCallResult:
     """
     OCR a single page and return Markdown output.
@@ -264,7 +304,9 @@ def ocr_page_to_markdown(
         "Use headings (##, ###) for section titles. "
         "Return ONLY Markdown - no commentary."
     )
-    return process_image_with_vision(page_image_bytes, prompt, settings, "image/png")
+    return process_image_with_vision(
+        page_image_bytes, prompt, settings, mime_type or "image/png"
+    )
 
 
 def extract_json_from_markdown(
@@ -378,11 +420,14 @@ Rules:
 1. Use null for missing fields; do not guess.
 2. Use the exact field names shown above.
 3. supplier_name_raw must be the full item description including specs like origin, brand, or pack size.
-4. price and min_order_qty must be numbers, not strings.
-5. If item currency is missing, use the top-level currency.
-6. If price_type is missing, use "standard".
-7. For each item, set source_page={page_num} and include row_index/raw_row when possible.
-8. If the page has no relevant data, return {{"items": []}}.
+4. ONLY include an item if there is a clear numeric price on the page. If the page is a cover, delivery schedule/terms, contact info, or a product photo page without explicit prices, return {{"items": []}}.
+5. Skip rows with missing price or "N/A" (do not output a price of 0).
+6. price and min_order_qty/min_qty must be numbers (no currency symbols, no commas).
+7. If item currency is missing, use the top-level currency.
+8. If price_type is missing, use "standard".
+9. If the page has a "code" column, map it to supplier_sku. If it has "packing", map it to pack_size_text. If it has a "unit" column: kg→unit_basis="kg"; pack→"pack"; jar/bottle/pc→"piece".
+10. For each item, set source_page={page_num} and include row_index/raw_row when possible.
+11. If the page has no relevant data, return {{"items": []}}.
 
 Page content (Markdown):
 {markdown_text}
@@ -1232,7 +1277,7 @@ def _extract_structured_from_text(
     )
     user_prompt = f"{prompt}\n\nExtracted text:\n{extracted_text}"
 
-    model, api_key, base_url = _get_vision_settings(settings)
+    model, api_key, base_url = _get_text_settings(settings)
     start_time = time.time()
     payload: dict[str, Any] | None = None
     try:
@@ -1254,16 +1299,35 @@ def _extract_structured_from_text(
             ],
             "temperature": 0.2,
         }
-        _apply_reasoning_policy(payload, settings, base_url)
 
-        timeout = httpx.Timeout(
-            connect=10.0,
-            read=float(settings.openai_timeout_seconds),
-            write=10.0,
-            pool=10.0,
-        )
-        resp = httpx.post(url, headers=headers, json=payload, timeout=timeout)
-        resp.raise_for_status()
+        # Prefer disabling reasoning for fast/cheap extraction. Some providers may
+        # reject this, so fall back to low-effort reasoning on 4xx errors.
+        def _post_once(local_payload: dict[str, Any]) -> httpx.Response:
+            timeout = httpx.Timeout(
+                connect=10.0,
+                read=float(settings.openai_timeout_seconds),
+                write=10.0,
+                pool=10.0,
+            )
+            return httpx.post(url, headers=headers, json=local_payload, timeout=timeout)
+
+        should_control_reasoning = _should_control_reasoning(base_url)
+        if should_control_reasoning:
+            payload["reasoning"] = {"enabled": False}
+
+        resp = _post_once(payload)
+        try:
+            resp.raise_for_status()
+        except httpx.HTTPStatusError:
+            if should_control_reasoning:
+                # Retry once with low-effort reasoning (OpenRouter default policy) if the
+                # upstream rejects "enabled": false.
+                payload.pop("reasoning", None)
+                _apply_reasoning_policy(payload, settings, base_url)
+                resp = _post_once(payload)
+                resp.raise_for_status()
+            else:
+                raise
         response = resp.json()
         end_time = time.time()
         latency_ms = int((end_time - start_time) * 1000)

@@ -4,9 +4,11 @@ import base64
 import datetime as dt
 import json
 import logging
+import time
 import uuid
 from typing import Any
 
+from celery import current_task
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import Session
 
@@ -54,6 +56,7 @@ BROKER_PAYLOAD_MAX_BYTES = 200 * 1024
 PAYLOAD_DB_PREFIX = "db:"
 OCR_MAX_ATTEMPTS = 3
 EXTRACTION_MAX_ATTEMPTS = 2
+PAGE_JOB_STALE_SECONDS = 60 * 20  # Allow reclaiming "processing" jobs after 20 minutes.
 
 
 def _record_vision_telemetry(
@@ -215,9 +218,11 @@ def _resolve_payload_bytes(
 def _ensure_restaurant_supplier_link(
     *,
     db: Session,
-    restaurant_id: uuid.UUID,
+    restaurant_id: uuid.UUID | None,
     supplier_id: uuid.UUID,
 ) -> None:
+    if restaurant_id is None:
+        return
     existing = db.scalar(
         select(RestaurantSuppliers).where(
             RestaurantSuppliers.restaurant_id == restaurant_id,
@@ -239,12 +244,14 @@ def _get_or_create_supplier(
     *,
     db: Session,
     name: str,
-    restaurant_id: uuid.UUID,
+    user_id: uuid.UUID,
+    restaurant_id: uuid.UUID | None,
     defaults: dict[str, Any] | None = None,
 ) -> Suppliers:
     normalized = normalize_supplier_name(name)
     supplier = db.scalar(
         select(Suppliers).where(
+            Suppliers.user_id == user_id,
             Suppliers.name_normalized == normalized,
             Suppliers.is_active == True,
         )
@@ -252,6 +259,7 @@ def _get_or_create_supplier(
     if not supplier:
         values = defaults or {}
         supplier = Suppliers(
+            user_id=user_id,
             name=name,
             name_normalized=normalized,
             is_active=True,
@@ -260,11 +268,7 @@ def _get_or_create_supplier(
         db.add(supplier)
         db.flush()
 
-    _ensure_restaurant_supplier_link(
-        db=db,
-        restaurant_id=restaurant_id,
-        supplier_id=supplier.id,
-    )
+    _ensure_restaurant_supplier_link(db=db, restaurant_id=restaurant_id, supplier_id=supplier.id)
     return supplier
 
 
@@ -1091,7 +1095,8 @@ def process_file_api_task(
         extra={
             "run_id": run_id,
             "mime_type": mime_type,
-            "filename": filename,
+            # Avoid clobbering logging.LogRecord's reserved "filename" attribute.
+            "uploaded_filename": filename,
         },
     )
 
@@ -1160,6 +1165,12 @@ def process_file_api_task(
                 db.flush()
 
             if job.status in {"completed", "failed_ocr", "failed_extraction"}:
+                logger.info(
+                    "page_job_enqueue_skipped_terminal run_id=%s page_index=%s status=%s",
+                    str(run.id),
+                    page_index,
+                    job.status,
+                )
                 continue
 
             payload_ref = _encode_payload_bytes(
@@ -1169,10 +1180,28 @@ def process_file_api_task(
                 page_index=page_index,
             )
             db.commit()
-            process_page_job_task.apply_async(
-                args=[str(run.id), page_index, payload_ref, page_mime_type],
-                task_id=f"{run.id}:{page_index}",
+            task_id = f"{run.id}:{page_index}"
+            payload_kind = "db" if payload_ref.startswith(PAYLOAD_DB_PREFIX) else "inline"
+            logger.info(
+                "page_job_enqueued run_id=%s page_index=%s task_id=%s payload_kind=%s page_mime_type=%s",
+                str(run.id),
+                page_index,
+                task_id,
+                payload_kind,
+                page_mime_type,
             )
+            try:
+                process_page_job_task.apply_async(
+                    args=[str(run.id), page_index, payload_ref, page_mime_type],
+                    task_id=task_id,
+                )
+            except Exception:
+                logger.exception(
+                    "page_job_enqueue_failed run_id=%s page_index=%s task_id=%s",
+                    str(run.id),
+                    page_index,
+                    task_id,
+                )
 
         return {
             "run_id": run_id,
@@ -1241,11 +1270,23 @@ def process_page_job_task(
 ) -> None:
     settings = get_settings()
     run_uuid = _parse_uuid(run_id)
+    total_pages = 0
+    markdown_text = ""
+    page_bytes: bytes | None = None
+    ocr_attempts = 0
+    extraction_attempts = 0
+    processing_type = ""
+    task_uuid = getattr(getattr(current_task, "request", None), "id", None)
 
+    # Session A: do all DB reads and claim the job, then close the session before
+    # calling external OCR/extraction (prevents idle-in-transaction timeouts).
     with worker_db_session() as db:
         run = db.get(FileProcessingRuns, run_uuid)
         if not run:
             raise ValueError(f"FileProcessingRun not found: {run_id}")
+
+        processing_type = run.processing_type
+        total_pages = run.pages_total or 0
 
         job = db.scalar(
             select(FileProcessingPageJobs).where(
@@ -1260,9 +1301,51 @@ def process_page_job_task(
                 status="pending",
             )
             db.add(job)
-            db.commit()
+            db.flush()
 
         if job.status in {"completed", "failed_ocr", "failed_extraction"}:
+            logger.info(
+                "page_job_skipped_terminal run_id=%s page_index=%s task_id=%s status=%s",
+                run_id,
+                page_index,
+                task_uuid,
+                job.status,
+            )
+            db.commit()
+            return
+
+        if job.status == "processing":
+            stale_before = dt.datetime.now(dt.UTC) - dt.timedelta(seconds=PAGE_JOB_STALE_SECONDS)
+            reclaimed = db.execute(
+                update(FileProcessingPageJobs)
+                .where(
+                    FileProcessingPageJobs.id == job.id,
+                    FileProcessingPageJobs.status == "processing",
+                    FileProcessingPageJobs.updated_at < stale_before,
+                )
+                .values(status="pending", error_message=None)
+            )
+            if reclaimed.rowcount == 1:
+                logger.warning(
+                    "page_job_reclaimed_stale run_id=%s page_index=%s task_id=%s stale_seconds=%s",
+                    run_id,
+                    page_index,
+                    task_uuid,
+                    PAGE_JOB_STALE_SECONDS,
+                )
+                db.commit()
+                job.status = "pending"
+
+        if job.status != "pending":
+            # Another worker is processing it.
+            logger.info(
+                "page_job_skipped_not_pending run_id=%s page_index=%s task_id=%s status=%s",
+                run_id,
+                page_index,
+                task_uuid,
+                job.status,
+            )
+            db.commit()
             return
 
         updated = db.execute(
@@ -1277,13 +1360,18 @@ def process_page_job_task(
             db.rollback()
             return
 
-        run.current_stage = f"page_{page_index}_processing"
+        run.current_stage = f"page_{page_index}_ocr"
+        logger.info(
+            "page_job_claimed run_id=%s page_index=%s task_id=%s processing_type=%s mime_type=%s pages_total=%s",
+            run_id,
+            page_index,
+            task_uuid,
+            processing_type,
+            mime_type,
+            total_pages,
+        )
         db.commit()
 
-        total_pages = run.pages_total or 0
-
-        ocr_attempts = 0
-        markdown_text = ""
         ocr_step = db.scalar(
             select(FileProcessingSteps).where(
                 FileProcessingSteps.run_id == run_uuid,
@@ -1295,28 +1383,62 @@ def process_page_job_task(
         if ocr_step and ocr_step.output_text:
             markdown_text = ocr_step.output_text
         else:
-            try:
-                page_bytes = _resolve_payload_bytes(db=db, payload_ref=page_payload)
-                ocr_result, ocr_attempts = ocr_page_with_retries(
-                    page_image_bytes=page_bytes,
-                    page_num=page_index,
-                    total_pages=total_pages or page_index,
-                    settings=settings,
-                    max_attempts=OCR_MAX_ATTEMPTS,
+            # If OCR is missing, we need the page bytes. Fetch them now and then close the DB session.
+            save_page_snapshot(
+                run_id=run_uuid,
+                page_index=page_index,
+                stage="ocr",
+                output_text="",
+                status="started",
+                db=db,
+            )
+            page_bytes = _resolve_payload_bytes(db=db, payload_ref=page_payload)
+
+    # OCR (no DB session held open)
+    if not markdown_text:
+        try:
+            if page_bytes is None:
+                # Shouldn't happen, but keep a defensive fallback.
+                with worker_db_session() as db:
+                    page_bytes = _resolve_payload_bytes(db=db, payload_ref=page_payload)
+            logger.info(
+                "page_job_ocr_start run_id=%s page_index=%s task_id=%s",
+                run_id,
+                page_index,
+                task_uuid,
+            )
+            ocr_start = time.time()
+            ocr_result, ocr_attempts = ocr_page_with_retries(
+                page_image_bytes=page_bytes,
+                page_num=page_index,
+                total_pages=total_pages or page_index,
+                settings=settings,
+                mime_type=mime_type,
+                max_attempts=OCR_MAX_ATTEMPTS,
+            )
+            ocr_latency_ms = int((time.time() - ocr_start) * 1000)
+            markdown_text = ocr_result.content or ""
+            logger.info(
+                "page_job_ocr_done run_id=%s page_index=%s task_id=%s attempts=%s latency_ms=%s output_chars=%s",
+                run_id,
+                page_index,
+                task_uuid,
+                ocr_attempts,
+                ocr_latency_ms,
+                len(markdown_text),
+            )
+        except Exception as exc:
+            with worker_db_session() as db:
+                job = db.scalar(
+                    select(FileProcessingPageJobs).where(
+                        FileProcessingPageJobs.run_id == run_uuid,
+                        FileProcessingPageJobs.page_index == page_index,
+                    )
                 )
-                markdown_text = ocr_result.content or ""
-                save_page_snapshot(
-                    run_id=run_uuid,
-                    page_index=page_index,
-                    stage="ocr",
-                    output_text=markdown_text,
-                    status="completed",
-                    db=db,
-                )
-            except Exception as exc:
-                job.status = "failed_ocr"
-                job.error_message = str(exc)
-                job.ocr_retries = max(OCR_MAX_ATTEMPTS - 1, 0)
+                if job:
+                    job.status = "failed_ocr"
+                    job.error_message = str(exc)
+                    job.ocr_retries = max(OCR_MAX_ATTEMPTS - 1, 0)
                 save_page_snapshot(
                     run_id=run_uuid,
                     page_index=page_index,
@@ -1329,49 +1451,101 @@ def process_page_job_task(
                 db.commit()
                 _update_run_progress(db, run_uuid)
                 maybe_finalize_run(run_uuid, db)
-                return
+            return
 
         if not markdown_text:
-            job.status = "failed_ocr"
-            job.error_message = "OCR returned empty content"
-            job.ocr_retries = max(OCR_MAX_ATTEMPTS - 1, 0)
+            with worker_db_session() as db:
+                job = db.scalar(
+                    select(FileProcessingPageJobs).where(
+                        FileProcessingPageJobs.run_id == run_uuid,
+                        FileProcessingPageJobs.page_index == page_index,
+                    )
+                )
+                if job:
+                    job.status = "failed_ocr"
+                    job.error_message = "OCR returned empty content"
+                    job.ocr_retries = max(OCR_MAX_ATTEMPTS - 1, 0)
+                save_page_snapshot(
+                    run_id=run_uuid,
+                    page_index=page_index,
+                    stage="ocr",
+                    output_text="",
+                    status="failed",
+                    error_message="OCR returned empty content",
+                    db=db,
+                )
+                db.commit()
+                _update_run_progress(db, run_uuid)
+                maybe_finalize_run(run_uuid, db)
+            return
+
+        # Session B: persist OCR snapshot in its own short transaction
+        with worker_db_session() as db:
             save_page_snapshot(
                 run_id=run_uuid,
                 page_index=page_index,
                 stage="ocr",
-                output_text="",
-                status="failed",
-                error_message=job.error_message,
-                db=db,
-            )
-            db.commit()
-            _update_run_progress(db, run_uuid)
-            maybe_finalize_run(run_uuid, db)
-            return
-
-        extraction_attempts = 0
-        try:
-            db_schema = get_extraction_schema(run.processing_type)
-            extraction_result, _, extraction_attempts = extract_json_with_retries(
-                markdown_text=markdown_text,
-                page_num=page_index,
-                processing_type=run.processing_type,
-                db_schema=db_schema,
-                settings=settings,
-                max_attempts=EXTRACTION_MAX_ATTEMPTS,
-            )
-            save_page_snapshot(
-                run_id=run_uuid,
-                page_index=page_index,
-                stage="extraction",
-                output_text=extraction_result.content or "{}",
+                output_text=markdown_text,
                 status="completed",
                 db=db,
             )
-        except Exception as exc:
-            job.status = "failed_extraction"
-            job.error_message = str(exc)
-            job.extraction_retries = max(EXTRACTION_MAX_ATTEMPTS - 1, 0)
+
+    # Extraction (no DB session held open)
+    with worker_db_session() as db:
+        run = db.get(FileProcessingRuns, run_uuid)
+        if run:
+            run.current_stage = f"page_{page_index}_extraction"
+        save_page_snapshot(
+            run_id=run_uuid,
+            page_index=page_index,
+            stage="extraction",
+            output_text="",
+            status="started",
+            db=db,
+        )
+        db.commit()
+
+    try:
+        db_schema = get_extraction_schema(processing_type)
+        logger.info(
+            "page_job_extraction_start run_id=%s page_index=%s task_id=%s processing_type=%s",
+            run_id,
+            page_index,
+            task_uuid,
+            processing_type,
+        )
+        extraction_start = time.time()
+        extraction_result, _, extraction_attempts = extract_json_with_retries(
+            markdown_text=markdown_text,
+            page_num=page_index,
+            processing_type=processing_type,
+            db_schema=db_schema,
+            settings=settings,
+            max_attempts=EXTRACTION_MAX_ATTEMPTS,
+        )
+        extraction_latency_ms = int((time.time() - extraction_start) * 1000)
+        extraction_text = extraction_result.content or "{}"
+        logger.info(
+            "page_job_extraction_done run_id=%s page_index=%s task_id=%s attempts=%s latency_ms=%s output_chars=%s",
+            run_id,
+            page_index,
+            task_uuid,
+            extraction_attempts,
+            extraction_latency_ms,
+            len(extraction_text),
+        )
+    except Exception as exc:
+        with worker_db_session() as db:
+            job = db.scalar(
+                select(FileProcessingPageJobs).where(
+                    FileProcessingPageJobs.run_id == run_uuid,
+                    FileProcessingPageJobs.page_index == page_index,
+                )
+            )
+            if job:
+                job.status = "failed_extraction"
+                job.error_message = str(exc)
+                job.extraction_retries = max(EXTRACTION_MAX_ATTEMPTS - 1, 0)
             save_page_snapshot(
                 run_id=run_uuid,
                 page_index=page_index,
@@ -1384,7 +1558,38 @@ def process_page_job_task(
             db.commit()
             _update_run_progress(db, run_uuid)
             maybe_finalize_run(run_uuid, db)
-            return
+        return
+
+    # Session C: persist extraction snapshot + mark job completed in its own short transaction
+    with worker_db_session() as db:
+        run = db.get(FileProcessingRuns, run_uuid)
+        if not run:
+            raise ValueError(f"FileProcessingRun not found: {run_id}")
+
+        job = db.scalar(
+            select(FileProcessingPageJobs).where(
+                FileProcessingPageJobs.run_id == run_uuid,
+                FileProcessingPageJobs.page_index == page_index,
+            )
+        )
+        if not job:
+            # Shouldn't happen, but avoid crashing the worker.
+            job = FileProcessingPageJobs(
+                run_id=run_uuid,
+                page_index=page_index,
+                status="processing",
+            )
+            db.add(job)
+            db.flush()
+
+        save_page_snapshot(
+            run_id=run_uuid,
+            page_index=page_index,
+            stage="extraction",
+            output_text=extraction_text,
+            status="completed",
+            db=db,
+        )
 
         job.status = "completed"
         if ocr_attempts:
@@ -1410,6 +1615,15 @@ def process_page_job_task(
                     pages_total=total,
                 )
 
+        logger.info(
+            "page_job_completed run_id=%s page_index=%s task_id=%s pages_completed=%s pages_total=%s pages_failed=%s",
+            run_id,
+            page_index,
+            task_uuid,
+            counts["completed"],
+            counts["total"],
+            counts["failed"],
+        )
         maybe_finalize_run(run_uuid, db)
 
 
@@ -1502,6 +1716,7 @@ def finalize_run_task(run_id: str) -> None:
                 supplier = _get_or_create_supplier(
                     db=db,
                     name=supplier_name,
+                    user_id=run.user_id,
                     restaurant_id=run.restaurant_id,
                     defaults=defaults,
                 )
