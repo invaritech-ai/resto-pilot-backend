@@ -54,8 +54,8 @@ Try: "list outlets" or "add outlet Little Italy"."""
 HELP_STAFF = """👥 *Staff* lets you list, invite, or remove team members.
 Try: "list staff" or "invite staff to Main"."""
 
-HELP_SUPPLIERS = """📦 *Suppliers* lets you list, add, view, update, or deactivate vendors.
-Try: "list suppliers" or "view supplier price list"."""
+HELP_SUPPLIERS = """📦 *Suppliers* lets you list, add, view, update, deactivate vendors, link a supplier to another outlet, and see unlinked suppliers.
+Try: "list suppliers", "list my suppliers", "show unlinked suppliers", or "link supplier Fresh Farms to outlet Mercato"."""
 
 HELP_INVOICES = """📄 *Invoices* lets you list invoices or view one.
 Try: "list invoices"."""
