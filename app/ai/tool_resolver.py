@@ -57,8 +57,9 @@ If the user asks for help about a specific topic, call get_help_topic.
 If the user asks for menu/options/paths, call get_menu_paths.
 If there is a pending action and the user says yes/no, call the relevant tool to confirm or cancel.
 When listing staff, include the outlet name if provided by the tool.
-When the user says "list suppliers" or "list my suppliers" without specifying an outlet, call list_my_suppliers.
+When the user says "list suppliers" without specifying an outlet, call list_my_suppliers.
 When the user specifies an outlet (e.g., "for Mercato"), call list_suppliers with restaurant_id.
+When the user asks to add/link a supplier to all outlets, call link_supplier_to_all_outlets.
 """
 
 
@@ -110,6 +111,7 @@ def resolve_with_tools(
     session_id: uuid.UUID | None,
     max_steps: int = 6,
 ) -> ToolResolutionResult:
+    normalized_message = (message_text or "").strip().lower()
     context_info: dict[str, str] = {}
     if active_restaurant_id:
         context_info["active_restaurant_id"] = active_restaurant_id
@@ -149,6 +151,17 @@ def resolve_with_tools(
     )
     merged_tools = {**BASE_TOOLS, **tools}
     tool_schema = tools_to_openai_schema(merged_tools)
+
+    if normalized_message in {"list suppliers", "list my suppliers"}:
+        tool = merged_tools.get("list_my_suppliers")
+        if tool is None:
+            return ToolResolutionResult(response_text=responses.ERROR_GENERIC)
+        return ToolResolutionResult(
+            response_text=tool.handler({}),
+            llm_calls=[],
+            context_update={},
+            tool_calls=1,
+        )
 
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": RESOLVER_SYSTEM_PROMPT},

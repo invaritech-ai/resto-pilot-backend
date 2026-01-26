@@ -259,6 +259,12 @@ SUPPLIER_DEACTIVATED = "Deactivated supplier '{name}'."
 
 SUPPLIER_ALREADY_INACTIVE = "Supplier '{name}' is already inactive."
 
+SUPPLIER_LINK_ALL_CONFIRMATION = (
+    "I'll link supplier '{name}' to all your outlets ({count}). Confirm?"
+)
+
+SUPPLIER_LINK_ALL_CANCELLED = "Cancelled linking supplier to all outlets."
+
 
 def supplier_details(supplier: dict[str, Any]) -> str:
     """Format supplier details response."""

@@ -526,6 +526,196 @@ def create_supplier_tools(
             indent=2,
         )
 
+    def link_supplier_to_all_outlets(args: dict[str, Any]) -> str:
+        """Link an existing supplier to all outlets the user can access."""
+        message_lower = _normalize(user_message)
+
+        def _outlet_ids() -> list[uuid.UUID]:
+            ids: list[uuid.UUID] = []
+            for rid in (restaurant_roles or {}).keys():
+                try:
+                    ids.append(uuid.UUID(str(rid)))
+                except ValueError:
+                    continue
+            return ids
+
+        if pending_action and pending_action.get("type") == "link_supplier_to_all_outlets":
+            if _is_cancel(message_lower):
+                return json.dumps(
+                    {
+                        "status": "cancelled",
+                        "message": responses.SUPPLIER_LINK_ALL_CANCELLED,
+                        "context_update": {"clear_pending_action": True},
+                    },
+                    indent=2,
+                )
+            if _is_confirm(message_lower):
+                args = dict(pending_action.get("args") or {})
+            else:
+                return json.dumps(
+                    {
+                        "status": "pending_confirmation",
+                        "message": pending_action.get("message") or "Please confirm.",
+                    },
+                    indent=2,
+                )
+
+        supplier_id_str = str(args.get("supplier_id", "")).strip()
+        supplier_name = str(args.get("supplier_name", "")).strip()
+        if not supplier_id_str and not supplier_name:
+            return "Error: supplier_id or supplier_name is required."
+
+        target_outlets = _outlet_ids()
+        if not target_outlets:
+            return "Error: You don't have any outlets yet."
+
+        supplier: Suppliers | None = None
+        if supplier_id_str:
+            try:
+                supplier_id = uuid.UUID(supplier_id_str)
+            except ValueError:
+                return "Error: Invalid supplier_id format."
+            supplier = db.get(Suppliers, supplier_id)
+        else:
+            normalized = normalize_supplier_name(supplier_name)
+            matches = db.scalars(
+                select(Suppliers).where(
+                    (Suppliers.user_id == user_id) | (Suppliers.user_id.is_(None)),
+                    Suppliers.name_normalized == normalized,
+                    Suppliers.is_active == True,
+                )
+            ).all()
+            if not matches:
+                supplier = Suppliers(
+                    user_id=user_id,
+                    name=supplier_name,
+                    name_normalized=normalized,
+                    is_active=True,
+                )
+                db.add(supplier)
+                db.flush()
+            elif len(matches) > 1:
+                return "Error: Multiple suppliers match that name. Please be more specific."
+            else:
+                supplier = matches[0]
+
+        if not supplier:
+            return "Error: Supplier not found."
+        if not supplier.is_active:
+            return "Error: Supplier is inactive."
+
+        if supplier.user_id is None:
+            supplier.user_id = user_id
+        elif supplier.user_id != user_id:
+            return "Error: Supplier does not belong to this user."
+
+        status_value = str(args.get("status_value") or args.get("status") or "active").strip().lower()
+        if status_value not in {"active", "inactive"}:
+            return "Error: status_value must be 'active' or 'inactive'."
+
+        account_number = args.get("account_number")
+        default_currency = args.get("default_currency")
+        lead_time_days = args.get("lead_time_days")
+        notes = args.get("notes")
+
+        if not pending_action and len(target_outlets) > 1:
+            msg = responses.SUPPLIER_LINK_ALL_CONFIRMATION.format(
+                name=supplier.name, count=len(target_outlets)
+            )
+            return json.dumps(
+                {
+                    "status": "needs_confirmation",
+                    "message": msg,
+                    "context_update": {
+                        "pending_action": {
+                            "type": "link_supplier_to_all_outlets",
+                            "args": {
+                                "supplier_id": str(supplier.id),
+                                "supplier_name": supplier.name,
+                                "status_value": status_value,
+                                "account_number": account_number,
+                                "default_currency": default_currency,
+                                "lead_time_days": lead_time_days,
+                                "notes": notes,
+                            },
+                            "message": msg,
+                        }
+                    },
+                },
+                indent=2,
+            )
+
+        results: list[dict[str, Any]] = []
+        linked_count = 0
+        outlet_names: list[str] = []
+        for outlet_id in target_outlets:
+            link = db.scalar(
+                select(RestaurantSuppliers).where(
+                    RestaurantSuppliers.restaurant_id == outlet_id,
+                    RestaurantSuppliers.supplier_id == supplier.id,
+                )
+            )
+            created = False
+            if not link:
+                link = RestaurantSuppliers(
+                    restaurant_id=outlet_id,
+                    supplier_id=supplier.id,
+                    status=status_value,
+                    account_number=account_number,
+                    default_currency=default_currency,
+                    lead_time_days=int(lead_time_days) if lead_time_days is not None else None,
+                    notes=notes,
+                )
+                db.add(link)
+                created = True
+            else:
+                link.status = status_value
+                if account_number is not None:
+                    link.account_number = account_number
+                if default_currency is not None:
+                    link.default_currency = default_currency
+                if lead_time_days is not None:
+                    link.lead_time_days = int(lead_time_days)
+                if notes is not None:
+                    link.notes = notes
+
+            restaurant = db.get(Restaurant, outlet_id)
+            if restaurant and restaurant.name:
+                outlet_names.append(restaurant.name)
+            results.append(
+                {
+                    "restaurant_name": restaurant.name if restaurant else str(outlet_id),
+                    "action": "linked" if created else "updated",
+                    "status": link.status,
+                }
+            )
+            if created:
+                linked_count += 1
+
+        try:
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            logger.exception("link_supplier_to_all_outlets_failed")
+            return f"Error linking supplier: {str(e)}"
+
+        return json.dumps(
+            {
+                "status": "ok",
+                "supplier_id": str(supplier.id),
+                "supplier_name": supplier.name,
+                "outlets_count": len(target_outlets),
+                "outlets": outlet_names,
+                "created_links": linked_count,
+                "results": results,
+                "context_update": {
+                    "clear_pending_action": True,
+                    "active_supplier_id": str(supplier.id),
+                },
+            },
+            indent=2,
+        )
+
     def get_supplier(args: dict[str, Any]) -> str:
         """Get details of a specific supplier."""
         supplier_id_str = args.get("supplier_id", "").strip()
@@ -777,6 +967,45 @@ def create_supplier_tools(
                 "additionalProperties": False,
             },
             handler=link_supplier_to_restaurant,
+        ),
+        "link_supplier_to_all_outlets": Tool(
+            name="link_supplier_to_all_outlets",
+            description="Link an existing supplier (or create by name) to all outlets you can access.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "supplier_id": {
+                        "type": "string",
+                        "description": "Supplier UUID (preferred if known).",
+                    },
+                    "supplier_name": {
+                        "type": "string",
+                        "description": "Supplier name (used to look up or create your supplier if supplier_id not provided).",
+                    },
+                    "status_value": {
+                        "type": "string",
+                        "description": "Link status: active or inactive (optional).",
+                    },
+                    "account_number": {
+                        "type": "string",
+                        "description": "Account number to set for all outlets (optional).",
+                    },
+                    "default_currency": {
+                        "type": "string",
+                        "description": "Default currency to set for all outlets (optional).",
+                    },
+                    "lead_time_days": {
+                        "type": "integer",
+                        "description": "Lead time in days to set for all outlets (optional).",
+                    },
+                    "notes": {
+                        "type": "string",
+                        "description": "Notes to set for all outlets (optional).",
+                    },
+                },
+                "additionalProperties": False,
+            },
+            handler=link_supplier_to_all_outlets,
         ),
         "create_supplier": Tool(
             name="create_supplier",
