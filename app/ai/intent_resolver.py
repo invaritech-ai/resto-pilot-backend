@@ -25,6 +25,7 @@ from app.ai.openai_client import (
 from app.ai.openrouter_generation import extract_openrouter_generation_id
 from app.ai.openrouter_usage import extract_openrouter_usage
 from app.core.config import Settings
+from app.db.models.restaurant_suppliers import RestaurantSuppliers
 from app.db.models.suppliers import Suppliers
 from app.db.models.user import User
 from app.domain.services.restaurant_service import RestaurantService
@@ -202,8 +203,10 @@ def _build_candidates(
     # Load suppliers
     suppliers = db.scalars(
         select(Suppliers)
+        .join(RestaurantSuppliers, RestaurantSuppliers.supplier_id == Suppliers.id)
         .where(
-            Suppliers.restaurant_id == restaurant_uuid,
+            RestaurantSuppliers.restaurant_id == restaurant_uuid,
+            RestaurantSuppliers.status == "active",
             Suppliers.is_active == True,
         )
         .order_by(Suppliers.name.asc())

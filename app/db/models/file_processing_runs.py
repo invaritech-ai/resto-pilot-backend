@@ -4,7 +4,7 @@ import datetime as dt
 import uuid
 from typing import ClassVar
 
-from sqlalchemy import DateTime, Enum, ForeignKey, Integer, String, func
+from sqlalchemy import BigInteger, DateTime, Enum, ForeignKey, Integer, String, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -27,6 +27,16 @@ class FileProcessingRuns(Base):
     filename: Mapped[str | None] = mapped_column(String, nullable=True)
     mime_type: Mapped[str | None] = mapped_column(String, nullable=True)
     webhook_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    source: Mapped[str | None] = mapped_column(
+        Enum("api", "telegram", name="file_processing_source"), nullable=True
+    )
+    chat_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    session_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("telegram_sessions.id", ondelete="SET NULL"), nullable=True
+    )
+    supplier_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("suppliers.id", ondelete="SET NULL"), nullable=True
+    )
 
     processing_type: Mapped[str] = mapped_column(
         Enum("invoice", "price_list", "inventory", name="processing_type"),

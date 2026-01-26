@@ -9,9 +9,10 @@ from __future__ import annotations
 import datetime as dt
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.db.models.file_processing_page_jobs import FileProcessingPageJobs
 from app.db.models.file_processing_runs import FileProcessingRuns
 from app.db.models.file_processing_steps import FileProcessingSteps
 from app.db.models.file_processing_staging import FileProcessingStaging
@@ -43,10 +44,29 @@ def get_processing_status(run_id: UUID, db: Session) -> dict:
     if not run:
         raise ValueError(f"FileProcessingRun not found: {run_id}")
 
+    pages_completed = db.scalar(
+        select(func.count()).where(
+            FileProcessingPageJobs.run_id == run_id,
+            FileProcessingPageJobs.status == "completed",
+        )
+    ) or 0
+    pages_failed = db.scalar(
+        select(func.count()).where(
+            FileProcessingPageJobs.run_id == run_id,
+            FileProcessingPageJobs.status.in_(["failed_ocr", "failed_extraction"]),
+        )
+    ) or 0
+    pages_total = run.pages_total or db.scalar(
+        select(func.count()).where(FileProcessingPageJobs.run_id == run_id)
+    )
+    pages_processing = 0
+    if pages_total:
+        pages_processing = max(pages_total - pages_completed - pages_failed, 0)
+
     # Calculate progress percentage
     progress_pct = 0.0
-    if run.pages_total and run.pages_total > 0:
-        progress_pct = (run.pages_processed / run.pages_total) * 100
+    if pages_total and pages_total > 0:
+        progress_pct = (pages_completed / pages_total) * 100
 
     # Calculate elapsed time
     elapsed_seconds = 0
@@ -56,18 +76,21 @@ def get_processing_status(run_id: UUID, db: Session) -> dict:
 
     # Estimate remaining time
     estimated_seconds_remaining = None
-    if run.status == "processing" and run.pages_processed and run.pages_total:
-        if run.pages_processed > 0 and elapsed_seconds > 0:
-            seconds_per_page = elapsed_seconds / run.pages_processed
-            remaining_pages = run.pages_total - run.pages_processed
+    if run.status == "processing" and pages_completed and pages_total:
+        if pages_completed > 0 and elapsed_seconds > 0:
+            seconds_per_page = elapsed_seconds / pages_completed
+            remaining_pages = pages_total - pages_completed
             estimated_seconds_remaining = int(seconds_per_page * remaining_pages)
 
     return {
         "run_id": str(run.id),
         "status": run.status,
         "current_stage": run.current_stage or "initializing",
-        "pages_total": run.pages_total,
-        "pages_processed": run.pages_processed or 0,
+        "pages_total": pages_total,
+        "pages_processed": pages_completed,
+        "pages_completed": pages_completed,
+        "pages_failed": pages_failed,
+        "pages_processing": pages_processing,
         "progress_percentage": round(progress_pct, 1),
         "started_at": run.started_at.isoformat() if run.started_at else None,
         "finished_at": run.finished_at.isoformat() if run.finished_at else None,

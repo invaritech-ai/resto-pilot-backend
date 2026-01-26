@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import datetime as dt
-import uuid
+import re
 from typing import ClassVar
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, func
+from sqlalchemy import DateTime, Integer, String, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -13,10 +13,10 @@ from app.db.base import Base
 class Suppliers(Base):
     __tablename__: ClassVar[str] = "suppliers"  # type: ignore[override]
 
-    restaurant_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("restaurants.id", ondelete="CASCADE"), nullable=False
-    )
     name: Mapped[str] = mapped_column(String, nullable=False)
+    name_normalized: Mapped[str | None] = mapped_column(
+        String, nullable=True, index=True
+    )
     contact_name: Mapped[str | None] = mapped_column(String, nullable=True)
     contact_email: Mapped[str | None] = mapped_column(String, nullable=True)
     contact_phone: Mapped[str | None] = mapped_column(String, nullable=True)
@@ -36,3 +36,10 @@ class Suppliers(Base):
         onupdate=func.now(),
     )
 
+
+def normalize_supplier_name(name: str | None) -> str:
+    """Normalize supplier names for de-duplication."""
+    if not name:
+        return ""
+    normalized = re.sub(r"\s+", " ", name.strip().lower())
+    return normalized

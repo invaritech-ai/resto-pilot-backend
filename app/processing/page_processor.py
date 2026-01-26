@@ -13,6 +13,8 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
+import random
+import time
 from typing import Any
 from uuid import UUID
 
@@ -32,6 +34,103 @@ from app.processing.file_processor import _format_schema_for_extraction
 from app.processing.webhooks import send_webhook_notification
 
 logger = logging.getLogger(__name__)
+
+
+def _clean_json_text(raw_text: str) -> str:
+    cleaned = raw_text.strip()
+
+    if cleaned.startswith("```"):
+        lines = cleaned.split("\n")
+        if lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        cleaned = "\n".join(lines).strip()
+
+    cleaned = cleaned.replace("<|begin_of_box|>", "").replace("<|end_of_box|>", "")
+    return cleaned.strip()
+
+
+def parse_extracted_json(raw_text: str) -> dict[str, Any]:
+    cleaned = _clean_json_text(raw_text)
+    return json.loads(cleaned)
+
+
+def get_extraction_schema(processing_type: str) -> str:
+    schema_tables_map = {
+        "invoice": ["invoices", "invoice_line_items"],
+        "price_list": ["suppliers", "supplier_items", "supplier_prices"],
+        "inventory": ["inventory_batches"],
+    }
+    schema_tables = schema_tables_map.get(processing_type, [])
+    return _format_schema_for_extraction(schema_tables) if schema_tables else ""
+
+
+def ocr_page_with_retries(
+    *,
+    page_image_bytes: bytes,
+    page_num: int,
+    total_pages: int,
+    settings: Settings,
+    max_attempts: int = 3,
+    base_delay_seconds: float = 1.0,
+) -> tuple[VisionCallResult, int]:
+    last_exc: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            result = ocr_page_to_markdown(
+                page_image_bytes=page_image_bytes,
+                page_num=page_num,
+                total_pages=total_pages,
+                settings=settings,
+            )
+            return result, attempt
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= max_attempts:
+                break
+            delay = base_delay_seconds * (2 ** (attempt - 1))
+            jitter = random.uniform(0, delay * 0.25)
+            time.sleep(delay + jitter)
+    raise last_exc or RuntimeError("OCR retries exhausted")
+
+
+def extract_json_with_retries(
+    *,
+    markdown_text: str,
+    page_num: int,
+    processing_type: str,
+    db_schema: str,
+    settings: Settings,
+    max_attempts: int = 2,
+) -> tuple[VisionCallResult, dict[str, Any], int]:
+    last_exc: Exception | None = None
+    repair_hint: str | None = None
+
+    for attempt in range(1, max_attempts + 1):
+        result = extract_json_from_markdown(
+            markdown_text=markdown_text,
+            page_num=page_num,
+            processing_type=processing_type,
+            db_schema=db_schema,
+            settings=settings,
+            repair_hint=repair_hint,
+        )
+        try:
+            parsed = parse_extracted_json(result.content or "{}")
+            return result, parsed, attempt
+        except json.JSONDecodeError as exc:
+            last_exc = exc
+            snippet = (result.content or "")[:500]
+            repair_hint = (
+                "The previous response was invalid JSON. "
+                f"Parsing error: {exc}. "
+                f"Return ONLY valid JSON. Previous response snippet: {snippet}"
+            )
+            if attempt >= max_attempts:
+                break
+
+    raise last_exc or RuntimeError("Extraction retries exhausted")
 
 
 def process_file_with_snapshots(
@@ -249,13 +348,7 @@ def process_pdf_page_by_page(
     db.commit()
 
     # Get database schema for extraction
-    schema_tables_map = {
-        "invoice": ["invoices", "invoice_line_items"],
-        "price_list": ["suppliers", "supplier_items", "supplier_prices"],
-        "inventory": ["inventory_batches"],
-    }
-    schema_tables = schema_tables_map.get(processing_type, [])
-    db_schema = _format_schema_for_extraction(schema_tables) if schema_tables else ""
+    db_schema = get_extraction_schema(processing_type)
 
     for page_num in range(1, total_pages + 1):
         # Skip if already completed (recovery)
@@ -373,13 +466,7 @@ def process_image_file(
     run.current_stage = "extraction"
     db.commit()
 
-    schema_tables_map = {
-        "invoice": ["invoices", "invoice_line_items"],
-        "price_list": ["suppliers", "supplier_items", "supplier_prices"],
-        "inventory": ["inventory_batches"],
-    }
-    schema_tables = schema_tables_map.get(processing_type, [])
-    db_schema = _format_schema_for_extraction(schema_tables) if schema_tables else ""
+    db_schema = get_extraction_schema(processing_type)
 
     extraction_result = extract_json_from_markdown(
         markdown_text=ocr_result.content or "",
@@ -419,6 +506,7 @@ def save_page_snapshot(
     stage: str,
     output_text: str,
     status: str,
+    error_message: str | None = None,
     db: Session,
 ) -> FileProcessingSteps:
     """
@@ -432,6 +520,7 @@ def save_page_snapshot(
         stage: "ocr" or "extraction"
         output_text: OCR markdown or extracted JSON
         status: "started", "completed", or "failed"
+        error_message: Optional error string for failed snapshots
         db: Database session
 
     Returns:
@@ -450,6 +539,7 @@ def save_page_snapshot(
         # Update existing
         existing_step.output_text = output_text
         existing_step.status = status
+        existing_step.error_message = error_message
         step = existing_step
     else:
         # Create new
@@ -459,6 +549,7 @@ def save_page_snapshot(
             page_index=page_index,
             output_text=output_text,
             status=status,
+            error_message=error_message,
         )
         db.add(step)
 
@@ -526,23 +617,7 @@ def merge_page_results(run_id: UUID, db: Session) -> dict[str, Any]:
     page_results: list[dict[str, Any]] = []
     for step in extraction_steps:
         try:
-            # Clean JSON string (remove markdown code fences and special tokens)
-            raw_json = step.output_text or "{}"
-
-            # Remove markdown code blocks
-            if raw_json.strip().startswith("```"):
-                # Find the JSON content between ```json and ```
-                lines = raw_json.strip().split("\n")
-                if lines[0].startswith("```"):
-                    lines = lines[1:]  # Remove opening fence
-                if lines and lines[-1].strip() == "```":
-                    lines = lines[:-1]  # Remove closing fence
-                raw_json = "\n".join(lines)
-
-            # Remove special tokens (like <|begin_of_box|> and <|end_of_box|>)
-            raw_json = raw_json.replace("<|begin_of_box|>", "").replace("<|end_of_box|>", "")
-
-            page_data = json.loads(raw_json.strip())
+            page_data = parse_extracted_json(step.output_text or "{}")
             page_results.append(page_data)
         except json.JSONDecodeError:
             logger.exception(f"Failed to parse JSON for page {step.page_index}")

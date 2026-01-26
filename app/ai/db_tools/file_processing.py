@@ -14,6 +14,9 @@ from sqlalchemy.orm import Session
 
 from app.ai.tools import Tool
 from app.db.models.file_processing_staging import FileProcessingStaging
+from app.db.models.restaurant_suppliers import RestaurantSuppliers
+from app.db.models.supplier_item_products import SupplierItemProducts
+from app.db.models.suppliers import normalize_supplier_name
 from app.workers.celery_types import CeleryApplyAsync
 
 from .base import has_restaurant_access
@@ -608,27 +611,51 @@ def create_file_processing_tools(
 
                 # Find or create supplier by name
                 supplier_name = extracted_data.get("supplier_name", "").strip()
+                if not supplier_name and staging.supplier_id:
+                    existing_supplier = db.get(Suppliers, staging.supplier_id)
+                    if existing_supplier:
+                        supplier_name = existing_supplier.name
                 if not supplier_name:
                     return "Error: Supplier name is required for invoice processing."
 
-                supplier = db.scalar(
-                    select(Suppliers).where(
-                        Suppliers.restaurant_id == staging.restaurant_id,
-                        Suppliers.name.ilike(supplier_name),
-                        Suppliers.is_active,
+                supplier = db.get(Suppliers, staging.supplier_id) if staging.supplier_id else None
+                if not supplier:
+                    normalized = normalize_supplier_name(supplier_name)
+                    supplier = db.scalar(
+                        select(Suppliers).where(
+                            Suppliers.name_normalized == normalized,
+                            Suppliers.is_active,
+                        )
                     )
-                )
 
                 if not supplier:
-                    # Create new supplier
                     supplier = Suppliers(
-                        restaurant_id=staging.restaurant_id,
                         name=supplier_name,
+                        name_normalized=normalize_supplier_name(supplier_name),
                         currency=extracted_data.get("currency", "USD"),
                         is_active=True,
                     )
                     db.add(supplier)
                     db.flush()
+                elif not supplier.name_normalized:
+                    supplier.name_normalized = normalize_supplier_name(supplier_name)
+
+                link = db.scalar(
+                    select(RestaurantSuppliers).where(
+                        RestaurantSuppliers.restaurant_id == staging.restaurant_id,
+                        RestaurantSuppliers.supplier_id == supplier.id,
+                    )
+                )
+                if not link:
+                    link = RestaurantSuppliers(
+                        restaurant_id=staging.restaurant_id,
+                        supplier_id=supplier.id,
+                        status="active",
+                        default_currency=extracted_data.get("currency", "USD"),
+                    )
+                    db.add(link)
+                elif extracted_data.get("currency") and not link.default_currency:
+                    link.default_currency = extracted_data.get("currency")
 
                 supplier_id = supplier.id
 
@@ -693,22 +720,27 @@ def create_file_processing_tools(
 
                 # Find or create supplier by name
                 supplier_name = extracted_data.get("supplier_name", "").strip()
+                if not supplier_name and staging.supplier_id:
+                    existing_supplier = db.get(Suppliers, staging.supplier_id)
+                    if existing_supplier:
+                        supplier_name = existing_supplier.name
                 if not supplier_name:
                     return "Error: Supplier name is required for price list processing."
 
-                supplier = db.scalar(
-                    select(Suppliers).where(
-                        Suppliers.restaurant_id == staging.restaurant_id,
-                        Suppliers.name.ilike(supplier_name),
-                        Suppliers.is_active,
+                supplier = db.get(Suppliers, staging.supplier_id) if staging.supplier_id else None
+                if not supplier:
+                    normalized = normalize_supplier_name(supplier_name)
+                    supplier = db.scalar(
+                        select(Suppliers).where(
+                            Suppliers.name_normalized == normalized,
+                            Suppliers.is_active,
+                        )
                     )
-                )
 
                 if not supplier:
-                    # Create new supplier with contact info if available
                     supplier = Suppliers(
-                        restaurant_id=staging.restaurant_id,
                         name=supplier_name,
+                        name_normalized=normalize_supplier_name(supplier_name),
                         contact_name=extracted_data.get("contact_name"),
                         contact_email=extracted_data.get("contact_email"),
                         contact_phone=extracted_data.get("contact_phone"),
@@ -718,7 +750,8 @@ def create_file_processing_tools(
                     db.add(supplier)
                     db.flush()
                 else:
-                    # Update contact info if provided and not already set
+                    if not supplier.name_normalized:
+                        supplier.name_normalized = normalize_supplier_name(supplier_name)
                     if extracted_data.get("contact_name") and not supplier.contact_name:
                         supplier.contact_name = extracted_data.get("contact_name")
                     if (
@@ -733,6 +766,23 @@ def create_file_processing_tools(
                         supplier.contact_phone = extracted_data.get("contact_phone")
                     if extracted_data.get("currency") and not supplier.currency:
                         supplier.currency = extracted_data.get("currency")
+
+                link = db.scalar(
+                    select(RestaurantSuppliers).where(
+                        RestaurantSuppliers.restaurant_id == staging.restaurant_id,
+                        RestaurantSuppliers.supplier_id == supplier.id,
+                    )
+                )
+                if not link:
+                    link = RestaurantSuppliers(
+                        restaurant_id=staging.restaurant_id,
+                        supplier_id=supplier.id,
+                        status="active",
+                        default_currency=extracted_data.get("currency", "USD"),
+                    )
+                    db.add(link)
+                elif extracted_data.get("currency") and not link.default_currency:
+                    link.default_currency = extracted_data.get("currency")
 
                 supplier_id = supplier.id
 
@@ -785,6 +835,29 @@ def create_file_processing_tools(
                         db.add(supplier_item)
                         db.flush()
                         items_created += 1
+
+                    product_id_value = item_data.get("product_id")
+                    if product_id_value:
+                        try:
+                            product_uuid = uuid.UUID(str(product_id_value))
+                        except ValueError:
+                            product_uuid = None
+                        if product_uuid:
+                            link = db.scalar(
+                                select(SupplierItemProducts).where(
+                                    SupplierItemProducts.supplier_item_id == supplier_item.id,
+                                    SupplierItemProducts.restaurant_id == staging.restaurant_id,
+                                )
+                            )
+                            if link:
+                                link.product_id = product_uuid
+                            else:
+                                link = SupplierItemProducts(
+                                    supplier_item_id=supplier_item.id,
+                                    restaurant_id=staging.restaurant_id,
+                                    product_id=product_uuid,
+                                )
+                                db.add(link)
 
                     # Create price entry
                     valid_from = (
@@ -848,18 +921,33 @@ def create_file_processing_tools(
                     supplier_id = None
                     if item_data.get("supplier_id"):
                         supplier_id = uuid.UUID(item_data.get("supplier_id"))
+                    elif staging.supplier_id:
+                        supplier_id = staging.supplier_id
                     else:
                         # Try to find supplier by name if provided
                         supplier_name = extracted_data.get("supplier_name")
                         if supplier_name:
+                            normalized = normalize_supplier_name(supplier_name)
                             supplier = db.scalar(
                                 select(Suppliers).where(
-                                    Suppliers.restaurant_id == staging.restaurant_id,
-                                    Suppliers.name.ilike(supplier_name),
+                                    Suppliers.name_normalized == normalized,
                                     Suppliers.is_active,
                                 )
                             )
                             if supplier:
+                                link = db.scalar(
+                                    select(RestaurantSuppliers).where(
+                                        RestaurantSuppliers.restaurant_id == staging.restaurant_id,
+                                        RestaurantSuppliers.supplier_id == supplier.id,
+                                    )
+                                )
+                                if not link:
+                                    link = RestaurantSuppliers(
+                                        restaurant_id=staging.restaurant_id,
+                                        supplier_id=supplier.id,
+                                        status="active",
+                                    )
+                                    db.add(link)
                                 supplier_id = supplier.id
 
                     if not supplier_id:

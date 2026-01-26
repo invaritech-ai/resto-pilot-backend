@@ -1,32 +1,38 @@
 from __future__ import annotations
 
+import base64
 import datetime as dt
 import json
 import logging
 import uuid
+from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import Session
 
-from app.core.config import get_settings
+from app.core.config import Settings, get_settings
 from app.db.models.documents import Documents
-from app.db.models.file_processing_staging import FileProcessingStaging
+from app.db.models.file_processing_page_jobs import FileProcessingPageJobs
+from app.db.models.file_processing_payloads import FileProcessingPayloads
 from app.db.models.file_processing_runs import FileProcessingRuns
+from app.db.models.file_processing_staging import FileProcessingStaging
 from app.db.models.file_processing_steps import FileProcessingSteps
 from app.db.models.processing_events import ProcessingEvents
-from app.db.models.suppliers import Suppliers
+from app.db.models.restaurant_suppliers import RestaurantSuppliers
+from app.db.models.suppliers import Suppliers, normalize_supplier_name
 from app.db.models.telegram_messages import TelegramMessages
 from app.db.models.user import User
 from app.conversation.context import load_context, save_context
-from app.ai.openrouter_generation import extract_openrouter_generation_id
-from app.ai.vision_client import VisionCallResult, _get_vision_settings
-from app.processing.file_processor import (
-    extract_inventory_data,
-    extract_invoice_data,
-    extract_price_list_data,
+from app.ai.vision_client import VisionCallResult, _convert_pdf_pages_to_images
+from app.processing.page_processor import (
+    extract_json_with_retries,
+    get_extraction_schema,
+    merge_page_results,
+    ocr_page_with_retries,
+    save_page_snapshot,
 )
+from app.processing.webhooks import send_webhook_notification
 from app.telegram.bot_api import (
-    TelegramFileError,
     TelegramFileExpiredError,
     TelegramFileNetworkError,
     TelegramFileTooBigError,
@@ -43,6 +49,11 @@ from app.workers.telemetry import (
 from app.workers.utils import _get_task_id, _parse_uuid
 
 logger = logging.getLogger(__name__)
+
+BROKER_PAYLOAD_MAX_BYTES = 200 * 1024
+PAYLOAD_DB_PREFIX = "db:"
+OCR_MAX_ATTEMPTS = 3
+EXTRACTION_MAX_ATTEMPTS = 2
 
 
 def _record_vision_telemetry(
@@ -165,6 +176,140 @@ def _record_file_processing_steps(
         db.commit()
 
 
+def _encode_payload_bytes(
+    *,
+    db: Session,
+    payload_bytes: bytes,
+    run_id: uuid.UUID | None = None,
+    page_index: int | None = None,
+) -> str:
+    """Return a broker-safe payload reference for file/page bytes."""
+    encoded = base64.b64encode(payload_bytes)
+    if len(encoded) <= BROKER_PAYLOAD_MAX_BYTES:
+        return encoded.decode("ascii")
+
+    payload = FileProcessingPayloads(
+        run_id=run_id,
+        page_index=page_index,
+        payload_bytes=payload_bytes,
+    )
+    db.add(payload)
+    db.flush()
+    return f"{PAYLOAD_DB_PREFIX}{payload.id}"
+
+
+def _resolve_payload_bytes(
+    *, db: Session, payload_ref: str
+) -> bytes:
+    """Resolve a broker payload reference into bytes."""
+    if payload_ref.startswith(PAYLOAD_DB_PREFIX):
+        payload_id = payload_ref[len(PAYLOAD_DB_PREFIX) :]
+        payload = db.get(FileProcessingPayloads, _parse_uuid(payload_id))
+        if not payload:
+            raise ValueError(f"Payload not found: {payload_id}")
+        return bytes(payload.payload_bytes)
+
+    return base64.b64decode(payload_ref)
+
+
+def _ensure_restaurant_supplier_link(
+    *,
+    db: Session,
+    restaurant_id: uuid.UUID,
+    supplier_id: uuid.UUID,
+) -> None:
+    existing = db.scalar(
+        select(RestaurantSuppliers).where(
+            RestaurantSuppliers.restaurant_id == restaurant_id,
+            RestaurantSuppliers.supplier_id == supplier_id,
+        )
+    )
+    if existing:
+        return
+    link = RestaurantSuppliers(
+        restaurant_id=restaurant_id,
+        supplier_id=supplier_id,
+        status="active",
+    )
+    db.add(link)
+    db.flush()
+
+
+def _get_or_create_supplier(
+    *,
+    db: Session,
+    name: str,
+    restaurant_id: uuid.UUID,
+    defaults: dict[str, Any] | None = None,
+) -> Suppliers:
+    normalized = normalize_supplier_name(name)
+    supplier = db.scalar(
+        select(Suppliers).where(
+            Suppliers.name_normalized == normalized,
+            Suppliers.is_active == True,
+        )
+    )
+    if not supplier:
+        values = defaults or {}
+        supplier = Suppliers(
+            name=name,
+            name_normalized=normalized,
+            is_active=True,
+            **values,
+        )
+        db.add(supplier)
+        db.flush()
+
+    _ensure_restaurant_supplier_link(
+        db=db,
+        restaurant_id=restaurant_id,
+        supplier_id=supplier.id,
+    )
+    return supplier
+
+
+def _enqueue_coordinator_task(
+    *,
+    db: Session,
+    run: FileProcessingRuns,
+    file_bytes: bytes,
+    mime_type: str,
+    filename: str | None,
+) -> None:
+    payload_ref = _encode_payload_bytes(
+        db=db,
+        payload_bytes=file_bytes,
+        run_id=run.id,
+    )
+    db.commit()
+    process_file_api_task.apply_async(
+        args=[str(run.id), payload_ref, mime_type, filename or "unknown"],
+    )
+
+
+def _mark_run_failed(
+    *,
+    db: Session,
+    run_id: uuid.UUID,
+    error_message: str,
+) -> None:
+    failed_at = dt.datetime.now(dt.UTC)
+    run = db.get(FileProcessingRuns, run_id)
+    if run:
+        run.status = "failed"
+        run.current_stage = "failed"
+        run.error_message = error_message
+        run.finished_at = failed_at
+
+    staging = db.scalar(
+        select(FileProcessingStaging).where(FileProcessingStaging.run_id == run_id)
+    )
+    if staging:
+        staging.status = "failed"
+        staging.error_message = error_message
+        staging.finished_at = failed_at
+    db.commit()
+
 def _set_pending_file_processing_action(
     *,
     db: Session,
@@ -281,7 +426,7 @@ def process_invoice_file_task(
     user_id: str,
     session_id: str | None = None,
 ) -> None:
-    """Process an invoice file: extract data, match products, store in staging."""
+    """Process an invoice file: enqueue coordinator and notify user on completion."""
     task_id = _get_task_id()
     logger.info(
         "celery_task_started name=process_invoice_file_task task_id=%s restaurant_id=%s file_id=%s",
@@ -295,13 +440,13 @@ def process_invoice_file_task(
     user_uuid = _parse_uuid(user_id)
     session_uuid = _parse_uuid(session_id) if session_id else None
     db_session: Session | None = None
+    run_id: uuid.UUID | None = None
 
     try:
         with worker_db_session() as db:
             db_session = db
             now = dt.datetime.now(dt.UTC)
 
-            # Get actual mime type and filename from Telegram message
             telegram_msg = db.scalar(
                 select(TelegramMessages)
                 .where(TelegramMessages.file_id == file_id)
@@ -326,12 +471,17 @@ def process_invoice_file_task(
                 status="processing",
                 pages_total=None,
                 pages_processed=0,
-                current_stage="processing",
+                current_stage="intake",
                 error_message=None,
                 started_at=now,
+                source="telegram",
+                chat_id=chat_id,
+                session_id=session_uuid,
+                supplier_id=_parse_uuid(supplier_id) if supplier_id else None,
             )
             db.add(run)
             db.flush()
+            run_id = run.id
 
             staging = FileProcessingStaging(
                 restaurant_id=restaurant_uuid,
@@ -345,270 +495,22 @@ def process_invoice_file_task(
                 pages_total=None,
                 pages_processed=0,
                 started_at=now,
+                supplier_id=_parse_uuid(supplier_id) if supplier_id else None,
             )
             db.add(staging)
             db.commit()
 
-            # Download file
             file_bytes = get_file_bytes(file_id=file_id, settings=settings)
 
-            # Extract invoice data using new page-by-page processor with snapshots
-            try:
-                from app.processing.page_processor import process_file_with_snapshots
-
-                result = process_file_with_snapshots(
-                    run_id=run.id,
-                    file_bytes=file_bytes,
-                    mime_type=mime_type,
-                    filename=filename,
-                    processing_type="invoice",
-                    db=db,
-                    settings=settings,
-                )
-
-                extracted_data = result["data"]
-                telemetry_results = result.get("telemetry", [])
-
-                # Record telemetry for vision calls (uses fresh session internally)
-                if telemetry_results:
-                    _record_vision_telemetry(
-                        session_uuid=session_uuid,
-                        chat_id=chat_id,
-                        telemetry_results=telemetry_results,
-                        purpose_base="vision_invoice",
-                        processing_type="invoice",
-                    )
-                    # Note: File processing steps are now recorded by page_processor itself
-
-            except Exception as exc:
-                failed_at = dt.datetime.now(dt.UTC)
-                run.status = "failed"
-                run.current_stage = "failed"
-                run.error_message = str(exc)
-                run.finished_at = failed_at
-                staging.status = "failed"
-                staging.error_message = str(exc)
-                staging.finished_at = failed_at
-                db.commit()
-                # Record error telemetry if possible (uses fresh session internally)
-                if session_uuid:
-                    try:
-                        model, _, _ = _get_vision_settings(settings)
-                        error_result = VisionCallResult(
-                            content="",
-                            model=model,
-                            latency_ms=0,
-                            usage=None,
-                            openrouter_generation_id=None,
-                            response_headers={},
-                            response_data={},
-                            error=f"Invoice extraction failed: {exc}",
-                        )
-                        _record_vision_telemetry(
-                            session_uuid=session_uuid,
-                            chat_id=chat_id,
-                            telemetry_results=[error_result],
-                            purpose_base="vision_invoice",
-                            processing_type="invoice",
-                        )
-                        _record_file_processing_steps(
-                            run_id=run.id,
-                            telemetry_results=[error_result],
-                            stage="vision_invoice_error",
-                        )
-                    except Exception:
-                        logger.exception("failed_to_record_error_telemetry")
-                raise
-
-            # Check for missing required fields
-            supplier_name = extracted_data.get("supplier_name", "").strip() if extracted_data.get("supplier_name") else ""
-            currency = extracted_data.get("currency", "").strip() if extracted_data.get("currency") else ""
-
-            # Find or create supplier if not provided
-            supplier_uuid = None
-            if supplier_id:
-                supplier_uuid = _parse_uuid(supplier_id)
-            elif supplier_name:
-                supplier = db.scalar(
-                    select(Suppliers).where(
-                        Suppliers.restaurant_id == restaurant_uuid,
-                        Suppliers.name.ilike(supplier_name),
-                        Suppliers.is_active == True,
-                    )
-                )
-                if supplier:
-                    supplier_uuid = supplier.id
-
-            # No longer matching product aliases - we store raw names and search when user asks
-            alias_matches = {}
-
-            # Create document record
-            document = Documents(
-                restaurant_id=restaurant_uuid,
-                supplier_id=supplier_uuid,
-                doc_type="invoice",
-                file_url=file_id,
-                uploaded_at=dt.datetime.now(dt.UTC),
+            _enqueue_coordinator_task(
+                db=db,
+                run=run,
+                file_bytes=file_bytes,
+                mime_type=mime_type,
+                filename=filename,
             )
-            db.add(document)
-            db.flush()
-
-            # Determine status based on missing fields
-            status = "pending_review"
-            if not supplier_name:
-                status = "awaiting_supplier"
-            elif not currency:
-                status = "awaiting_currency"
-
-            line_items = extracted_data.get("line_items", [])
-            page_numbers = {
-                item.get("source_page")
-                for item in line_items
-                if isinstance(item.get("source_page"), int)
-            }
-            pages_processed = len(page_numbers)
-            pages_total = max(page_numbers) if page_numbers else None
-            finished_at = dt.datetime.now(dt.UTC)
-
-            run.document_id = document.id
-            run.status = "completed"
-            run.current_stage = status
-            run.pages_total = pages_total
-            run.pages_processed = pages_processed
-            run.finished_at = finished_at
-
-            staging.document_id = document.id
-            staging.extracted_data_json = extracted_data
-            staging.product_alias_matches_json = alias_matches
-            staging.status = status
-            staging.pages_total = pages_total
-            staging.pages_processed = pages_processed
-            staging.finished_at = finished_at
-            staging.error_message = None
-            db.commit()
-
-            # Send message based on status
-            if status == "awaiting_supplier":
-                _set_pending_file_processing_action(
-                    db=db,
-                    user_id=user_uuid,
-                    restaurant_id=restaurant_uuid,
-                    staging_id=staging.id,
-                    field="supplier",
-                    supplier_id=supplier_uuid,
-                )
-                db.commit()
-                _send_message_with_telemetry(
-                    db=db,
-                    chat_id=chat_id,
-                    text="I couldn't find the supplier in this invoice. What supplier is it from?",
-                    settings=settings,
-                    session_uuid=session_uuid,
-                )
-            elif status == "awaiting_currency":
-                _set_pending_file_processing_action(
-                    db=db,
-                    user_id=user_uuid,
-                    restaurant_id=restaurant_uuid,
-                    staging_id=staging.id,
-                    field="currency",
-                    supplier_id=supplier_uuid,
-                )
-                db.commit()
-                _send_message_with_telemetry(
-                    db=db,
-                    chat_id=chat_id,
-                    text="What currency is this invoice in? (e.g., USD, EUR)",
-                    settings=settings,
-                    session_uuid=session_uuid,
-                )
-            else:
-                _clear_pending_file_processing_action(
-                    db=db,
-                    user_id=user_uuid,
-                    restaurant_id=restaurant_uuid,
-                    supplier_id=supplier_uuid,
-                )
-                db.commit()
-                _set_pending_file_processing_confirm_action(
-                    db=db,
-                    user_id=user_uuid,
-                    restaurant_id=restaurant_uuid,
-                    staging_id=staging.id,
-                    supplier_id=supplier_uuid,
-                )
-                db.commit()
-                # Format and send preview message with summary
-                line_items = extracted_data.get("line_items", [])
-                total_items = len(line_items)
-                
-                lines = ["📄 **Invoice Extracted**\n"]
-                lines.append(f"**Supplier:** {supplier_name}")
-                
-                # Show contact info if available
-                contact_name = extracted_data.get("contact_name")
-                contact_email = extracted_data.get("contact_email")
-                contact_phone = extracted_data.get("contact_phone")
-                if contact_name:
-                    lines.append(f"**Contact:** {contact_name}")
-                if contact_email:
-                    lines.append(f"**Email:** {contact_email}")
-                if contact_phone:
-                    lines.append(f"**Phone:** {contact_phone}")
-                
-                lines.append(f"**Invoice #:** {extracted_data.get('invoice_number', 'N/A')}")
-                lines.append(f"**Date:** {extracted_data.get('invoice_date', 'N/A')}")
-                due_date = extracted_data.get('due_date')
-                if due_date:
-                    lines.append(f"**Due Date:** {due_date}")
-                lines.append(f"**Currency:** {currency}")
-                lines.append(f"**Total:** {currency} {extracted_data.get('total', 'N/A')}")
-                lines.append(f"**Line Items:** {total_items}")
-                
-                # Show sample of line items (first 10 for invoices)
-                sample_size = min(10, total_items)
-                if sample_size > 0:
-                    lines.append(f"\n**Line Items ({sample_size} of {total_items}):**")
-                    for i, item in enumerate(line_items[:sample_size], 1):
-                        desc = item.get("description_raw", item.get("description", "N/A"))
-                        qty = item.get("quantity", "N/A")
-                        unit = item.get("unit", "")
-                        total = item.get("line_total", "N/A")
-                        lines.append(f"  {i}. {desc} - {qty} {unit} = {currency} {total}")
-                    
-                    if total_items > sample_size:
-                        lines.append(f"  ... and {total_items - sample_size} more items")
-                
-                lines.append("\n---")
-                lines.append("✅ Say **/confirm** to save this invoice")
-                lines.append("❓ Ask to see all line items if needed")
-                lines.append("✏️ Tell me if anything needs correcting")
-                
-                preview_text = "\n".join(lines)
-                _send_message_with_telemetry(
-                    db=db,
-                    chat_id=chat_id,
-                    text=preview_text,
-                    settings=settings,
-                    session_uuid=session_uuid,
-                )
-
-            # Record processing event
-            db.add(
-                ProcessingEvents(
-                    session_id=session_uuid if session_uuid else staging.id,
-                    at=dt.datetime.now(dt.UTC),
-                    event="invoice_file_processed_v0",
-                    payload_json=json.dumps(
-                        {"staging_id": str(staging.id), "file_id": file_id}, ensure_ascii=False
-                    ),
-                    error=None,
-                )
-            )
-            db.commit()
 
     except TelegramFileExpiredError as exc:
-        # File no longer available - clear, actionable message
         logger.error(
             "process_invoice_file_task_file_expired",
             extra={
@@ -619,6 +521,12 @@ def process_invoice_file_task(
             },
         )
         try:
+            if db_session and run_id:
+                _mark_run_failed(
+                    db=db_session,
+                    run_id=run_id,
+                    error_message="Telegram file expired",
+                )
             _send_message_with_telemetry(
                 db=db_session,
                 chat_id=chat_id,
@@ -637,7 +545,6 @@ def process_invoice_file_task(
         raise
 
     except TelegramFileTooBigError as exc:
-        # File too large - clear message
         logger.error(
             "process_invoice_file_task_file_too_big",
             extra={
@@ -648,13 +555,19 @@ def process_invoice_file_task(
             },
         )
         try:
+            if db_session and run_id:
+                _mark_run_failed(
+                    db=db_session,
+                    run_id=run_id,
+                    error_message=str(exc),
+                )
             _send_message_with_telemetry(
                 db=db_session,
                 chat_id=chat_id,
                 text=(
                     "📦 Your invoice file is too large.\n\n"
                     f"{str(exc)}\n\n"
-                    "Please try splitting the PDF into smaller files or compressing it."
+                    "Please try compressing the PDF or taking a photo instead."
                 ),
                 settings=settings,
                 session_uuid=session_uuid,
@@ -664,7 +577,6 @@ def process_invoice_file_task(
         raise
 
     except TelegramFileNetworkError as exc:
-        # Transient error - suggest retry
         logger.warning(
             "process_invoice_file_task_network_error",
             extra={
@@ -675,13 +587,19 @@ def process_invoice_file_task(
             },
         )
         try:
+            if db_session and run_id:
+                _mark_run_failed(
+                    db=db_session,
+                    run_id=run_id,
+                    error_message=str(exc),
+                )
             _send_message_with_telemetry(
                 db=db_session,
                 chat_id=chat_id,
                 text=(
-                    "⚠️ Temporary error downloading your invoice.\n\n"
+                    "⚠️ Temporary error downloading your invoice file.\n\n"
                     "This is usually a temporary issue with Telegram's servers. "
-                    "Please try re-uploading the file in a few minutes."
+                    "Please try re-uploading the PDF in a few minutes."
                 ),
                 settings=settings,
                 session_uuid=session_uuid,
@@ -691,7 +609,6 @@ def process_invoice_file_task(
         raise
 
     except Exception as exc:
-        # Unknown error - generic message
         logger.exception(
             "process_invoice_file_task_failed",
             extra={
@@ -701,12 +618,17 @@ def process_invoice_file_task(
                 "chat_id": chat_id,
             },
         )
-        # Send error message to user
         try:
+            if db_session and run_id:
+                _mark_run_failed(
+                    db=db_session,
+                    run_id=run_id,
+                    error_message=str(exc),
+                )
             _send_message_with_telemetry(
                 db=db_session,
                 chat_id=chat_id,
-                text=f"Sorry, I couldn't process your invoice file. Error: {str(exc)}",
+                text=f"Sorry, I couldn't process your invoice. Error: {str(exc)}",
                 settings=settings,
                 session_uuid=session_uuid,
             )
@@ -725,7 +647,7 @@ def process_price_list_file_task(
     user_id: str,
     session_id: str | None = None,
 ) -> None:
-    """Process a price list file: extract data, match products, store in staging."""
+    """Process a price list file: enqueue coordinator and notify user on completion."""
     task_id = _get_task_id()
     logger.info(
         "celery_task_started name=process_price_list_file_task task_id=%s restaurant_id=%s file_id=%s",
@@ -739,13 +661,13 @@ def process_price_list_file_task(
     user_uuid = _parse_uuid(user_id)
     session_uuid = _parse_uuid(session_id) if session_id else None
     db_session: Session | None = None
+    run_id: uuid.UUID | None = None
 
     try:
         with worker_db_session() as db:
             db_session = db
             now = dt.datetime.now(dt.UTC)
 
-            # Get actual mime type and filename from Telegram message
             telegram_msg = db.scalar(
                 select(TelegramMessages)
                 .where(TelegramMessages.file_id == file_id)
@@ -770,12 +692,17 @@ def process_price_list_file_task(
                 status="processing",
                 pages_total=None,
                 pages_processed=0,
-                current_stage="processing",
+                current_stage="intake",
                 error_message=None,
                 started_at=now,
+                source="telegram",
+                chat_id=chat_id,
+                session_id=session_uuid,
+                supplier_id=_parse_uuid(supplier_id) if supplier_id else None,
             )
             db.add(run)
             db.flush()
+            run_id = run.id
 
             staging = FileProcessingStaging(
                 restaurant_id=restaurant_uuid,
@@ -789,273 +716,22 @@ def process_price_list_file_task(
                 pages_total=None,
                 pages_processed=0,
                 started_at=now,
+                supplier_id=_parse_uuid(supplier_id) if supplier_id else None,
             )
             db.add(staging)
             db.commit()
 
-            # Download file
             file_bytes = get_file_bytes(file_id=file_id, settings=settings)
 
-            # Extract price list data using new page-by-page processor with snapshots
-            try:
-                from app.processing.page_processor import process_file_with_snapshots
-
-                result = process_file_with_snapshots(
-                    run_id=run.id,
-                    file_bytes=file_bytes,
-                    mime_type=mime_type,
-                    filename=filename,
-                    processing_type="price_list",
-                    db=db,
-                    settings=settings,
-                )
-
-                extracted_data = result["data"]
-                telemetry_results = result.get("telemetry", [])
-
-                # Record telemetry for vision calls (uses fresh session internally)
-                if telemetry_results:
-                    _record_vision_telemetry(
-                        session_uuid=session_uuid,
-                        chat_id=chat_id,
-                        telemetry_results=telemetry_results,
-                        purpose_base="vision_price_list",
-                        processing_type="price_list",
-                    )
-                    # Note: File processing steps are now recorded by page_processor itself
-
-            except Exception as exc:
-                failed_at = dt.datetime.now(dt.UTC)
-                run.status = "failed"
-                run.current_stage = "failed"
-                run.error_message = str(exc)
-                run.finished_at = failed_at
-                staging.status = "failed"
-                staging.error_message = str(exc)
-                staging.finished_at = failed_at
-                db.commit()
-                # Record error telemetry if possible (uses fresh session internally)
-                if session_uuid:
-                    try:
-                        model, _, _ = _get_vision_settings(settings)
-                        error_result = VisionCallResult(
-                            content="",
-                            model=model,
-                            latency_ms=0,
-                            usage=None,
-                            openrouter_generation_id=None,
-                            response_headers={},
-                            response_data={},
-                            error=f"Price list extraction failed: {exc}",
-                        )
-                        _record_vision_telemetry(
-                            session_uuid=session_uuid,
-                            chat_id=chat_id,
-                            telemetry_results=[error_result],
-                            purpose_base="vision_price_list",
-                            processing_type="price_list",
-                        )
-                        _record_file_processing_steps(
-                            run_id=run.id,
-                            telemetry_results=[error_result],
-                            stage="vision_price_list_error",
-                        )
-                    except Exception:
-                        logger.exception("failed_to_record_error_telemetry")
-                raise
-
-            # Check for missing required fields
-            supplier_name = extracted_data.get("supplier_name", "").strip() if extracted_data.get("supplier_name") else ""
-            currency = extracted_data.get("currency", "").strip() if extracted_data.get("currency") else ""
-
-            # Find or create supplier if not provided
-            supplier_uuid = None
-            if supplier_id:
-                supplier_uuid = _parse_uuid(supplier_id)
-            elif supplier_name:
-                supplier = db.scalar(
-                    select(Suppliers).where(
-                        Suppliers.restaurant_id == restaurant_uuid,
-                        Suppliers.name.ilike(supplier_name),
-                        Suppliers.is_active == True,
-                    )
-                )
-                if supplier:
-                    supplier_uuid = supplier.id
-
-            # No longer matching product aliases - we store raw names and search when user asks
-            alias_matches = {}
-
-            # Create document record
-            document = Documents(
-                restaurant_id=restaurant_uuid,
-                supplier_id=supplier_uuid,
-                doc_type="price_list",
-                file_url=file_id,
-                uploaded_at=dt.datetime.now(dt.UTC),
+            _enqueue_coordinator_task(
+                db=db,
+                run=run,
+                file_bytes=file_bytes,
+                mime_type=mime_type,
+                filename=filename,
             )
-            db.add(document)
-            db.flush()
-
-            # Determine status based on missing fields
-            status = "pending_review"
-            if not supplier_name:
-                status = "awaiting_supplier"
-            elif not currency:
-                status = "awaiting_currency"
-
-            items = extracted_data.get("items", [])
-            page_numbers = {
-                item.get("source_page")
-                for item in items
-                if isinstance(item.get("source_page"), int)
-            }
-            pages_processed = len(page_numbers)
-            pages_total = max(page_numbers) if page_numbers else None
-            finished_at = dt.datetime.now(dt.UTC)
-
-            run.document_id = document.id
-            run.status = "completed"
-            run.current_stage = status
-            run.pages_total = pages_total
-            run.pages_processed = pages_processed
-            run.finished_at = finished_at
-
-            staging.document_id = document.id
-            staging.extracted_data_json = extracted_data
-            staging.product_alias_matches_json = alias_matches
-            staging.status = status
-            staging.pages_total = pages_total
-            staging.pages_processed = pages_processed
-            staging.finished_at = finished_at
-            staging.error_message = None
-            db.commit()
-
-            # Send message based on status
-            if status == "awaiting_supplier":
-                _set_pending_file_processing_action(
-                    db=db,
-                    user_id=user_uuid,
-                    restaurant_id=restaurant_uuid,
-                    staging_id=staging.id,
-                    field="supplier",
-                    supplier_id=supplier_uuid,
-                )
-                db.commit()
-                _send_message_with_telemetry(
-                    db=db,
-                    chat_id=chat_id,
-                    text="I couldn't find the supplier in this price list. Which supplier is it from?",
-                    settings=settings,
-                    session_uuid=session_uuid,
-                )
-            elif status == "awaiting_currency":
-                _set_pending_file_processing_action(
-                    db=db,
-                    user_id=user_uuid,
-                    restaurant_id=restaurant_uuid,
-                    staging_id=staging.id,
-                    field="currency",
-                    supplier_id=supplier_uuid,
-                )
-                db.commit()
-                _send_message_with_telemetry(
-                    db=db,
-                    chat_id=chat_id,
-                    text="What currency is this price list in? (e.g., USD, EUR)",
-                    settings=settings,
-                    session_uuid=session_uuid,
-                )
-            else:
-                _clear_pending_file_processing_action(
-                    db=db,
-                    user_id=user_uuid,
-                    restaurant_id=restaurant_uuid,
-                    supplier_id=supplier_uuid,
-                )
-                db.commit()
-                _set_pending_file_processing_confirm_action(
-                    db=db,
-                    user_id=user_uuid,
-                    restaurant_id=restaurant_uuid,
-                    staging_id=staging.id,
-                    supplier_id=supplier_uuid,
-                )
-                db.commit()
-                # Format and send preview message with summary (not all items)
-                items = extracted_data.get("items", [])
-                total_items = len(items)
-                
-                lines = ["📋 **Price List Extracted**\n"]
-                lines.append(f"**Supplier:** {supplier_name}")
-                
-                # Show contact info if available
-                contact_name = extracted_data.get("contact_name")
-                contact_email = extracted_data.get("contact_email")
-                contact_phone = extracted_data.get("contact_phone")
-                if contact_name:
-                    lines.append(f"**Contact:** {contact_name}")
-                if contact_email:
-                    lines.append(f"**Email:** {contact_email}")
-                if contact_phone:
-                    lines.append(f"**Phone:** {contact_phone}")
-                
-                lines.append(f"**Currency:** {currency}")
-                lines.append(f"**Total Items:** {total_items}")
-                
-                # Show effective date if available
-                effective_date = extracted_data.get("effective_date")
-                if effective_date:
-                    lines.append(f"**Effective Date:** {effective_date}")
-                
-                # Show sample of first 5 items
-                sample_size = min(5, total_items)
-                if sample_size > 0:
-                    lines.append(f"\n**Sample Items (first {sample_size} of {total_items}):**")
-                    for i, item in enumerate(items[:sample_size], 1):
-                        name = item.get("supplier_name_raw", item.get("name", "N/A"))
-                        price = item.get("price", "N/A")
-                        pack_size = item.get("pack_size_text", "")
-                        
-                        item_line = f"  {i}. {name}"
-                        if pack_size:
-                            item_line += f" ({pack_size})"
-                        item_line += f" - {currency} {price}"
-                        lines.append(item_line)
-                    
-                    if total_items > sample_size:
-                        lines.append(f"  ... and {total_items - sample_size} more items")
-                
-                lines.append("\n---")
-                lines.append("✅ Say **/confirm** to save all items to your database")
-                lines.append("❓ Ask me to show specific items or categories")
-                lines.append("✏️ Tell me if anything needs correcting")
-                
-                preview_text = "\n".join(lines)
-                _send_message_with_telemetry(
-                    db=db,
-                    chat_id=chat_id,
-                    text=preview_text,
-                    settings=settings,
-                    session_uuid=session_uuid,
-                )
-
-            # Record processing event
-            db.add(
-                ProcessingEvents(
-                    session_id=session_uuid if session_uuid else staging.id,
-                    at=dt.datetime.now(dt.UTC),
-                    event="price_list_file_processed_v0",
-                    payload_json=json.dumps(
-                        {"staging_id": str(staging.id), "file_id": file_id}, ensure_ascii=False
-                    ),
-                    error=None,
-                )
-            )
-            db.commit()
 
     except TelegramFileExpiredError as exc:
-        # File no longer available - clear, actionable message
         logger.error(
             "process_price_list_file_task_file_expired",
             extra={
@@ -1066,13 +742,19 @@ def process_price_list_file_task(
             },
         )
         try:
+            if db_session and run_id:
+                _mark_run_failed(
+                    db=db_session,
+                    run_id=run_id,
+                    error_message="Telegram file expired",
+                )
             _send_message_with_telemetry(
                 db=db_session,
                 chat_id=chat_id,
                 text=(
                     "⏰ Your price list file is no longer available on Telegram.\n\n"
                     "Telegram files expire after 24-48 hours. To process this price list, "
-                    "please re-upload the file.\n\n"
+                    "please re-upload the PDF.\n\n"
                     "💡 Tip: If you were resuming processing, I'll pick up where we left off "
                     "after you re-upload."
                 ),
@@ -1084,7 +766,6 @@ def process_price_list_file_task(
         raise
 
     except TelegramFileTooBigError as exc:
-        # File too large - clear message
         logger.error(
             "process_price_list_file_task_file_too_big",
             extra={
@@ -1095,13 +776,19 @@ def process_price_list_file_task(
             },
         )
         try:
+            if db_session and run_id:
+                _mark_run_failed(
+                    db=db_session,
+                    run_id=run_id,
+                    error_message=str(exc),
+                )
             _send_message_with_telemetry(
                 db=db_session,
                 chat_id=chat_id,
                 text=(
                     "📦 Your price list file is too large.\n\n"
                     f"{str(exc)}\n\n"
-                    "Please try splitting the file into smaller files or compressing it."
+                    "Please try compressing the PDF or taking a photo instead."
                 ),
                 settings=settings,
                 session_uuid=session_uuid,
@@ -1111,7 +798,6 @@ def process_price_list_file_task(
         raise
 
     except TelegramFileNetworkError as exc:
-        # Transient error - suggest retry
         logger.warning(
             "process_price_list_file_task_network_error",
             extra={
@@ -1122,13 +808,19 @@ def process_price_list_file_task(
             },
         )
         try:
+            if db_session and run_id:
+                _mark_run_failed(
+                    db=db_session,
+                    run_id=run_id,
+                    error_message=str(exc),
+                )
             _send_message_with_telemetry(
                 db=db_session,
                 chat_id=chat_id,
                 text=(
-                    "⚠️ Temporary error downloading your price list.\n\n"
+                    "⚠️ Temporary error downloading your price list file.\n\n"
                     "This is usually a temporary issue with Telegram's servers. "
-                    "Please try re-uploading the file in a few minutes."
+                    "Please try re-uploading the PDF in a few minutes."
                 ),
                 settings=settings,
                 session_uuid=session_uuid,
@@ -1147,12 +839,17 @@ def process_price_list_file_task(
                 "chat_id": chat_id,
             },
         )
-        # Send error message to user
         try:
+            if db_session and run_id:
+                _mark_run_failed(
+                    db=db_session,
+                    run_id=run_id,
+                    error_message=str(exc),
+                )
             _send_message_with_telemetry(
                 db=db_session,
                 chat_id=chat_id,
-                text=f"Sorry, I couldn't process your price list file. Error: {str(exc)}",
+                text=f"Sorry, I couldn't process your price list. Error: {str(exc)}",
                 settings=settings,
                 session_uuid=session_uuid,
             )
@@ -1170,7 +867,7 @@ def process_inventory_photo_task(
     user_id: str,
     session_id: str | None = None,
 ) -> None:
-    """Process an inventory photo: extract data, match products, store in staging."""
+    """Process an inventory photo: enqueue coordinator and notify user on completion."""
     task_id = _get_task_id()
     logger.info(
         "celery_task_started name=process_inventory_photo_task task_id=%s restaurant_id=%s file_id=%s",
@@ -1184,13 +881,13 @@ def process_inventory_photo_task(
     user_uuid = _parse_uuid(user_id)
     session_uuid = _parse_uuid(session_id) if session_id else None
     db_session: Session | None = None
+    run_id: uuid.UUID | None = None
 
     try:
         with worker_db_session() as db:
             db_session = db
             now = dt.datetime.now(dt.UTC)
 
-            # Get actual mime type and filename from Telegram message
             telegram_msg = db.scalar(
                 select(TelegramMessages)
                 .where(TelegramMessages.file_id == file_id)
@@ -1215,12 +912,16 @@ def process_inventory_photo_task(
                 status="processing",
                 pages_total=1,
                 pages_processed=0,
-                current_stage="processing",
+                current_stage="intake",
                 error_message=None,
                 started_at=now,
+                source="telegram",
+                chat_id=chat_id,
+                session_id=session_uuid,
             )
             db.add(run)
             db.flush()
+            run_id = run.id
 
             staging = FileProcessingStaging(
                 restaurant_id=restaurant_uuid,
@@ -1238,151 +939,17 @@ def process_inventory_photo_task(
             db.add(staging)
             db.commit()
 
-            # Download file
             file_bytes = get_file_bytes(file_id=file_id, settings=settings)
 
-            # Extract inventory data using new page-by-page processor with snapshots
-            try:
-                from app.processing.page_processor import process_file_with_snapshots
-
-                result = process_file_with_snapshots(
-                    run_id=run.id,
-                    file_bytes=file_bytes,
-                    mime_type=mime_type,
-                    filename=filename,
-                    processing_type="inventory",
-                    db=db,
-                    settings=settings,
-                )
-
-                extracted_data = result["data"]
-                telemetry_results = result.get("telemetry", [])
-
-                # Record telemetry for vision calls (uses fresh session internally)
-                if telemetry_results:
-                    _record_vision_telemetry(
-                        session_uuid=session_uuid,
-                        chat_id=chat_id,
-                        telemetry_results=telemetry_results,
-                        purpose_base="vision_inventory",
-                        processing_type="inventory",
-                    )
-                    # Note: File processing steps are now recorded by page_processor itself
-
-            except Exception as exc:
-                failed_at = dt.datetime.now(dt.UTC)
-                run.status = "failed"
-                run.current_stage = "failed"
-                run.error_message = str(exc)
-                run.finished_at = failed_at
-                staging.status = "failed"
-                staging.error_message = str(exc)
-                staging.finished_at = failed_at
-                db.commit()
-                # Record error telemetry if possible (uses fresh session internally)
-                if session_uuid:
-                    try:
-                        model, _, _ = _get_vision_settings(settings)
-                        error_result = VisionCallResult(
-                            content="",
-                            model=model,
-                            latency_ms=0,
-                            usage=None,
-                            openrouter_generation_id=None,
-                            response_headers={},
-                            response_data={},
-                            error=f"Inventory extraction failed: {exc}",
-                        )
-                        _record_vision_telemetry(
-                            session_uuid=session_uuid,
-                            chat_id=chat_id,
-                            telemetry_results=[error_result],
-                            purpose_base="vision_inventory",
-                            processing_type="inventory",
-                        )
-                        _record_file_processing_steps(
-                            run_id=run.id,
-                            telemetry_results=[error_result],
-                            stage="vision_inventory_error",
-                        )
-                    except Exception:
-                        logger.exception("failed_to_record_error_telemetry")
-                raise
-
-            # No longer matching product aliases - we store raw names and search when user asks
-            alias_matches = {}
-
-            finished_at = dt.datetime.now(dt.UTC)
-            run.status = "completed"
-            run.current_stage = "pending_review"
-            run.pages_processed = 1
-            run.finished_at = finished_at
-
-            staging.extracted_data_json = extracted_data
-            staging.product_alias_matches_json = alias_matches
-            staging.status = "pending_review"
-            staging.pages_processed = 1
-            staging.finished_at = finished_at
-            staging.error_message = None
-            db.commit()
-            _set_pending_file_processing_confirm_action(
+            _enqueue_coordinator_task(
                 db=db,
-                user_id=user_uuid,
-                restaurant_id=restaurant_uuid,
-                staging_id=staging.id,
+                run=run,
+                file_bytes=file_bytes,
+                mime_type=mime_type,
+                filename=filename,
             )
-            db.commit()
-
-            # Format and send preview message with summary
-            items = extracted_data.get("items", [])
-            total_items = len(items)
-            
-            lines = ["📸 **Inventory Extracted**\n"]
-            lines.append(f"**Items Detected:** {total_items}")
-            
-            # Show sample of items (first 10 for inventory)
-            sample_size = min(10, total_items)
-            if sample_size > 0:
-                lines.append(f"\n**Items ({sample_size} of {total_items}):**")
-                for i, item in enumerate(items[:sample_size], 1):
-                    product_name = item.get("product_name", "N/A")
-                    quantity = item.get("quantity", "N/A")
-                    unit = item.get("unit", "")
-                    lines.append(f"  {i}. {product_name} - {quantity} {unit}")
-                
-                if total_items > sample_size:
-                    lines.append(f"  ... and {total_items - sample_size} more items")
-            
-            lines.append("\n---")
-            lines.append("✅ Say **/confirm** to save inventory counts")
-            lines.append("❓ Ask to see all items if needed")
-            lines.append("✏️ Tell me if anything needs correcting")
-            
-            preview_text = "\n".join(lines)
-            _send_message_with_telemetry(
-                db=db,
-                chat_id=chat_id,
-                text=preview_text,
-                settings=settings,
-                session_uuid=session_uuid,
-            )
-
-            # Record processing event
-            db.add(
-                ProcessingEvents(
-                    session_id=session_uuid if session_uuid else staging.id,
-                    at=dt.datetime.now(dt.UTC),
-                    event="inventory_photo_processed_v0",
-                    payload_json=json.dumps(
-                        {"staging_id": str(staging.id), "file_id": file_id}, ensure_ascii=False
-                    ),
-                    error=None,
-                )
-            )
-            db.commit()
 
     except TelegramFileExpiredError as exc:
-        # File no longer available - clear, actionable message
         logger.error(
             "process_inventory_photo_task_file_expired",
             extra={
@@ -1393,6 +960,12 @@ def process_inventory_photo_task(
             },
         )
         try:
+            if db_session and run_id:
+                _mark_run_failed(
+                    db=db_session,
+                    run_id=run_id,
+                    error_message="Telegram file expired",
+                )
             _send_message_with_telemetry(
                 db=db_session,
                 chat_id=chat_id,
@@ -1409,7 +982,6 @@ def process_inventory_photo_task(
         raise
 
     except TelegramFileTooBigError as exc:
-        # File too large - clear message
         logger.error(
             "process_inventory_photo_task_file_too_big",
             extra={
@@ -1420,6 +992,12 @@ def process_inventory_photo_task(
             },
         )
         try:
+            if db_session and run_id:
+                _mark_run_failed(
+                    db=db_session,
+                    run_id=run_id,
+                    error_message=str(exc),
+                )
             _send_message_with_telemetry(
                 db=db_session,
                 chat_id=chat_id,
@@ -1436,7 +1014,6 @@ def process_inventory_photo_task(
         raise
 
     except TelegramFileNetworkError as exc:
-        # Transient error - suggest retry
         logger.warning(
             "process_inventory_photo_task_network_error",
             extra={
@@ -1447,6 +1024,12 @@ def process_inventory_photo_task(
             },
         )
         try:
+            if db_session and run_id:
+                _mark_run_failed(
+                    db=db_session,
+                    run_id=run_id,
+                    error_message=str(exc),
+                )
             _send_message_with_telemetry(
                 db=db_session,
                 chat_id=chat_id,
@@ -1472,8 +1055,13 @@ def process_inventory_photo_task(
                 "chat_id": chat_id,
             },
         )
-        # Send error message to user
         try:
+            if db_session and run_id:
+                _mark_run_failed(
+                    db=db_session,
+                    run_id=run_id,
+                    error_message=str(exc),
+                )
             _send_message_with_telemetry(
                 db=db_session,
                 chat_id=chat_id,
@@ -1494,29 +1082,10 @@ def process_file_api_task(
     filename: str,
 ) -> dict[str, Any]:
     """
-    Process file uploaded via API.
+    Coordinator task that creates page jobs and enqueues per-page processing.
 
-    Similar to Telegram tasks but accepts base64-encoded file bytes
-    instead of Telegram file_id.
-
-    Args:
-        run_id: FileProcessingRuns UUID as string
-        file_bytes_base64: Base64-encoded file bytes
-        mime_type: MIME type of file
-        filename: Original filename
-
-    Returns:
-        {
-            "run_id": "...",
-            "status": "completed",
-            "staging_id": "..."
-        }
+    Accepts base64-encoded payloads or payload references with the "db:" prefix.
     """
-    import base64
-    from uuid import UUID
-
-    from app.processing.page_processor import process_file_with_snapshots
-
     logger.info(
         "process_file_api_task_started",
         extra={
@@ -1526,71 +1095,702 @@ def process_file_api_task(
         },
     )
 
-    # Decode file bytes
-    file_bytes = base64.b64decode(file_bytes_base64)
+    run_uuid = _parse_uuid(run_id)
 
-    # Get database session
     with worker_db_session() as db:
-        settings = get_settings()
-
-        # Get run record
-        run = db.get(FileProcessingRuns, UUID(run_id))
+        run = db.get(FileProcessingRuns, run_uuid)
         if not run:
             raise ValueError(f"FileProcessingRun not found: {run_id}")
 
         try:
-            # Process with snapshots
-            result = process_file_with_snapshots(
-                run_id=run.id,
-                file_bytes=file_bytes,
-                mime_type=mime_type,
-                filename=filename,
-                processing_type=run.processing_type,
+            file_bytes = _resolve_payload_bytes(db=db, payload_ref=file_bytes_base64)
+        except Exception as exc:
+            _mark_run_failed(db=db, run_id=run_uuid, error_message=str(exc))
+            raise
+
+        now = dt.datetime.now(dt.UTC)
+        if not run.started_at:
+            run.started_at = now
+        run.status = "processing"
+        run.current_stage = "pdf_to_images" if mime_type == "application/pdf" else "image_to_page"
+        db.commit()
+
+        try:
+            if mime_type == "application/pdf":
+                pages = _convert_pdf_pages_to_images(file_bytes)
+                page_mime_type = "image/png"
+            else:
+                pages = [(1, file_bytes)]
+                page_mime_type = mime_type
+        except Exception as exc:
+            _mark_run_failed(db=db, run_id=run_uuid, error_message=str(exc))
+            raise
+
+        total_pages = len(pages)
+        run.pages_total = total_pages
+        run.pages_processed = 0
+        run.current_stage = "page_jobs_enqueued"
+
+        staging = db.scalar(
+            select(FileProcessingStaging).where(FileProcessingStaging.run_id == run.id)
+        )
+        if staging:
+            staging.pages_total = total_pages
+            staging.pages_processed = 0
+            if not staging.started_at:
+                staging.started_at = run.started_at or now
+        db.commit()
+
+        for page_index, page_bytes in pages:
+            existing = db.scalar(
+                select(FileProcessingPageJobs).where(
+                    FileProcessingPageJobs.run_id == run.id,
+                    FileProcessingPageJobs.page_index == page_index,
+                )
+            )
+            if existing:
+                job = existing
+            else:
+                job = FileProcessingPageJobs(
+                    run_id=run.id,
+                    page_index=page_index,
+                    status="pending",
+                )
+                db.add(job)
+                db.flush()
+
+            if job.status in {"completed", "failed_ocr", "failed_extraction"}:
+                continue
+
+            payload_ref = _encode_payload_bytes(
                 db=db,
-                settings=settings,
+                payload_bytes=page_bytes,
+                run_id=run.id,
+                page_index=page_index,
+            )
+            db.commit()
+            process_page_job_task.apply_async(
+                args=[str(run.id), page_index, payload_ref, page_mime_type],
+                task_id=f"{run.id}:{page_index}",
             )
 
-            # Update staging with extracted data
-            staging = db.query(FileProcessingStaging).filter_by(
-                run_id=run.id
-            ).first()
+        return {
+            "run_id": run_id,
+            "status": "enqueued",
+            "pages_total": total_pages,
+        }
 
-            if staging:
-                staging.extracted_data_json = result["data"]
-                staging.status = "pending_review"
+
+def _get_page_job_counts(db: Session, run_id: uuid.UUID) -> dict[str, int]:
+    total = db.scalar(
+        select(func.count()).where(FileProcessingPageJobs.run_id == run_id)
+    ) or 0
+    completed = db.scalar(
+        select(func.count()).where(
+            FileProcessingPageJobs.run_id == run_id,
+            FileProcessingPageJobs.status == "completed",
+        )
+    ) or 0
+    failed = db.scalar(
+        select(func.count()).where(
+            FileProcessingPageJobs.run_id == run_id,
+            FileProcessingPageJobs.status.in_(["failed_ocr", "failed_extraction"]),
+        )
+    ) or 0
+    processing = db.scalar(
+        select(func.count()).where(
+            FileProcessingPageJobs.run_id == run_id,
+            FileProcessingPageJobs.status == "processing",
+        )
+    ) or 0
+
+    return {
+        "total": total,
+        "completed": completed,
+        "failed": failed,
+        "processing": processing,
+    }
+
+
+def _update_run_progress(db: Session, run_id: uuid.UUID) -> dict[str, int]:
+    counts = _get_page_job_counts(db, run_id)
+    run = db.get(FileProcessingRuns, run_id)
+    if run:
+        if counts["total"] > 0:
+            run.pages_total = counts["total"]
+        run.pages_processed = counts["completed"]
+
+    staging = db.scalar(
+        select(FileProcessingStaging).where(FileProcessingStaging.run_id == run_id)
+    )
+    if staging:
+        if counts["total"] > 0:
+            staging.pages_total = counts["total"]
+        staging.pages_processed = counts["completed"]
+
+    db.commit()
+    return counts
+
+
+@celery_app.task(name="process_page_job_task")
+def process_page_job_task(
+    run_id: str,
+    page_index: int,
+    page_payload: str,
+    mime_type: str,
+) -> None:
+    settings = get_settings()
+    run_uuid = _parse_uuid(run_id)
+
+    with worker_db_session() as db:
+        run = db.get(FileProcessingRuns, run_uuid)
+        if not run:
+            raise ValueError(f"FileProcessingRun not found: {run_id}")
+
+        job = db.scalar(
+            select(FileProcessingPageJobs).where(
+                FileProcessingPageJobs.run_id == run_uuid,
+                FileProcessingPageJobs.page_index == page_index,
+            )
+        )
+        if not job:
+            job = FileProcessingPageJobs(
+                run_id=run_uuid,
+                page_index=page_index,
+                status="pending",
+            )
+            db.add(job)
+            db.commit()
+
+        if job.status in {"completed", "failed_ocr", "failed_extraction"}:
+            return
+
+        updated = db.execute(
+            update(FileProcessingPageJobs)
+            .where(
+                FileProcessingPageJobs.id == job.id,
+                FileProcessingPageJobs.status == "pending",
+            )
+            .values(status="processing", error_message=None)
+        )
+        if updated.rowcount != 1:
+            db.rollback()
+            return
+
+        run.current_stage = f"page_{page_index}_processing"
+        db.commit()
+
+        total_pages = run.pages_total or 0
+
+        ocr_attempts = 0
+        markdown_text = ""
+        ocr_step = db.scalar(
+            select(FileProcessingSteps).where(
+                FileProcessingSteps.run_id == run_uuid,
+                FileProcessingSteps.stage == "ocr",
+                FileProcessingSteps.page_index == page_index,
+                FileProcessingSteps.status == "completed",
+            )
+        )
+        if ocr_step and ocr_step.output_text:
+            markdown_text = ocr_step.output_text
+        else:
+            try:
+                page_bytes = _resolve_payload_bytes(db=db, payload_ref=page_payload)
+                ocr_result, ocr_attempts = ocr_page_with_retries(
+                    page_image_bytes=page_bytes,
+                    page_num=page_index,
+                    total_pages=total_pages or page_index,
+                    settings=settings,
+                    max_attempts=OCR_MAX_ATTEMPTS,
+                )
+                markdown_text = ocr_result.content or ""
+                save_page_snapshot(
+                    run_id=run_uuid,
+                    page_index=page_index,
+                    stage="ocr",
+                    output_text=markdown_text,
+                    status="completed",
+                    db=db,
+                )
+            except Exception as exc:
+                job.status = "failed_ocr"
+                job.error_message = str(exc)
+                job.ocr_retries = max(OCR_MAX_ATTEMPTS - 1, 0)
+                save_page_snapshot(
+                    run_id=run_uuid,
+                    page_index=page_index,
+                    stage="ocr",
+                    output_text="",
+                    status="failed",
+                    error_message=str(exc),
+                    db=db,
+                )
+                db.commit()
+                _update_run_progress(db, run_uuid)
+                maybe_finalize_run(run_uuid, db)
+                return
+
+        if not markdown_text:
+            job.status = "failed_ocr"
+            job.error_message = "OCR returned empty content"
+            job.ocr_retries = max(OCR_MAX_ATTEMPTS - 1, 0)
+            save_page_snapshot(
+                run_id=run_uuid,
+                page_index=page_index,
+                stage="ocr",
+                output_text="",
+                status="failed",
+                error_message=job.error_message,
+                db=db,
+            )
+            db.commit()
+            _update_run_progress(db, run_uuid)
+            maybe_finalize_run(run_uuid, db)
+            return
+
+        extraction_attempts = 0
+        try:
+            db_schema = get_extraction_schema(run.processing_type)
+            extraction_result, _, extraction_attempts = extract_json_with_retries(
+                markdown_text=markdown_text,
+                page_num=page_index,
+                processing_type=run.processing_type,
+                db_schema=db_schema,
+                settings=settings,
+                max_attempts=EXTRACTION_MAX_ATTEMPTS,
+            )
+            save_page_snapshot(
+                run_id=run_uuid,
+                page_index=page_index,
+                stage="extraction",
+                output_text=extraction_result.content or "{}",
+                status="completed",
+                db=db,
+            )
+        except Exception as exc:
+            job.status = "failed_extraction"
+            job.error_message = str(exc)
+            job.extraction_retries = max(EXTRACTION_MAX_ATTEMPTS - 1, 0)
+            save_page_snapshot(
+                run_id=run_uuid,
+                page_index=page_index,
+                stage="extraction",
+                output_text="",
+                status="failed",
+                error_message=str(exc),
+                db=db,
+            )
+            db.commit()
+            _update_run_progress(db, run_uuid)
+            maybe_finalize_run(run_uuid, db)
+            return
+
+        job.status = "completed"
+        if ocr_attempts:
+            job.ocr_retries = max(ocr_attempts - 1, 0)
+        if extraction_attempts:
+            job.extraction_retries = max(extraction_attempts - 1, 0)
+        job.error_message = None
+        db.commit()
+
+        counts = _update_run_progress(db, run_uuid)
+
+        if run.webhook_url and counts["total"] > 0:
+            completed = counts["completed"]
+            total = counts["total"]
+            if completed % 10 == 0 or (counts["completed"] + counts["failed"]) >= total:
+                progress_pct = (completed / total) * 100 if total else 0
+                send_webhook_notification(
+                    webhook_url=run.webhook_url,
+                    run_id=run.id,
+                    status="processing",
+                    progress_percentage=progress_pct,
+                    pages_processed=completed,
+                    pages_total=total,
+                )
+
+        maybe_finalize_run(run_uuid, db)
+
+
+def maybe_finalize_run(run_id: uuid.UUID, db: Session) -> None:
+    counts = _get_page_job_counts(db, run_id)
+    total = counts["total"]
+    if total <= 0:
+        return
+    terminal = counts["completed"] + counts["failed"]
+    if terminal < total:
+        return
+
+    updated = db.execute(
+        update(FileProcessingRuns)
+        .where(
+            FileProcessingRuns.id == run_id,
+            or_(
+                FileProcessingRuns.current_stage.is_(None),
+                FileProcessingRuns.current_stage.notin_(["merge_pending", "finalize"]),
+            ),
+        )
+        .values(current_stage="merge_pending")
+    )
+    if updated.rowcount != 1:
+        db.rollback()
+        return
+    db.commit()
+    finalize_run_task.apply_async(args=[str(run_id)])
+
+
+@celery_app.task(name="finalize_run_task")
+def finalize_run_task(run_id: str) -> None:
+    settings = get_settings()
+    run_uuid = _parse_uuid(run_id)
+
+    with worker_db_session() as db:
+        run = db.get(FileProcessingRuns, run_uuid)
+        if not run:
+            raise ValueError(f"FileProcessingRun not found: {run_id}")
+
+        staging = db.scalar(
+            select(FileProcessingStaging).where(FileProcessingStaging.run_id == run_uuid)
+        )
+        if not staging:
+            logger.error("finalize_run_task_no_staging", extra={"run_id": run_id})
+            return
+
+        failed_pages = db.scalars(
+            select(FileProcessingPageJobs.page_index)
+            .where(
+                FileProcessingPageJobs.run_id == run_uuid,
+                FileProcessingPageJobs.status.in_(["failed_ocr", "failed_extraction"]),
+            )
+            .order_by(FileProcessingPageJobs.page_index)
+        ).all()
+        failed_pages_list = [int(page) for page in failed_pages]
+
+        try:
+            merged_data = merge_page_results(run_uuid, db)
+        except Exception as exc:
+            _mark_run_failed(db=db, run_id=run_uuid, error_message=str(exc))
+            raise
+        if not isinstance(merged_data, dict):
+            merged_data = {}
+
+        counts = _update_run_progress(db, run_uuid)
+
+        supplier_uuid = run.supplier_id or staging.supplier_id
+        supplier_name = (
+            merged_data.get("supplier_name", "").strip()
+            if isinstance(merged_data, dict) and merged_data.get("supplier_name")
+            else ""
+        )
+        currency = (
+            merged_data.get("currency", "").strip()
+            if isinstance(merged_data, dict) and merged_data.get("currency")
+            else ""
+        )
+
+        if run.processing_type in {"invoice", "price_list"}:
+            if not supplier_uuid and supplier_name:
+                defaults = {}
+                if run.processing_type == "price_list":
+                    defaults = {
+                        "contact_name": merged_data.get("contact_name"),
+                        "contact_email": merged_data.get("contact_email"),
+                        "contact_phone": merged_data.get("contact_phone"),
+                        "currency": merged_data.get("currency"),
+                    }
+                supplier = _get_or_create_supplier(
+                    db=db,
+                    name=supplier_name,
+                    restaurant_id=run.restaurant_id,
+                    defaults=defaults,
+                )
+                supplier_uuid = supplier.id
+
+            if supplier_uuid:
+                run.supplier_id = supplier_uuid
+                staging.supplier_id = supplier_uuid
+                _ensure_restaurant_supplier_link(
+                    db=db,
+                    restaurant_id=run.restaurant_id,
+                    supplier_id=supplier_uuid,
+                )
+                if not supplier_name:
+                    supplier_row = db.get(Suppliers, supplier_uuid)
+                    if supplier_row:
+                        supplier_name = supplier_row.name
+
+        if run.source == "telegram" and run.processing_type in {"invoice", "price_list"}:
+            if not run.document_id:
+                document = Documents(
+                    restaurant_id=run.restaurant_id,
+                    supplier_id=supplier_uuid,
+                    doc_type=run.processing_type,
+                    file_url=run.file_id,
+                    uploaded_at=dt.datetime.now(dt.UTC),
+                )
+                db.add(document)
+                db.flush()
+                run.document_id = document.id
+                staging.document_id = document.id
+
+        status = "pending_review"
+        if run.processing_type in {"invoice", "price_list"}:
+            if not supplier_uuid and not supplier_name:
+                status = "awaiting_supplier"
+            elif not currency:
+                status = "awaiting_currency"
+
+        staging.extracted_data_json = merged_data if isinstance(merged_data, dict) else {}
+        staging.product_alias_matches_json = {}
+        staging.status = status
+        staging.error_message = None
+        staging.finished_at = dt.datetime.now(dt.UTC)
+
+        run.status = "completed"
+        run.current_stage = "finalize"
+        run.finished_at = dt.datetime.now(dt.UTC)
+        if failed_pages_list:
+            run.error_message = f"{len(failed_pages_list)} pages failed: {failed_pages_list}"
+        else:
+            run.error_message = None
+
+        db.commit()
+
+        if run.source == "telegram" and run.chat_id:
+            if status == "awaiting_supplier":
+                _set_pending_file_processing_action(
+                    db=db,
+                    user_id=run.user_id,
+                    restaurant_id=run.restaurant_id,
+                    staging_id=staging.id,
+                    field="supplier",
+                    supplier_id=supplier_uuid,
+                )
+                db.commit()
+                _send_message_with_telemetry(
+                    db=db,
+                    chat_id=run.chat_id,
+                    text=(
+                        "I couldn't find the supplier in this document. "
+                        "What supplier is it from?"
+                    ),
+                    settings=settings,
+                    session_uuid=run.session_id,
+                )
+            elif status == "awaiting_currency":
+                _set_pending_file_processing_action(
+                    db=db,
+                    user_id=run.user_id,
+                    restaurant_id=run.restaurant_id,
+                    staging_id=staging.id,
+                    field="currency",
+                    supplier_id=supplier_uuid,
+                )
+                db.commit()
+                _send_message_with_telemetry(
+                    db=db,
+                    chat_id=run.chat_id,
+                    text=(
+                        "What currency is this document in? (e.g., USD, EUR)"
+                    ),
+                    settings=settings,
+                    session_uuid=run.session_id,
+                )
+            else:
+                _clear_pending_file_processing_action(
+                    db=db,
+                    user_id=run.user_id,
+                    restaurant_id=run.restaurant_id,
+                    supplier_id=supplier_uuid,
+                )
+                db.commit()
+                _set_pending_file_processing_confirm_action(
+                    db=db,
+                    user_id=run.user_id,
+                    restaurant_id=run.restaurant_id,
+                    staging_id=staging.id,
+                    supplier_id=supplier_uuid,
+                )
                 db.commit()
 
-                logger.info(
-                    "process_file_api_task_completed",
-                    extra={
-                        "run_id": run_id,
-                        "staging_id": str(staging.id),
-                        "status": "completed",
-                    },
-                )
+                if run.processing_type == "invoice":
+                    line_items = merged_data.get("line_items", []) if isinstance(merged_data, dict) else []
+                    total_items = len(line_items)
+                    lines = ["📄 **Invoice Extracted**\n"]
+                    lines.append(f"**Supplier:** {supplier_name or 'N/A'}")
+                    lines.append(f"**Invoice #:** {merged_data.get('invoice_number', 'N/A')}")
+                    lines.append(f"**Date:** {merged_data.get('invoice_date', 'N/A')}")
+                    due_date = merged_data.get("due_date") if isinstance(merged_data, dict) else None
+                    if due_date:
+                        lines.append(f"**Due Date:** {due_date}")
+                    lines.append(f"**Currency:** {currency or 'N/A'}")
+                    lines.append(f"**Total:** {currency or ''} {merged_data.get('total', 'N/A')}")
+                    lines.append(f"**Line Items:** {total_items}")
 
-                return {
-                    "run_id": run_id,
-                    "status": "completed",
-                    "staging_id": str(staging.id),
-                }
-            else:
-                logger.error(
-                    "process_file_api_task_no_staging",
-                    extra={"run_id": run_id},
-                )
-                return {
-                    "run_id": run_id,
-                    "status": "completed_no_staging",
-                }
+                    sample_size = min(10, total_items)
+                    if sample_size > 0:
+                        lines.append(f"\n**Line Items ({sample_size} of {total_items}):**")
+                        for i, item in enumerate(line_items[:sample_size], 1):
+                            desc = item.get("description_raw", item.get("description", "N/A"))
+                            qty = item.get("quantity", "N/A")
+                            unit = item.get("unit", "")
+                            total = item.get("line_total", "N/A")
+                            lines.append(f"  {i}. {desc} - {qty} {unit} = {currency or ''} {total}")
+                        if total_items > sample_size:
+                            lines.append(f"  ... and {total_items - sample_size} more items")
 
-        except Exception as exc:
-            logger.exception(
-                "process_file_api_task_failed",
-                extra={
-                    "error": repr(exc),
-                    "run_id": run_id,
-                    "filename": filename,
-                },
+                    lines.append("\n---")
+                    lines.append("✅ Say **/confirm** to save this invoice")
+                    lines.append("❓ Ask to see all line items if needed")
+                    lines.append("✏️ Tell me if anything needs correcting")
+
+                    _send_message_with_telemetry(
+                        db=db,
+                        chat_id=run.chat_id,
+                        text="\n".join(lines),
+                        settings=settings,
+                        session_uuid=run.session_id,
+                    )
+
+                elif run.processing_type == "price_list":
+                    items = merged_data.get("items", []) if isinstance(merged_data, dict) else []
+                    total_items = len(items)
+                    lines = ["📋 **Price List Extracted**\n"]
+                    lines.append(f"**Supplier:** {supplier_name or 'N/A'}")
+                    lines.append(f"**Currency:** {currency or 'N/A'}")
+                    lines.append(f"**Items:** {total_items}")
+
+                    sample_size = min(10, total_items)
+                    if sample_size > 0:
+                        lines.append(f"\n**Items ({sample_size} of {total_items}):**")
+                        for i, item in enumerate(items[:sample_size], 1):
+                            name = item.get("supplier_name_raw", item.get("name", "N/A"))
+                            price = item.get("price", "N/A")
+                            item_currency = item.get("currency", currency or "N/A")
+                            unit_basis = item.get("unit_basis", "")
+                            pack_size = item.get("pack_size_text", "")
+                            min_order_qty = item.get("min_order_qty")
+
+                            item_line = f"  {i}. {name}"
+                            if pack_size:
+                                item_line += f" (pack_size_text: {pack_size})"
+                            if unit_basis:
+                                item_line += f" (unit_basis: {unit_basis})"
+                            if min_order_qty is not None:
+                                item_line += f" (min_order_qty: {min_order_qty})"
+                            item_line += f" - {price} {item_currency}"
+                            lines.append(item_line)
+                        if total_items > sample_size:
+                            lines.append(f"  ... and {total_items - sample_size} more items")
+
+                    lines.append("\n---")
+                    lines.append("✅ Say **/confirm** to save this price list")
+                    lines.append("❓ Ask to see all items if needed")
+                    lines.append("✏️ Tell me if anything needs correcting")
+
+                    _send_message_with_telemetry(
+                        db=db,
+                        chat_id=run.chat_id,
+                        text="\n".join(lines),
+                        settings=settings,
+                        session_uuid=run.session_id,
+                    )
+
+                elif run.processing_type == "inventory":
+                    items = merged_data.get("items", []) if isinstance(merged_data, dict) else []
+                    total_items = len(items)
+                    lines = ["📸 **Inventory Extracted**\n"]
+                    lines.append(f"**Items Detected:** {total_items}")
+
+                    sample_size = min(10, total_items)
+                    if sample_size > 0:
+                        lines.append(f"\n**Items ({sample_size} of {total_items}):**")
+                        for i, item in enumerate(items[:sample_size], 1):
+                            product_name = item.get("product_name", "N/A")
+                            quantity = item.get("quantity", "N/A")
+                            unit = item.get("unit", "")
+                            lines.append(f"  {i}. {product_name} - {quantity} {unit}")
+                        if total_items > sample_size:
+                            lines.append(f"  ... and {total_items - sample_size} more items")
+
+                    lines.append("\n---")
+                    lines.append("✅ Say **/confirm** to save inventory counts")
+                    lines.append("❓ Ask to see all items if needed")
+                    lines.append("✏️ Tell me if anything needs correcting")
+
+                    _send_message_with_telemetry(
+                        db=db,
+                        chat_id=run.chat_id,
+                        text="\n".join(lines),
+                        settings=settings,
+                        session_uuid=run.session_id,
+                    )
+
+        if run.source == "telegram":
+            event_name = None
+            if run.processing_type == "invoice":
+                event_name = "invoice_file_processed_v0"
+            elif run.processing_type == "price_list":
+                event_name = "price_list_file_processed_v0"
+            elif run.processing_type == "inventory":
+                event_name = "inventory_photo_processed_v0"
+
+            if event_name:
+                db.add(
+                    ProcessingEvents(
+                        session_id=run.session_id if run.session_id else staging.id,
+                        at=dt.datetime.now(dt.UTC),
+                        event=event_name,
+                        payload_json=json.dumps(
+                            {"staging_id": str(staging.id), "file_id": run.file_id},
+                            ensure_ascii=False,
+                        ),
+                        error=None,
+                    )
+                )
+                db.commit()
+
+        if run.webhook_url:
+            progress_pct = 100.0 if counts["total"] else 0.0
+            send_webhook_notification(
+                webhook_url=run.webhook_url,
+                run_id=run.id,
+                status="completed",
+                progress_percentage=progress_pct,
+                pages_processed=counts["completed"],
+                pages_total=counts["total"],
+                staging_id=staging.id,
+                error_message=run.error_message,
             )
-            raise
+
+
+@celery_app.task(name="cleanup_file_processing_task")
+def cleanup_file_processing_task() -> None:
+    with worker_db_session() as db:
+        now = dt.datetime.now(dt.UTC)
+        expired_run_ids = db.scalars(
+            select(FileProcessingRuns.id)
+            .join(
+                FileProcessingStaging,
+                FileProcessingStaging.run_id == FileProcessingRuns.id,
+            )
+            .where(
+                FileProcessingRuns.finished_at.isnot(None),
+                FileProcessingStaging.expires_at <= now,
+            )
+        ).all()
+
+        if not expired_run_ids:
+            return
+
+        db.query(FileProcessingPageJobs).filter(
+            FileProcessingPageJobs.run_id.in_(expired_run_ids)
+        ).delete(synchronize_session=False)
+        db.query(FileProcessingSteps).filter(
+            FileProcessingSteps.run_id.in_(expired_run_ids)
+        ).delete(synchronize_session=False)
+        db.query(FileProcessingPayloads).filter(
+            FileProcessingPayloads.run_id.in_(expired_run_ids)
+        ).delete(synchronize_session=False)
+        db.commit()

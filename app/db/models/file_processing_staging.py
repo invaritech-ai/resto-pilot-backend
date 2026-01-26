@@ -27,6 +27,9 @@ class FileProcessingStaging(Base):
     document_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("documents.id", ondelete="SET NULL"), nullable=True
     )
+    supplier_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("suppliers.id", ondelete="SET NULL"), nullable=True
+    )
     processing_type: Mapped[str] = mapped_column(
         Enum("invoice", "price_list", "inventory", name="processing_type"),
         nullable=False,

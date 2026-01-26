@@ -20,6 +20,23 @@ if config.config_file_name is not None:
 target_metadata = Base.metadata
 
 
+def _enum_type_exists(connection, name: str, schema: str | None) -> bool:
+    schema_name = schema or "public"
+    row = connection.execute(
+        text(
+            """
+            SELECT 1
+            FROM pg_type t
+            JOIN pg_namespace n ON n.oid = t.typnamespace
+            WHERE t.typname = :name AND n.nspname = :schema
+            LIMIT 1
+            """
+        ),
+        {"name": name, "schema": schema_name},
+    ).fetchone()
+    return row is not None
+
+
 def _get_db_enum_values(connection, name: str, schema: str | None) -> list[str]:
     schema_name = schema or "public"
     rows = connection.execute(
@@ -51,6 +68,10 @@ def _collect_enum_additions(connection, metadata: Base.metadata.__class__) -> di
             if not enum_name:
                 continue
             schema = col_type.schema
+            # Only emit ALTER TYPE for enums that already exist in the DB.
+            # For brand-new enums, Alembic/SQLAlchemy will create the type via table creation.
+            if not _enum_type_exists(connection, enum_name, schema):
+                continue
             db_values = _get_db_enum_values(connection, enum_name, schema)
             metadata_values = list(col_type.enums)
             missing = [value for value in metadata_values if value not in db_values]

@@ -4,7 +4,6 @@ File upload and processing API endpoints.
 Provides REST API access for file uploads with progress tracking and webhooks.
 """
 
-import base64
 import logging
 import uuid
 from typing import Any, cast
@@ -18,10 +17,12 @@ from fastapi import (
     UploadFile,
     status,
 )
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db_dep, get_settings_dep
 from app.core.config import Settings
+from app.db.models.file_processing_page_jobs import FileProcessingPageJobs
 from app.db.models.file_processing_runs import FileProcessingRuns
 from app.db.models.file_processing_staging import FileProcessingStaging
 from app.db.queries.file_processing import (
@@ -29,7 +30,7 @@ from app.db.queries.file_processing import (
     get_processing_status,
 )
 from app.workers.celery_types import CeleryDelayable
-from app.workers.file_processing_tasks import process_file_api_task
+from app.workers.file_processing_tasks import _encode_payload_bytes, process_file_api_task
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -122,6 +123,8 @@ async def upload_file(
         processing_type=processing_type,
         status="processing",
         webhook_url=webhook_url,
+        source="api",
+        supplier_id=supplier_uuid,
     )
     db.add(run)
     db.commit()
@@ -150,12 +153,16 @@ async def upload_file(
 
     # Enqueue for processing
     try:
-        # Encode file bytes to base64 for Celery serialization
-        file_bytes_base64 = base64.b64encode(file_bytes).decode("utf-8")
+        file_payload_ref = _encode_payload_bytes(
+            db=db,
+            payload_bytes=file_bytes,
+            run_id=run.id,
+        )
+        db.commit()
 
         async_result = cast(CeleryDelayable, process_file_api_task).delay(
             str(run.id),
-            file_bytes_base64,
+            file_payload_ref,
             mime_type,
             file.filename or "unknown",
         )
@@ -226,6 +233,41 @@ async def get_file_status(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=str(e),
         )
+
+
+@router.get("/files/{run_id}/pages")
+async def get_file_pages(
+    run_id: str,
+    db: Session = Depends(get_db_dep),
+) -> dict[str, Any]:
+    """Return page job statuses for a file processing run."""
+    try:
+        run_uuid = uuid.UUID(run_id)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid run_id format: {e}",
+        )
+
+    jobs = db.scalars(
+        select(FileProcessingPageJobs)
+        .where(FileProcessingPageJobs.run_id == run_uuid)
+        .order_by(FileProcessingPageJobs.page_index)
+    ).all()
+
+    return {
+        "run_id": run_id,
+        "pages": [
+            {
+                "page_index": job.page_index,
+                "status": job.status,
+                "ocr_retries": job.ocr_retries,
+                "extraction_retries": job.extraction_retries,
+                "error_message": job.error_message,
+            }
+            for job in jobs
+        ],
+    }
 
 
 @router.get("/files/{staging_id}")

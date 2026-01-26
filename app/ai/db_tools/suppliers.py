@@ -14,7 +14,9 @@ from sqlalchemy.orm import Session
 
 from app.ai.tools import Tool
 from app.conversation import responses
-from app.db.models.suppliers import Suppliers
+from app.db.models.restaurant_suppliers import RestaurantSuppliers
+from app.db.models.restaurant_user import RestaurantUser
+from app.db.models.suppliers import Suppliers, normalize_supplier_name
 from app.db.models.restaurant import Restaurant
 
 from .base import format_date, has_restaurant_access
@@ -64,22 +66,28 @@ def create_supplier_tools(
         if not has_restaurant_access(db, user_id, restaurant_id):
             return "Error: You don't have access to this restaurant."
 
-        suppliers = db.scalars(
-            select(Suppliers).where(
-                Suppliers.restaurant_id == restaurant_id, Suppliers.is_active == True
+        rows = db.execute(
+            select(Suppliers, RestaurantSuppliers)
+            .join(RestaurantSuppliers, RestaurantSuppliers.supplier_id == Suppliers.id)
+            .where(
+                RestaurantSuppliers.restaurant_id == restaurant_id,
+                RestaurantSuppliers.status == "active",
+                Suppliers.is_active == True,
             )
+            .order_by(Suppliers.name.asc())
         ).all()
         restaurant = db.get(Restaurant, restaurant_id)
 
         result = []
-        for supplier in suppliers:
+        for supplier, link in rows:
             result.append(
                 {
                     "id": str(supplier.id),
                     "name": supplier.name,
-                    "currency": supplier.currency,
+                    "currency": link.default_currency or supplier.currency,
                     "language": supplier.language,
-                    "lead_time_days": supplier.lead_time_days,
+                    "lead_time_days": link.lead_time_days or supplier.lead_time_days,
+                    "status": link.status,
                 }
             )
 
@@ -95,6 +103,11 @@ def create_supplier_tools(
 
         restaurant_id_str = args.get("restaurant_id", "").strip()
         name = args.get("name", "").strip()
+        currency = args.get("currency")
+        language = args.get("language")
+        lead_time_days = args.get("lead_time_days")
+        notes = args.get("notes")
+        account_number = args.get("account_number")
 
         if pending_action and pending_action.get("type") == "create_supplier":
             if _is_cancel(message_lower):
@@ -109,6 +122,11 @@ def create_supplier_tools(
             if _is_confirm(message_lower):
                 pending_restaurant_id = pending_action.get("restaurant_id")
                 pending_name = pending_action.get("name")
+                pending_currency = pending_action.get("currency")
+                pending_language = pending_action.get("language")
+                pending_lead_time = pending_action.get("lead_time_days")
+                pending_notes = pending_action.get("notes")
+                pending_account_number = pending_action.get("account_number")
                 if not pending_restaurant_id or not pending_name:
                     return "Error: Pending supplier details are incomplete."
                 try:
@@ -118,12 +136,57 @@ def create_supplier_tools(
                 name = str(pending_name).strip()
                 if not has_restaurant_access(db, user_id, restaurant_id):
                     return "Error: You don't have access to this restaurant."
-                supplier = Suppliers(
-                    restaurant_id=restaurant_id,
-                    name=name,
-                    is_active=True,
+
+                normalized = normalize_supplier_name(name)
+                supplier = db.scalar(
+                    select(Suppliers).where(
+                        Suppliers.name_normalized == normalized,
+                        Suppliers.is_active == True,
+                    )
                 )
-                db.add(supplier)
+                if not supplier:
+                    supplier = Suppliers(
+                        name=name,
+                        name_normalized=normalized,
+                        language=pending_language,
+                        is_active=True,
+                    )
+                    db.add(supplier)
+                    db.flush()
+                else:
+                    if not supplier.name_normalized:
+                        supplier.name_normalized = normalized
+                    if pending_language and not supplier.language:
+                        supplier.language = pending_language
+                    if pending_notes and not supplier.notes:
+                        supplier.notes = pending_notes
+
+                link = db.scalar(
+                    select(RestaurantSuppliers).where(
+                        RestaurantSuppliers.restaurant_id == restaurant_id,
+                        RestaurantSuppliers.supplier_id == supplier.id,
+                    )
+                )
+                if not link:
+                    link = RestaurantSuppliers(
+                        restaurant_id=restaurant_id,
+                        supplier_id=supplier.id,
+                        status="active",
+                        account_number=pending_account_number,
+                        default_currency=pending_currency,
+                        lead_time_days=pending_lead_time,
+                        notes=pending_notes,
+                    )
+                    db.add(link)
+                else:
+                    if pending_account_number and not link.account_number:
+                        link.account_number = pending_account_number
+                    if pending_currency and not link.default_currency:
+                        link.default_currency = pending_currency
+                    if pending_lead_time is not None and link.lead_time_days is None:
+                        link.lead_time_days = pending_lead_time
+                    if pending_notes and not link.notes:
+                        link.notes = pending_notes
                 try:
                     db.commit()
                     return json.dumps(
@@ -195,6 +258,11 @@ def create_supplier_tools(
                         "restaurant_id": str(restaurant_id),
                         "restaurant_name": restaurant_name,
                         "name": name,
+                        "currency": currency,
+                        "language": language,
+                        "lead_time_days": lead_time_days,
+                        "notes": notes,
+                        "account_number": account_number,
                     },
                     "active_restaurant_id": str(restaurant_id),
                 },
@@ -205,6 +273,7 @@ def create_supplier_tools(
     def get_supplier(args: dict[str, Any]) -> str:
         """Get details of a specific supplier."""
         supplier_id_str = args.get("supplier_id", "").strip()
+        restaurant_id_str = args.get("restaurant_id", "").strip()
         if not supplier_id_str:
             return "Error: supplier_id is required."
 
@@ -217,17 +286,48 @@ def create_supplier_tools(
         if not supplier:
             return "Error: Supplier not found."
 
-        if not has_restaurant_access(db, user_id, supplier.restaurant_id):
-            return "Error: You don't have access to this supplier's restaurant."
+        link = None
+        if restaurant_id_str:
+            try:
+                restaurant_id = uuid.UUID(restaurant_id_str)
+            except ValueError:
+                return "Error: Invalid restaurant_id format."
+            if not has_restaurant_access(db, user_id, restaurant_id):
+                return "Error: You don't have access to this restaurant."
+            link = db.scalar(
+                select(RestaurantSuppliers).where(
+                    RestaurantSuppliers.restaurant_id == restaurant_id,
+                    RestaurantSuppliers.supplier_id == supplier.id,
+                )
+            )
+            if not link:
+                return "Error: Supplier is not linked to this restaurant."
+        else:
+            link = db.scalar(
+                select(RestaurantSuppliers)
+                .join(
+                    RestaurantUser,
+                    RestaurantUser.restaurant_id == RestaurantSuppliers.restaurant_id,
+                )
+                .where(
+                    RestaurantSuppliers.supplier_id == supplier.id,
+                    RestaurantUser.user_id == user_id,
+                    RestaurantUser.status != "removed",
+                )
+            )
+            if not link:
+                return "Error: You don't have access to this supplier."
 
         return json.dumps(
             {
                 "id": str(supplier.id),
                 "name": supplier.name,
-                "currency": supplier.currency,
+                "currency": link.default_currency or supplier.currency if link else supplier.currency,
                 "language": supplier.language,
-                "lead_time_days": supplier.lead_time_days,
-                "notes": supplier.notes,
+                "lead_time_days": link.lead_time_days or supplier.lead_time_days if link else supplier.lead_time_days,
+                "notes": link.notes if link and link.notes else supplier.notes,
+                "account_number": link.account_number if link else None,
+                "status": link.status if link else None,
                 "is_active": supplier.is_active,
                 "created_at": format_date(supplier.created_at),
             },
@@ -237,6 +337,7 @@ def create_supplier_tools(
     def update_supplier(args: dict[str, Any]) -> str:
         """Update supplier details."""
         supplier_id_str = args.get("supplier_id", "").strip()
+        restaurant_id_str = args.get("restaurant_id", "").strip()
         if not supplier_id_str:
             return "Error: supplier_id is required."
 
@@ -249,27 +350,77 @@ def create_supplier_tools(
         if not supplier:
             return "Error: Supplier not found."
 
-        if not has_restaurant_access(db, user_id, supplier.restaurant_id):
-            return "Error: You don't have access to this supplier's restaurant."
+        link = None
+        if restaurant_id_str:
+            try:
+                restaurant_id = uuid.UUID(restaurant_id_str)
+            except ValueError:
+                return "Error: Invalid restaurant_id format."
+            if not has_restaurant_access(db, user_id, restaurant_id):
+                return "Error: You don't have access to this restaurant."
+            link = db.scalar(
+                select(RestaurantSuppliers).where(
+                    RestaurantSuppliers.restaurant_id == restaurant_id,
+                    RestaurantSuppliers.supplier_id == supplier.id,
+                )
+            )
+            if not link:
+                return "Error: Supplier is not linked to this restaurant."
+        else:
+            link = db.scalar(
+                select(RestaurantSuppliers)
+                .join(
+                    RestaurantUser,
+                    RestaurantUser.restaurant_id == RestaurantSuppliers.restaurant_id,
+                )
+                .where(
+                    RestaurantSuppliers.supplier_id == supplier.id,
+                    RestaurantUser.user_id == user_id,
+                    RestaurantUser.status != "removed",
+                )
+            )
+            if not link:
+                return "Error: You don't have access to this supplier."
 
         updates = []
         if "name" in args:
             supplier.name = args["name"].strip()
+            supplier.name_normalized = normalize_supplier_name(supplier.name)
             updates.append(f"Name: {supplier.name}")
         if "currency" in args:
-            supplier.currency = args["currency"] if args["currency"] else None
-            updates.append(f"Currency: {supplier.currency}")
+            if link:
+                link.default_currency = args["currency"] if args["currency"] else None
+                updates.append(f"Currency: {link.default_currency}")
+            else:
+                supplier.currency = args["currency"] if args["currency"] else None
+                updates.append(f"Currency: {supplier.currency}")
         if "language" in args:
             supplier.language = args["language"] if args["language"] else None
             updates.append(f"Language: {supplier.language}")
         if "lead_time_days" in args:
-            supplier.lead_time_days = (
-                int(args["lead_time_days"]) if args["lead_time_days"] else None
-            )
-            updates.append(f"Lead time (days): {supplier.lead_time_days}")
+            if link:
+                link.lead_time_days = (
+                    int(args["lead_time_days"]) if args["lead_time_days"] else None
+                )
+                updates.append(f"Lead time (days): {link.lead_time_days}")
+            else:
+                supplier.lead_time_days = (
+                    int(args["lead_time_days"]) if args["lead_time_days"] else None
+                )
+                updates.append(f"Lead time (days): {supplier.lead_time_days}")
         if "notes" in args:
-            supplier.notes = args["notes"] if args["notes"] else None
-            updates.append(f"Notes: {supplier.notes}")
+            if link:
+                link.notes = args["notes"] if args["notes"] else None
+                updates.append(f"Notes: {link.notes}")
+            else:
+                supplier.notes = args["notes"] if args["notes"] else None
+                updates.append(f"Notes: {supplier.notes}")
+        if "account_number" in args and link:
+            link.account_number = args["account_number"] if args["account_number"] else None
+            updates.append(f"Account number: {link.account_number}")
+        if "status" in args and link:
+            link.status = args["status"] if args["status"] else link.status
+            updates.append(f"Status: {link.status}")
         if "is_active" in args:
             supplier.is_active = bool(args["is_active"])
             updates.append(f"Active: {supplier.is_active}")
@@ -332,6 +483,10 @@ def create_supplier_tools(
                         "type": "string",
                         "description": "Additional notes (optional).",
                     },
+                    "account_number": {
+                        "type": "string",
+                        "description": "Account number (optional).",
+                    },
                 },
                 "required": ["restaurant_id", "name"],
                 "additionalProperties": False,
@@ -347,6 +502,10 @@ def create_supplier_tools(
                     "supplier_id": {
                         "type": "string",
                         "description": "The supplier's UUID.",
+                    },
+                    "restaurant_id": {
+                        "type": "string",
+                        "description": "Restaurant UUID for scoped details (optional).",
                     },
                 },
                 "required": ["supplier_id"],
@@ -364,20 +523,32 @@ def create_supplier_tools(
                         "type": "string",
                         "description": "The supplier's UUID.",
                     },
-                    "name": {"type": "string", "description": "Supplier name."},
+                    "restaurant_id": {
+                        "type": "string",
+                        "description": "Restaurant UUID for scoped updates (optional).",
+                    },
+                    "name": {"type": "string", "description": "Supplier name (optional)."},
                     "currency": {
                         "type": "string",
-                        "description": "Currency code (e.g., USD, EUR).",
+                        "description": "Currency code (e.g., USD, EUR) (optional).",
                     },
-                    "language": {"type": "string", "description": "Language code."},
+                    "language": {"type": "string", "description": "Language code (optional)."},
                     "lead_time_days": {
                         "type": "integer",
-                        "description": "Lead time in days.",
+                        "description": "Lead time in days (optional).",
                     },
-                    "notes": {"type": "string", "description": "Additional notes."},
+                    "notes": {"type": "string", "description": "Additional notes (optional)."},
+                    "account_number": {
+                        "type": "string",
+                        "description": "Account number (optional).",
+                    },
+                    "status": {
+                        "type": "string",
+                        "description": "Restaurant supplier status (optional).",
+                    },
                     "is_active": {
                         "type": "boolean",
-                        "description": "Whether the supplier is active.",
+                        "description": "Whether the supplier is active (optional).",
                     },
                 },
                 "required": ["supplier_id"],

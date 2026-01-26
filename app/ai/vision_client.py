@@ -274,6 +274,7 @@ def extract_json_from_markdown(
     processing_type: str,
     db_schema: str,
     settings: Settings,
+    repair_hint: str | None = None,
 ) -> VisionCallResult:
     """
     Extract structured JSON from Markdown text for a single page.
@@ -287,13 +288,110 @@ def extract_json_from_markdown(
         processing_type: "invoice", "price_list", or "inventory"
         db_schema: Database schema text for extraction guidance
         settings: Application settings
+        repair_hint: Optional repair instructions for invalid JSON retries
 
     Returns:
         VisionCallResult with JSON content
     """
-    prompt = f"""Extract data from this page ({page_num}) into JSON matching this database schema:
+    repair_block = f"\nRepair instructions:\n{repair_hint}\n" if repair_hint else ""
+
+    if processing_type == "invoice":
+        prompt = f"""Extract invoice data from this page ({page_num}) and return ONLY valid JSON.
+
+Schema reference:
+{db_schema}
+{repair_block}
+
+Output schema:
+{{
+  "supplier_name": "string",
+  "invoice_number": "string",
+  "invoice_date": "YYYY-MM-DD",
+  "due_date": "YYYY-MM-DD|null",
+  "currency": "string",
+  "line_items": [
+    {{
+      "description_raw": "string",
+      "quantity": "number",
+      "unit": "string",
+      "unit_price": "number",
+      "line_total": "number",
+      "currency": "string",
+      "tax_amount": "number",
+      "source_page": "number",
+      "row_index": "number|null",
+      "raw_row": "string|null"
+    }}
+  ],
+  "subtotal": "number|null",
+  "tax": "number|null",
+  "total": "number|null"
+}}
+
+Rules:
+1. Use null for missing fields; do not guess.
+2. Use the exact field names shown above.
+3. description_raw should capture the full line description including specs like pack size or origin.
+4. All numeric fields must be numbers, not strings.
+5. For each line_item, set source_page={page_num} and include row_index/raw_row when possible.
+6. If the page has no relevant data, return {{"line_items": []}}.
+
+Page content (Markdown):
+{markdown_text}
+"""
+    elif processing_type == "price_list":
+        prompt = f"""Extract supplier price list data from this page ({page_num}) and return ONLY valid JSON.
+
+Schema reference:
+{db_schema}
+{repair_block}
+
+Output schema:
+{{
+  "supplier_name": "string",
+  "contact_name": "string|null",
+  "contact_email": "string|null",
+  "contact_phone": "string|null",
+  "currency": "string|null",
+  "effective_date": "YYYY-MM-DD|null",
+  "items": [
+    {{
+      "supplier_name_raw": "string",
+      "supplier_sku": "string|null",
+      "pack_size_text": "string|null",
+      "unit_basis": "kg|pack|piece|null",
+      "min_order_qty": "number|null",
+      "price": "number",
+      "currency": "string|null",
+      "price_type": "standard|promo|special",
+      "min_qty": "number|null",
+      "valid_from": "YYYY-MM-DD|null",
+      "valid_to": "YYYY-MM-DD|null",
+      "source_page": "number",
+      "row_index": "number|null",
+      "raw_row": "string|null"
+    }}
+  ]
+}}
+
+Rules:
+1. Use null for missing fields; do not guess.
+2. Use the exact field names shown above.
+3. supplier_name_raw must be the full item description including specs like origin, brand, or pack size.
+4. price and min_order_qty must be numbers, not strings.
+5. If item currency is missing, use the top-level currency.
+6. If price_type is missing, use "standard".
+7. For each item, set source_page={page_num} and include row_index/raw_row when possible.
+8. If the page has no relevant data, return {{"items": []}}.
+
+Page content (Markdown):
+{markdown_text}
+"""
+    else:
+        prompt = f"""Extract data from this page ({page_num}) into JSON matching this database schema:
 
 {db_schema}
+{repair_block}
 
 Page content (Markdown):
 {markdown_text}
