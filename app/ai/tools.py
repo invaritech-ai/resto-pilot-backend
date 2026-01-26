@@ -40,7 +40,6 @@ def get_menu_paths() -> str:
             "description": "Manage vendors and price lists.",
             "examples": [
                 "list suppliers",
-                "list my suppliers",
                 "show unlinked suppliers",
                 "show unlinked suppliers for outlet Mercato",
                 "view supplier price list Fresh Farms",

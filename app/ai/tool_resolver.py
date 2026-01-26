@@ -57,6 +57,8 @@ If the user asks for help about a specific topic, call get_help_topic.
 If the user asks for menu/options/paths, call get_menu_paths.
 If there is a pending action and the user says yes/no, call the relevant tool to confirm or cancel.
 When listing staff, include the outlet name if provided by the tool.
+When the user says "list suppliers" or "list my suppliers" without specifying an outlet, call list_my_suppliers.
+When the user specifies an outlet (e.g., "for Mercato"), call list_suppliers with restaurant_id.
 """
 
 

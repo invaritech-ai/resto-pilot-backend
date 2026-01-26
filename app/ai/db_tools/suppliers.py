@@ -9,7 +9,7 @@ import logging
 import uuid
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import and_, select
 from sqlalchemy.orm import Session
 
 from app.ai.tools import Tool
@@ -72,7 +72,6 @@ def create_supplier_tools(
             .where(
                 RestaurantSuppliers.restaurant_id == restaurant_id,
                 RestaurantSuppliers.status == "active",
-                Suppliers.user_id == user_id,
                 Suppliers.is_active == True,
             )
             .order_by(Suppliers.name.asc())
@@ -99,9 +98,14 @@ def create_supplier_tools(
         return json.dumps(payload, indent=2)
 
     def list_my_suppliers(_args: dict[str, Any]) -> str:
-        """List all suppliers owned by the user (across outlets)."""
+        """List all suppliers visible to the user (across outlets).
+
+        Includes:
+        - User-owned suppliers (even if unlinked)
+        - Legacy suppliers with NULL user_id, if linked to an outlet the user can access
+        """
         rows = db.execute(
-            select(Suppliers, RestaurantSuppliers, Restaurant)
+            select(Suppliers, RestaurantSuppliers, Restaurant, RestaurantUser)
             .join(
                 RestaurantSuppliers,
                 RestaurantSuppliers.supplier_id == Suppliers.id,
@@ -114,20 +118,26 @@ def create_supplier_tools(
             )
             .join(
                 RestaurantUser,
-                RestaurantUser.restaurant_id == RestaurantSuppliers.restaurant_id,
+                and_(
+                    RestaurantUser.restaurant_id == RestaurantSuppliers.restaurant_id,
+                    RestaurantUser.user_id == user_id,
+                ),
                 isouter=True,
             )
             .where(
-                Suppliers.user_id == user_id,
                 Suppliers.is_active == True,
-                (RestaurantUser.user_id == user_id) | (RestaurantUser.user_id.is_(None)),
-                (RestaurantUser.status != "removed") | (RestaurantUser.status.is_(None)),
+                (Suppliers.user_id == user_id)
+                | (
+                    Suppliers.user_id.is_(None)
+                    & (RestaurantUser.user_id.is_not(None))
+                    & (RestaurantUser.status != "removed")
+                ),
             )
             .order_by(Suppliers.name.asc())
         ).all()
 
         suppliers: dict[str, dict[str, Any]] = {}
-        for supplier, link, restaurant in rows:
+        for supplier, link, restaurant, membership in rows:
             supplier_key = str(supplier.id)
             entry = suppliers.get(supplier_key)
             if not entry:
@@ -142,7 +152,7 @@ def create_supplier_tools(
                 }
                 suppliers[supplier_key] = entry
 
-            if link and restaurant:
+            if link and restaurant and membership and membership.status != "removed":
                 entry["linked_outlets"].append(
                     {
                         "restaurant_id": str(restaurant.id),
@@ -685,7 +695,7 @@ def create_supplier_tools(
     return {
         "list_suppliers": Tool(
             name="list_suppliers",
-            description="List all suppliers for a restaurant. Returns JSON with restaurant_name and suppliers.",
+            description="List suppliers linked to a specific outlet/restaurant. Returns JSON with restaurant_name and suppliers.",
             parameters={
                 "type": "object",
                 "properties": {
@@ -701,7 +711,7 @@ def create_supplier_tools(
         ),
         "list_my_suppliers": Tool(
             name="list_my_suppliers",
-            description="List all suppliers you own (across outlets). Returns JSON.",
+            description="List all suppliers across your outlets (and any you added but haven't linked yet), including legacy suppliers with NULL user_id that are linked to your outlets. Returns JSON.",
             parameters={
                 "type": "object",
                 "properties": {},
