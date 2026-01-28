@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
 from typing import Any
 
@@ -35,8 +36,28 @@ def create_supplier_tools(
 ) -> dict[str, Tool]:
     """Create supplier management tools."""
 
+    _CURRENCY_RE = re.compile(r"\b([A-Z]{3})\b")
+    _LANG_RE = re.compile(r"\b([A-Z]{2})\b")
+    _LEAD_DAYS_RE = re.compile(r"\b(\d+)\s*(?:days?|d)\b", re.IGNORECASE)
+
     def _normalize(text: str | None) -> str:
         return text.strip().lower() if isinstance(text, str) else ""
+
+    def _extract_settings_from_text(text: str | None) -> dict[str, Any]:
+        if not isinstance(text, str) or not text.strip():
+            return {}
+        upper = text.upper()
+        out: dict[str, Any] = {}
+        if m := _CURRENCY_RE.search(upper):
+            out["currency"] = m.group(1)
+        if m := _LANG_RE.search(upper):
+            out["language"] = m.group(1)
+        if m := _LEAD_DAYS_RE.search(text):
+            try:
+                out["lead_time_days"] = int(m.group(1))
+            except ValueError:
+                pass
+        return out
 
     def _is_confirm(text: str) -> bool:
         tokens = [token.strip(".,!?") for token in text.split()]
@@ -257,14 +278,33 @@ def create_supplier_tools(
                     },
                     indent=2,
                 )
-            if _is_confirm(message_lower):
+            implicit_confirm = False
+            if not _is_confirm(message_lower):
+                extracted = _extract_settings_from_text(user_message)
+                if currency is None and "currency" in extracted:
+                    currency = extracted["currency"]
+                if language is None and "language" in extracted:
+                    language = extracted["language"]
+                if lead_time_days is None and "lead_time_days" in extracted:
+                    lead_time_days = extracted["lead_time_days"]
+
+                implicit_confirm = any(
+                    value is not None
+                    for value in (currency, language, lead_time_days, notes, account_number)
+                ) and "?" not in (user_message or "")
+
+            if _is_confirm(message_lower) or implicit_confirm:
                 pending_restaurant_id = pending_action.get("restaurant_id")
                 pending_name = pending_action.get("name")
-                pending_currency = pending_action.get("currency")
-                pending_language = pending_action.get("language")
-                pending_lead_time = pending_action.get("lead_time_days")
-                pending_notes = pending_action.get("notes")
-                pending_account_number = pending_action.get("account_number")
+                pending_currency = currency if currency is not None else pending_action.get("currency")
+                pending_language = language if language is not None else pending_action.get("language")
+                pending_lead_time = (
+                    lead_time_days if lead_time_days is not None else pending_action.get("lead_time_days")
+                )
+                pending_notes = notes if notes is not None else pending_action.get("notes")
+                pending_account_number = (
+                    account_number if account_number is not None else pending_action.get("account_number")
+                )
                 if not pending_restaurant_id or not pending_name:
                     return "Error: Pending supplier details are incomplete."
                 try:
@@ -424,9 +464,30 @@ def create_supplier_tools(
                     },
                     indent=2,
                 )
-            if _is_confirm(message_lower):
-                args = dict(pending_action.get("args") or {})
-            else:
+            pending_args = dict(pending_action.get("args") or {})
+            extracted: dict[str, Any] = {}
+            if not _is_confirm(message_lower):
+                extracted = _extract_settings_from_text(user_message)
+
+            # Allow the user to reply with settings (e.g. "HKD, EN, 2 days") as implicit confirmation.
+            default_currency = args.get("default_currency") or args.get("currency") or extracted.get("currency")
+            language = args.get("language") or extracted.get("language")
+            lead_time_days = args.get("lead_time_days")
+            if lead_time_days is None:
+                lead_time_days = extracted.get("lead_time_days")
+            elif isinstance(lead_time_days, str) and lead_time_days.strip().isdigit():
+                lead_time_days = int(lead_time_days.strip())
+
+            notes = args.get("notes")
+            account_number = args.get("account_number")
+            status_value = args.get("status_value") or args.get("status")
+
+            has_updates = any(
+                value is not None
+                for value in (default_currency, language, lead_time_days, notes, account_number, status_value)
+            ) and "?" not in (user_message or "")
+
+            if not _is_confirm(message_lower) and not has_updates:
                 return json.dumps(
                     {
                         "status": "pending_confirmation",
@@ -434,6 +495,20 @@ def create_supplier_tools(
                     },
                     indent=2,
                 )
+
+            args = pending_args
+            if default_currency is not None:
+                args["default_currency"] = default_currency
+            if language is not None:
+                args["language"] = language
+            if lead_time_days is not None:
+                args["lead_time_days"] = lead_time_days
+            if notes is not None:
+                args["notes"] = notes
+            if account_number is not None:
+                args["account_number"] = account_number
+            if status_value is not None:
+                args["status_value"] = status_value
 
         supplier_names_raw = args.get("supplier_names") or args.get("supplier_name")
         supplier_ids_raw = args.get("supplier_ids") or args.get("supplier_id")
@@ -541,7 +616,8 @@ def create_supplier_tools(
             return "Error: status_value must be 'active' or 'inactive'."
 
         account_number = args.get("account_number")
-        default_currency = args.get("default_currency")
+        default_currency = args.get("default_currency") or args.get("currency")
+        language = args.get("language")
         lead_time_days = args.get("lead_time_days")
         notes = args.get("notes")
 
@@ -566,6 +642,7 @@ def create_supplier_tools(
                     user_id=user_id,
                     name=name,
                     name_normalized=normalized,
+                    language=language,
                     is_active=True,
                 )
                 db.add(supplier)
@@ -626,6 +703,8 @@ def create_supplier_tools(
                 supplier.user_id = user_id
             elif supplier.user_id != user_id:
                 return f"Error: Supplier '{supplier.name}' does not belong to this user."
+            if language and not supplier.language:
+                supplier.language = language
 
             for rid in target_outlets:
                 link = db.scalar(
@@ -950,6 +1029,14 @@ def create_supplier_tools(
                     "default_currency": {
                         "type": "string",
                         "description": "Default currency to set on the link(s) (optional).",
+                    },
+                    "currency": {
+                        "type": "string",
+                        "description": "Alias for default_currency (optional).",
+                    },
+                    "language": {
+                        "type": "string",
+                        "description": "Supplier language to set if missing (optional).",
                     },
                     "lead_time_days": {
                         "type": "integer",
