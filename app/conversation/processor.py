@@ -13,6 +13,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
+import re
 import uuid
 from dataclasses import dataclass
 from typing import Any
@@ -41,6 +42,11 @@ from app.telegram.bot_api import send_message
 from app.workers.telemetry import record_llm_call, record_outgoing_message
 
 logger = logging.getLogger(__name__)
+
+_ITEM_SEARCH_ACK_SKIP_RE = re.compile(
+    r"^\s*(search|find|lookup|look\s+up|show\s+me)\b|^\s*order\b",
+    flags=re.IGNORECASE,
+)
 
 
 @dataclass
@@ -895,7 +901,10 @@ def send_ack_message(
     """
     text = responses.ACK_FILE_PROCESSING if has_file else responses.ACK_PROCESSING
     llm_call_id: uuid.UUID | None = None
-    if message_text.strip() or has_file:
+    should_skip_llm_ack = (
+        not has_file and isinstance(message_text, str) and bool(_ITEM_SEARCH_ACK_SKIP_RE.search(message_text))
+    )
+    if (message_text.strip() or has_file) and not should_skip_llm_ack:
         ack_text, llm_call_id = _generate_ack_text(
             settings=settings,
             message_text=message_text,

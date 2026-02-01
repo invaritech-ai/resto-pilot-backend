@@ -175,7 +175,7 @@ def test_item_search_basic_list_and_pending_action(monkeypatch: pytest.MonkeyPat
 
         assert "Items" in result.response_text
         assert "1." in result.response_text
-        assert 'Reply "open 2"' in result.response_text
+        assert 'Reply "open 1"' in result.response_text
         assert UUID_RE.search(result.response_text) is None
 
         db.refresh(user)
@@ -183,9 +183,10 @@ def test_item_search_basic_list_and_pending_action(monkeypatch: pytest.MonkeyPat
         pending = user.state_data.get("pending_action")
         assert isinstance(pending, dict)
         assert pending.get("type") == "item_search"
-        assert pending.get("restaurant_id") == str(restaurant.id)
+        assert pending.get("scope") == "all"
+        assert pending.get("restaurant_ids") == [str(restaurant.id)]
         assert pending.get("mode") == "search"
         last_page = pending.get("last_page")
         assert isinstance(last_page, list)
         assert last_page and isinstance(last_page[0], dict)
-
+        assert last_page[0].get("restaurant_id") == str(restaurant.id)

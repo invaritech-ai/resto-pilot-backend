@@ -35,6 +35,8 @@ class ItemSearchTokenOverrides:
 
 @dataclass(frozen=True)
 class ItemSearchRow:
+    restaurant_id: uuid.UUID
+    restaurant_name: str
     supplier_item_id: uuid.UUID
     supplier_item_name: str
     supplier_id: uuid.UUID
@@ -217,10 +219,43 @@ def resolve_supplier_id_for_restaurant(
     return None
 
 
-def search_supplier_items(
+def resolve_supplier_id_across_restaurants(
+    *,
+    db: Session,
+    restaurant_ids: list[uuid.UUID],
+    supplier_hint: str | None,
+) -> uuid.UUID | None:
+    if not supplier_hint:
+        return None
+    hint_norm = normalize_supplier_name(supplier_hint)
+    if not hint_norm:
+        return None
+    if not restaurant_ids:
+        return None
+
+    rows = db.execute(
+        select(Suppliers.id, Suppliers.name)
+        .join(RestaurantSuppliers, RestaurantSuppliers.supplier_id == Suppliers.id)
+        .where(
+            RestaurantSuppliers.restaurant_id.in_(restaurant_ids),
+            RestaurantSuppliers.status == "active",
+            Suppliers.is_active == True,
+        )
+        .order_by(Suppliers.name.asc())
+    ).all()
+    matches: set[uuid.UUID] = set()
+    for sid, name in rows:
+        name_norm = normalize_supplier_name(name)
+        if hint_norm in name_norm or name_norm in hint_norm:
+            matches.add(sid)
+    return next(iter(matches)) if len(matches) == 1 else None
+
+
+def _search_supplier_items_for_restaurant(
     *,
     db: Session,
     restaurant_id: uuid.UUID,
+    restaurant_name: str,
     queries: list[str],
     supplier_id: uuid.UUID | None,
     status: str,
@@ -294,6 +329,8 @@ def search_supplier_items(
             label = name_raw
             product_name_s = product_name if isinstance(product_name, str) and product_name.strip() else None
             row = ItemSearchRow(
+                restaurant_id=restaurant_id,
+                restaurant_name=restaurant_name,
                 supplier_item_id=sid,
                 supplier_item_name=label,
                 supplier_id=sup_id,
@@ -340,6 +377,8 @@ def search_supplier_items(
             if mp:
                 enriched.append(
                     ItemSearchRow(
+                        restaurant_id=r.restaurant_id,
+                        restaurant_name=r.restaurant_name,
                         supplier_item_id=r.supplier_item_id,
                         supplier_item_name=r.supplier_item_name,
                         supplier_id=r.supplier_id,
@@ -366,6 +405,102 @@ def search_supplier_items(
 
     page = results[offset : offset + limit]
     has_more = len(results) > (offset + limit)
+    return ItemSearchPage(results=page, has_more=has_more)
+
+
+def search_supplier_items(
+    *,
+    db: Session,
+    restaurant_id: uuid.UUID,
+    queries: list[str],
+    supplier_id: uuid.UUID | None,
+    status: str,
+    limit: int,
+    offset: int,
+    mode: str,
+) -> ItemSearchPage:
+    restaurant = db.get(Restaurant, restaurant_id)
+    restaurant_name = restaurant.name if restaurant else "Outlet"
+    return _search_supplier_items_for_restaurant(
+        db=db,
+        restaurant_id=restaurant_id,
+        restaurant_name=restaurant_name,
+        queries=queries,
+        supplier_id=supplier_id,
+        status=status,
+        limit=limit,
+        offset=offset,
+        mode=mode,
+    )
+
+
+def search_supplier_items_across_restaurants(
+    *,
+    db: Session,
+    restaurant_ids: list[uuid.UUID],
+    queries: list[str],
+    supplier_id: uuid.UUID | None,
+    status: str,
+    limit: int,
+    offset: int,
+    mode: str,
+) -> ItemSearchPage:
+    if not restaurant_ids:
+        return ItemSearchPage(results=[], has_more=False)
+
+    # Fetch names once
+    name_rows = db.execute(
+        select(Restaurant.id, Restaurant.name).where(Restaurant.id.in_(restaurant_ids))
+    ).all()
+    names: dict[uuid.UUID, str] = {rid: name for rid, name in name_rows}
+
+    # Over-fetch a bit per outlet, merge, then paginate globally.
+    per_outlet_offset = 0
+    per_outlet_limit = min(40, max(limit + offset + 1, 10))
+
+    merged: dict[tuple[uuid.UUID, uuid.UUID], ItemSearchRow] = {}
+    has_more_any = False
+
+    for rid in restaurant_ids:
+        page = _search_supplier_items_for_restaurant(
+            db=db,
+            restaurant_id=rid,
+            restaurant_name=names.get(rid, "Outlet"),
+            queries=queries,
+            supplier_id=supplier_id,
+            status=status,
+            limit=per_outlet_limit,
+            offset=per_outlet_offset,
+            mode=mode,
+        )
+        for r in page.results:
+            merged[(r.restaurant_id, r.supplier_item_id)] = r
+        has_more_any = has_more_any or page.has_more
+
+        if len(merged) >= min(200, offset + limit + 60):
+            break
+
+    results = list(merged.values())
+    if mode == "order":
+        results.sort(
+            key=lambda r: (
+                1 if r.min_price is None else 0,
+                float(r.min_price) if r.min_price is not None else 0.0,
+                r.supplier_item_name.lower(),
+                r.restaurant_name.lower(),
+            )
+        )
+    else:
+        results.sort(
+            key=lambda r: (
+                r.supplier_item_name.lower(),
+                r.supplier_name.lower(),
+                r.restaurant_name.lower(),
+            )
+        )
+
+    page = results[offset : offset + limit]
+    has_more = len(results) > (offset + limit) or has_more_any
     return ItemSearchPage(results=page, has_more=has_more)
 
 
@@ -538,11 +673,13 @@ def load_supplier_details(
     }
 
 
-def format_item_search_list(*, mode: str, page: ItemSearchPage) -> str:
+def format_item_search_list(*, mode: str, page: ItemSearchPage, include_outlet: bool | None = None) -> str:
     rows = page.results
     title = "🛒 Order options" if mode == "order" else "🔎 Items"
     if not rows:
         return f"{title}\n\nNo results. Try a different search."
+
+    show_outlet = include_outlet if isinstance(include_outlet, bool) else len({r.restaurant_id for r in rows}) > 1
 
     lines = [f"{title} ({len(rows)} shown)", ""]
     for idx, r in enumerate(rows, 1):
@@ -551,19 +688,24 @@ def format_item_search_list(*, mode: str, page: ItemSearchPage) -> str:
                 price_part = "Price unavailable"
             else:
                 price_part = f"{r.min_price:g} {r.currency}"
-            lines.append(f"{idx}. {r.supplier_item_name} — {price_part} — {r.supplier_name}")
+            outlet_part = f" — {r.restaurant_name}" if show_outlet else ""
+            lines.append(
+                f"{idx}. {r.supplier_item_name} — {price_part} — {r.supplier_name}{outlet_part}"
+            )
         else:
             suffix = f" — {r.supplier_name}"
             if r.product_name:
                 suffix = f" — {r.product_name} — {r.supplier_name}"
-            lines.append(f"{idx}. {r.supplier_item_name}{suffix}")
+            outlet_part = f" — {r.restaurant_name}" if show_outlet else ""
+            lines.append(f"{idx}. {r.supplier_item_name}{suffix}{outlet_part}")
 
     lines.append("")
     if page.has_more:
         lines.append('Reply "more" to see the next results.')
-    lines.append('Reply "open 2" to see item #2.')
+    open_index = 2 if len(rows) >= 2 else 1
+    lines.append(f'Reply "open {open_index}" to see item #{open_index}.')
     if mode == "order":
-        lines.append('Reply "supplier 2" to see supplier details for #2.')
+        lines.append(f'Reply "supplier {open_index}" to see supplier details for #{open_index}.')
     lines.append('Reply "search item <new query>" to start over.')
     return _strip_uuid("\n".join(lines).strip())
 
