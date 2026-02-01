@@ -5,13 +5,20 @@ It reflects current behavior in `app/ai/intent_resolver.py` and `app/conversatio
 
 ## Architecture
 
-The message processing flow uses 2 LLM calls:
+The message processing flow uses 2 LLM calls (for most messages):
 
 1. **Intent Resolution** (`app/ai/intent_resolver.py`): Single LLM call that classifies intent AND resolves all entity names to UUIDs using provided candidates.
 
 2. **Response Formatting** (`app/conversation/processor.py`): LLM call to format the action result into a user-friendly response.
 
 The executor (`app/conversation/executor.py`) receives fully resolved params and just executes the action.
+
+### Fast path: item search
+
+Item search runs as a processor-level fast path (before tool resolution) to minimize LLM usage and keep formatting deterministic:
+
+- New searches: 1 cheap JSON-only parse call (`app/ai/item_search_query_planner.py`) + DB lookups + deterministic text formatting.
+- Follow-ups (`more`, `open <n>`, `supplier <n>`): 0 LLM calls (DB + deterministic formatting).
 
 ## Global behavior
 
@@ -68,6 +75,11 @@ The executor (`app/conversation/executor.py`) receives fully resolved params and
 - `upload_price_list`
 - `upload_invoice`
 - `confirm_upload` (`staging_id`)
+
+### Item search (fast path)
+- `search item <query>` / `search <query>` / `find <query>` / "show me …"
+- Follow-ups: `more`, `open <n>`
+- Order flow: `order food` → prompt → search in order mode, supports `supplier <n>`
 
 ### Navigation
 - `show_menu`
@@ -155,6 +167,18 @@ Note: The intent resolver uses fuzzy matching to resolve entity names to UUIDs f
 1) User uploads a file with a caption containing "invoice" or "price list".
 2) System enqueues file processing tasks.
 3) User uses `/confirm` after review.
+
+### Item search: browse items
+1) User: "search item tomato" (or "search tomato", "find tomato", "show me tomatoes").
+2) Bot returns a numbered list of matching supplier items (deterministic formatting).
+3) User: "more" to paginate, or "open 2" to open details.
+
+### Item search: order flow
+1) User: "order food".
+2) Bot: "What would you like to order?"
+3) User: "tomato".
+4) Bot returns results with price + supplier name when available.
+5) User: "supplier 1" to view supplier contact details.
 
 ### Fallback
 Any other message returns "I can't help with that."

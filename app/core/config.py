@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     openai_response_model: str = ""
     openai_reasoning_model: str = ""
     openai_file_type_model: str = ""
+    openai_item_search_parse_model: str = ""
     openai_audio_model: str = ""
     openai_video_model: str = ""
     openai_base_url: str = "https://api.openai.com/v1"
@@ -60,6 +61,9 @@ class Settings(BaseSettings):
     vision_api_key: str = ""  # Optional, defaults to openai_api_key if empty
     vision_base_url: str = ""  # Optional, defaults to openai_base_url if empty
     vision_pdf_chunk_size: int = 3
+
+    # Item search fast-path configuration
+    item_search_session_ttl_minutes: int = 30
 
     model_config = SettingsConfigDict(
         env_file=".env", env_prefix="APP_", extra="ignore"

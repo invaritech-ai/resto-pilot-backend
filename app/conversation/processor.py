@@ -30,6 +30,7 @@ from app.ai.openrouter_usage import extract_openrouter_usage
 from app.ai.tool_resolver import resolve_with_tools
 from app.conversation import responses
 from app.conversation.context import load_context, update_context_from_result, UserContext
+from app.conversation.item_search_router import try_handle_item_search_fast_path
 from app.core.config import Settings
 from app.db.models.processing_events import ProcessingEvents
 from app.db.models.telegram_messages import TelegramMessages
@@ -496,6 +497,29 @@ def process_message_instant(
             response_text=final_text,
             response_llm_call_id=response_llm_call_id,
         )
+
+    # Item search fast-path (minimize LLM calls + deterministic formatting)
+    fast = try_handle_item_search_fast_path(
+        db=db,
+        user_id=user.id,
+        context=context,
+        message_text=message_text or "",
+        settings=settings,
+        session_id=session_id,
+        chat_id=chat_id,
+    )
+    if fast is not None:
+        response_text, context_update = fast
+        if context_update:
+            context = update_context_from_result(
+                db=db,
+                user=user,
+                context=context,
+                context_update=context_update,
+            )
+        user.last_interaction_at = dt.datetime.now(dt.UTC)
+        db.commit()
+        return ProcessResult(response_text=response_text)
 
     tool_result = resolve_with_tools(
         db=db,

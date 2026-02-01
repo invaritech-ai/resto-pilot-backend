@@ -61,3 +61,14 @@ def get_audio_model(settings: Settings) -> str:
 def get_video_model(settings: Settings) -> str:
     """Get the model for video processing tasks."""
     return _pick_model(settings, "openai_video_model", fallback=settings.openai_model)
+
+
+def get_item_search_parse_model(settings: Settings) -> str:
+    """Get the model for item search parsing (cheap JSON-only parse step)."""
+    return _pick_model(
+        settings,
+        "openai_item_search_parse_model",
+        "openai_intent_model",
+        "openai_gate_model",
+        fallback=settings.openai_model,
+    )
