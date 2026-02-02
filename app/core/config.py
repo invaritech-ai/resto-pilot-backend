@@ -21,6 +21,10 @@ class Settings(BaseSettings):
     # Local dev/testing side-channel (bypasses Telegram network and can run inline).
     side_channel_secret_token: str = ""
 
+    # Deterministic bot (development flags). These are read from APP_* env (including .env via SettingsConfigDict).
+    deterministic_shadow_mode: bool = False
+    deterministic_execution: bool = False
+
     # Optional AWS profile name for local dev.
     # If set, the app will use this profile for AWS SDK calls (including Celery SQS broker)
     # unless AWS_PROFILE is already set in the environment.
@@ -40,6 +44,11 @@ class Settings(BaseSettings):
 
     openai_api_key: str = ""
     openai_model: str = "gpt-4o-mini"
+    # Fine-grained text models (optional; fall back to openai_model)
+    ack_model: str = ""
+    planner_model: str = ""
+    clarification_model: str = ""
+    presenter_model: str = ""
     # Model for intent classification and file type detection (legacy alias)
     openai_gate_model: str = ""
     # Purpose-specific models (all optional, fall back to openai_model)

@@ -6,7 +6,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from app.ai.model_config import get_reasoning_model
+from app.ai.model_config import get_planner_model
 from app.ai.openai_client import (
     OpenAIError,
     chat_completions_create_with_http_info,
@@ -110,7 +110,7 @@ def plan_next_action(
     available_tools: list[dict[str, Any]],
     hard_rules: dict[str, Any] | None = None,
 ) -> tuple[PlannerDecision, PlannerTelemetry | None]:
-    model = get_reasoning_model(settings)
+    model = get_planner_model(settings)
     planner_settings = settings.model_copy(update={"openai_model": model}) if model != settings.openai_model else settings
 
     payload = {
@@ -141,12 +141,12 @@ def plan_next_action(
         )
     except OpenAIError as exc:
         logger.exception("planner_llm_failed", extra={"error": str(exc)})
-        # Deterministic fallback: ask for clarification.
+        # Deterministic fallback: upstream/network/provider error. Ask user to retry.
         return (
             PlannerClarify(
                 action="clarify",
-                clarify_kind="unknown",
-                question="I couldn't understand that. What would you like to do?",
+                clarify_kind="temporary_error",
+                question="Temporary error talking to the model. Please try again.",
                 choices=None,
             ),
             None,

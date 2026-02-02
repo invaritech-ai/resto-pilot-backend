@@ -19,8 +19,6 @@ MAIN_MENU = """Welcome! Here's what I can help you with:
 🏪 *Outlets* - Manage your restaurants
 👥 *Staff* - View or invite team members
 📦 *Suppliers* - Manage vendors, view price lists & items
-📄 *Invoices* - View past invoices
-📊 *Inventory* - Track stock, locations, log usage
 📤 *Files* - Upload price lists or invoices
 
 Just tell me what you'd like to do!"""
@@ -54,14 +52,9 @@ Try: "list outlets" or "add outlet Little Italy"."""
 HELP_STAFF = """👥 *Staff* lets you list, invite, or remove team members.
 Try: "list staff" or "invite staff to Main"."""
 
-HELP_SUPPLIERS = """📦 *Suppliers* lets you list, add, view, update, deactivate vendors, link a supplier to another outlet, and see unlinked suppliers.
-Try: "list suppliers", "show unlinked suppliers", or "link supplier Fresh Farms to outlet Mercato"."""
-
-HELP_INVOICES = """📄 *Invoices* lets you list invoices or view one.
-Try: "list invoices"."""
-
-HELP_INVENTORY = """📊 *Inventory* lets you list stock/locations, add items, or log usage.
-Try: "list inventory" or "log 2kg usage"."""
+HELP_SUPPLIERS = """📦 *Suppliers* lets you list suppliers and link/unlink them to outlets.
+Suppliers are added via price list uploads (no manual creation).
+Try: "list suppliers", "link supplier Cheong Hing to KTM", or "unlink supplier 1 from Joyful"."""
 
 HELP_FILES = """📤 *Files* lets you upload price lists or invoices.
 Try: "upload invoice" and send the file."""
@@ -85,9 +78,6 @@ def help_topic(topic: str | None) -> str:
         "staff": HELP_STAFF,
         "suppliers": HELP_SUPPLIERS,
         "supplier": HELP_SUPPLIERS,
-        "invoices": HELP_INVOICES,
-        "invoice": HELP_INVOICES,
-        "inventory": HELP_INVENTORY,
         "files": HELP_FILES,
         "file": HELP_FILES,
         "invites": HELP_INVITES,

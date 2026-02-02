@@ -207,6 +207,46 @@ def execute_deterministic_tool(
     Tool outputs should be JSON strings. The Presenter is responsible for rendering.
     """
     try:
+        if tool == "profile_get":
+            return json.dumps(
+                {
+                    "profile": {
+                        "full_name": user.full_name,
+                        "phone": user.phone,
+                        "username": user.username,
+                    }
+                },
+                indent=2,
+            )
+
+        if tool == "profile_update":
+            updated: dict[str, Any] = {}
+
+            full_name = args.get("full_name")
+            if isinstance(full_name, str):
+                user.full_name = full_name.strip() or None
+                updated["full_name"] = user.full_name
+
+            phone = args.get("phone")
+            if isinstance(phone, str):
+                user.phone = phone.strip() or None
+                updated["phone"] = user.phone
+
+            username = args.get("username")
+            if isinstance(username, str):
+                cleaned = username.strip()
+                if cleaned.startswith("@"):
+                    cleaned = cleaned[1:]
+                user.username = cleaned or None
+                updated["username"] = user.username
+
+            if not updated:
+                return json.dumps({"error": "No fields to update."}, indent=2)
+
+            db.add(user)
+            db.commit()
+            return json.dumps({"status": "updated", "profile": updated}, indent=2)
+
         if tool == "restaurants_list":
             rows = RestaurantService(db).list_for_user(user_id=user.id)
             payload = [
@@ -214,6 +254,32 @@ def execute_deterministic_tool(
                 for restaurant, membership in rows
             ]
             return json.dumps({"restaurants": payload}, indent=2)
+
+        if tool == "restaurants_select":
+            rq = args.get("restaurant_query")
+            restaurant_query = rq.strip() if isinstance(rq, str) else ""
+            if not restaurant_query:
+                return json.dumps({"error": "restaurant_query is required"}, indent=2)
+
+            restaurant_id, restaurant_name, err = _resolve_restaurant_id(
+                db=db,
+                user=user,
+                restaurant_query=restaurant_query,
+                context=context,
+            )
+            if err or restaurant_id is None:
+                return json.dumps(err or {"error": "Outlet not found."}, indent=2)
+            if not _has_access(db=db, user=user, restaurant_id=restaurant_id):
+                return json.dumps({"error": "You don't have access to this outlet."}, indent=2)
+
+            return json.dumps(
+                {
+                    "status": "selected",
+                    "restaurant_name": restaurant_name,
+                    "context_update": {"active_restaurant_id": str(restaurant_id)},
+                },
+                indent=2,
+            )
 
         if tool == "restaurants_create":
             name_raw = args.get("name")

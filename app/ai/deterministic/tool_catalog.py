@@ -24,10 +24,43 @@ def get_planner_tool_catalog() -> list[ToolSpec]:
     """
     return [
         ToolSpec(
+            name="profile_get",
+            description="Get your user profile (name, phone, username).",
+            parameters={"type": "object", "properties": {}, "additionalProperties": False},
+            is_write=False,
+        ),
+        ToolSpec(
+            name="profile_update",
+            description="Update your user profile fields. Only include fields the user explicitly provided.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "full_name": {"type": "string", "description": "Full name (optional)."},
+                    "phone": {"type": "string", "description": "Phone number (optional)."},
+                    "username": {"type": "string", "description": "Telegram username (without @) (optional)."},
+                },
+                "additionalProperties": False,
+            },
+            is_write=True,
+        ),
+        ToolSpec(
             name="restaurants_list",
             description="List outlets you belong to (includes your role).",
             parameters={"type": "object", "properties": {}, "additionalProperties": False},
             is_write=False,
+        ),
+        ToolSpec(
+            name="restaurants_select",
+            description="Set the active outlet context. If ambiguous, returns numbered choices.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "restaurant_query": {"type": "string", "description": "Outlet name or shortform."},
+                },
+                "required": ["restaurant_query"],
+                "additionalProperties": False,
+            },
+            is_write=True,
         ),
         ToolSpec(
             name="restaurants_create",
@@ -254,4 +287,3 @@ def tool_catalog_as_planner_json() -> list[dict[str, Any]]:
         }
         for t in get_planner_tool_catalog()
     ]
-

@@ -13,7 +13,6 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
-import os
 import re
 import uuid
 from dataclasses import dataclass
@@ -22,7 +21,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.ai.intent_classifier import Intent
-from app.ai.model_config import get_intent_model, get_response_model
+from app.ai.model_config import get_ack_model, get_presenter_model
 from app.ai.openai_client import (
     OpenAIError,
     create_chat_completion_text_allow_empty_with_http_info,
@@ -48,20 +47,6 @@ _ITEM_SEARCH_ACK_SKIP_RE = re.compile(
     r"^\s*(search|find|lookup|look\s+up|show\s+me)\b|^\s*order\b",
     flags=re.IGNORECASE,
 )
-
-_DETERMINISTIC_SHADOW_MODE = os.getenv("APP_DETERMINISTIC_SHADOW_MODE", "").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-
-_DETERMINISTIC_EXECUTION_MODE = os.getenv("APP_DETERMINISTIC_EXECUTION", "").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
 
 @dataclass
 class ProcessResult:
@@ -161,7 +146,7 @@ def _format_tool_response_with_llm(
     message_text: str,
     tool_response: str,
 ) -> tuple[str | None, uuid.UUID | None]:
-    model = get_response_model(settings)
+    model = get_presenter_model(settings)
     response_settings = (
         settings.model_copy(update={"openai_model": model})
         if model != settings.openai_model
@@ -228,7 +213,7 @@ def _generate_ack_text(
     session_id: uuid.UUID | None = None,
     chat_id: int | None = None,
 ) -> tuple[str | None, uuid.UUID | None]:
-    model = get_intent_model(settings)
+    model = get_ack_model(settings)
     ack_settings = (
         settings.model_copy(update={"openai_model": model})
         if model != settings.openai_model
@@ -520,7 +505,7 @@ def process_message_instant(
 
     # Deterministic execution mode: Planner -> (Clarify OR call one deterministic tool) -> Presenter.
     # Runs on the worker via handle_update_v2, so the API is never blocked.
-    if _DETERMINISTIC_EXECUTION_MODE:
+    if bool(getattr(settings, "deterministic_execution", False)):
         from app.ai.deterministic.execution import execute_deterministic_tool
         from app.ai.deterministic.planner import plan_next_action
         from app.ai.deterministic.schemas import PlannerCallTool, PlannerClarify
@@ -588,6 +573,41 @@ def process_message_instant(
                             lines.append(f"{label}) {text}")
             final_text = "\n".join([ln for ln in lines if ln.strip()]).strip()
 
+            # Optional ClarifierLLM (phrasing only). If it fails, fall back to deterministic text above.
+            clarifier_llm_call_id: uuid.UUID | None = None
+            if bool(getattr(settings, "clarification_model", "").strip()):
+                try:
+                    from app.ai.deterministic.clarifier import clarify_text
+
+                    llm_text, clarifier_telemetry = clarify_text(
+                        settings=settings,
+                        clarify_kind=validated.clarify_kind,
+                        question=question or "Please clarify what you want to do.",
+                        choices=[
+                            {"label": str(c.label), "text": str(c.text)}
+                            for c in (validated.choices or [])
+                            if c.label and c.text
+                        ]
+                        if validated.choices
+                        else None,
+                    )
+                    if clarifier_telemetry is not None:
+                        clarifier_llm_call_id = record_llm_call(
+                            db=db,
+                            session_id=session_id,
+                            chat_id=chat_id,
+                            purpose="clarifier",
+                            model=str(clarifier_telemetry.get("model") or ""),
+                            openrouter_generation_id=clarifier_telemetry.get("generation_id"),
+                            usage=clarifier_telemetry.get("usage") or {},
+                            latency_ms=clarifier_telemetry.get("latency_ms"),
+                        )
+                        db.commit()
+                    if isinstance(llm_text, str) and llm_text.strip():
+                        final_text = llm_text.strip()
+                except Exception:
+                    logger.exception("deterministic_clarifier_failed")
+
             user.last_interaction_at = dt.datetime.now(dt.UTC)
             db.add(
                 ProcessingEvents(
@@ -598,6 +618,7 @@ def process_message_instant(
                         {
                             "clarify_kind": validated.clarify_kind,
                             "llm_call_id": str(planner_llm_call_id) if planner_llm_call_id else None,
+                            "clarifier_llm_call_id": str(clarifier_llm_call_id) if clarifier_llm_call_id else None,
                         },
                         ensure_ascii=False,
                     ),
@@ -620,8 +641,14 @@ def process_message_instant(
         context_update: dict[str, Any] | None = None
         try:
             parsed = json.loads(tool_response)
-            if isinstance(parsed, dict) and isinstance(parsed.get("context_update"), dict):
-                context_update = parsed["context_update"]
+            if isinstance(parsed, dict):
+                if isinstance(parsed.get("context_update"), dict):
+                    context_update = parsed["context_update"]
+                # Never expose internal context updates (often contain UUIDs) to the Presenter/user.
+                if "context_update" in parsed:
+                    parsed = dict(parsed)
+                    parsed.pop("context_update", None)
+                    tool_response = json.dumps(parsed, indent=2)
         except Exception:
             context_update = None
 
@@ -633,6 +660,7 @@ def process_message_instant(
                 context_update=context_update,
             )
 
+        # Presenter: use PresenterLLM (model selectable). If it fails, fall back to deterministic presenter.
         formatted_text, response_llm_call_id = _format_tool_response_with_llm(
             db=db,
             settings=settings,
@@ -641,7 +669,11 @@ def process_message_instant(
             message_text=message_text,
             tool_response=tool_response,
         )
-        final_text = formatted_text or tool_response
+        if formatted_text:
+            final_text = formatted_text
+        else:
+            from app.ai.deterministic.presenter import present_tool_result
+            final_text = present_tool_result(tool=validated.tool, tool_response_json=tool_response)
 
         user.last_interaction_at = dt.datetime.now(dt.UTC)
         db.add(
@@ -657,6 +689,7 @@ def process_message_instant(
                         "response_llm_call_id": str(response_llm_call_id) if response_llm_call_id else None,
                         "validation_errors": validation.errors,
                         "has_context_update": bool(context_update),
+                        "presenter": "llm_with_deterministic_fallback_v1",
                     },
                     ensure_ascii=False,
                 ),
@@ -668,7 +701,7 @@ def process_message_instant(
 
     # Shadow mode: run deterministic PlannerLLM (no tool execution) and record telemetry.
     # This is used to tune prompts locally/in staging without affecting behavior.
-    if _DETERMINISTIC_SHADOW_MODE:
+    if bool(getattr(settings, "deterministic_shadow_mode", False)):
         try:
             from app.ai.deterministic.planner import plan_next_action
             from app.ai.deterministic.tool_catalog import tool_catalog_as_planner_json
