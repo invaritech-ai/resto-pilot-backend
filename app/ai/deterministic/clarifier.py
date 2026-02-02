@@ -45,16 +45,30 @@ def clarify_text(
     }
 
     try:
-        text, data, headers, latency_ms = create_chat_completion_text_allow_empty_with_http_info(
-            settings=clarifier_settings,
-            messages=[
-                {"role": "system", "content": CLARIFIER_SYSTEM_PROMPT},
-                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-            ],
-            temperature=0.2,
-            purpose="clarifier",
-            extra_body={"max_tokens": 200},
-        )
+        try:
+            text, data, headers, latency_ms = create_chat_completion_text_allow_empty_with_http_info(
+                settings=clarifier_settings,
+                messages=[
+                    {"role": "system", "content": CLARIFIER_SYSTEM_PROMPT},
+                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                ],
+                temperature=0.2,
+                purpose="clarifier",
+                extra_body={"max_tokens": 200},
+            )
+        except TypeError as exc:
+            # Backwards-compat: if a worker is running with an older openai_client loaded.
+            if "unexpected keyword argument 'purpose'" not in str(exc):
+                raise
+            text, data, headers, latency_ms = create_chat_completion_text_allow_empty_with_http_info(
+                settings=clarifier_settings,
+                messages=[
+                    {"role": "system", "content": CLARIFIER_SYSTEM_PROMPT},
+                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                ],
+                temperature=0.2,
+                extra_body={"max_tokens": 200},
+            )
     except OpenAIError as exc:
         logger.exception("clarifier_failed", extra={"error": str(exc)})
         return None, None

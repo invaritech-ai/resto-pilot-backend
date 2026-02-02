@@ -48,6 +48,34 @@ _ITEM_SEARCH_ACK_SKIP_RE = re.compile(
     flags=re.IGNORECASE,
 )
 
+_FOLLOWUP_RE = re.compile(
+    r"^\s*(?:how\s+about|what\s+about|howbout|how\s+abt|what\s+abt|any)\s+(?P<q>.+?)\s*[\?\!\.]*\s*$",
+    flags=re.IGNORECASE,
+)
+
+
+def _extract_followup_query(message_text: str) -> str | None:
+    m = _FOLLOWUP_RE.match(message_text or "")
+    if not m:
+        return None
+    q = (m.group("q") or "").strip()
+    q = q.strip(" \t\r\n?.!,")
+    return q if q else None
+
+
+def _last_list_is_fresh(settings: Settings, last_list: dict[str, Any] | None) -> bool:
+    if not isinstance(last_list, dict):
+        return False
+    created_at = last_list.get("created_at")
+    if not isinstance(created_at, str) or not created_at.strip():
+        return False
+    try:
+        ts = dt.datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+    except Exception:
+        return False
+    ttl_min = int(getattr(settings, "item_search_session_ttl_minutes", 30) or 30)
+    return (dt.datetime.now(dt.UTC) - ts) <= dt.timedelta(minutes=ttl_min)
+
 @dataclass
 class ProcessResult:
     response_text: str
@@ -162,16 +190,29 @@ def _format_tool_response_with_llm(
     )
 
     try:
-        text, data, headers, latency_ms = create_chat_completion_text_allow_empty_with_http_info(
-            settings=response_settings,
-            messages=[
-                {"role": "system", "content": FINAL_RESPONSE_SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.2,
-            purpose="presenter",
-            extra_body={"max_tokens": 400},
-        )
+        try:
+            text, data, headers, latency_ms = create_chat_completion_text_allow_empty_with_http_info(
+                settings=response_settings,
+                messages=[
+                    {"role": "system", "content": FINAL_RESPONSE_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.2,
+                purpose="presenter",
+                extra_body={"max_tokens": 400},
+            )
+        except TypeError as exc:
+            if "unexpected keyword argument 'purpose'" not in str(exc):
+                raise
+            text, data, headers, latency_ms = create_chat_completion_text_allow_empty_with_http_info(
+                settings=response_settings,
+                messages=[
+                    {"role": "system", "content": FINAL_RESPONSE_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.2,
+                extra_body={"max_tokens": 400},
+            )
     except OpenAIError as exc:
         logger.exception("final_response_failed", extra={"error": str(exc)})
         llm_call_id = record_llm_call(
@@ -236,16 +277,29 @@ def _generate_ack_text(
     )
 
     try:
-        text, data, headers, latency_ms = create_chat_completion_text_allow_empty_with_http_info(
-            settings=ack_settings,
-            messages=[
-                {"role": "system", "content": ACK_SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.2,
-            purpose="ack",
-            extra_body={"max_tokens": 20},
-        )
+        try:
+            text, data, headers, latency_ms = create_chat_completion_text_allow_empty_with_http_info(
+                settings=ack_settings,
+                messages=[
+                    {"role": "system", "content": ACK_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.2,
+                purpose="ack",
+                extra_body={"max_tokens": 40},
+            )
+        except TypeError as exc:
+            if "unexpected keyword argument 'purpose'" not in str(exc):
+                raise
+            text, data, headers, latency_ms = create_chat_completion_text_allow_empty_with_http_info(
+                settings=ack_settings,
+                messages=[
+                    {"role": "system", "content": ACK_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.2,
+                extra_body={"max_tokens": 40},
+            )
     except OpenAIError as exc:
         logger.exception("ack_generation_failed", extra={"error": str(exc)})
         if db is not None and session_id is not None:
@@ -419,6 +473,128 @@ def process_message_instant(
     db.commit()
 
     if not has_file and context.pending_action:
+        # Deterministic follow-up scope selection for item search.
+        if context.pending_action.get("type") == "followup_item_search_scope":
+            pending = context.pending_action
+            text = (message_text or "").strip().lower()
+            if text in {"cancel", "/cancel", "stop"}:
+                context = update_context_from_result(
+                    db=db,
+                    user=user,
+                    context=context,
+                    context_update={"clear_pending_action": True},
+                )
+                db.commit()
+                return ProcessResult(response_text=responses.CANCEL_SUCCESS)
+
+            if text.isdigit():
+                choice = int(text)
+                item_q = pending.get("item_query")
+                scope = pending.get("scope") if isinstance(pending.get("scope"), dict) else {}
+                supplier_name = scope.get("supplier_name") if isinstance(scope.get("supplier_name"), str) else None
+                restaurant_name = scope.get("restaurant_name") if isinstance(scope.get("restaurant_name"), str) else None
+
+                tool_name = "supplier_items_search"
+
+                # 1) Search across all suppliers/outlets
+                if choice == 1:
+                    args = {"item_query": str(item_q)}
+                # 2) Search within same supplier as last time (if known)
+                elif choice == 2 and supplier_name:
+                    args = {"item_query": str(item_q), "supplier_query": supplier_name}
+                    if restaurant_name:
+                        args["restaurant_query"] = restaurant_name
+                # 2) List suppliers (so user can pick one)
+                elif choice == 2:
+                    args = {}
+                    tool_name = "suppliers_list"
+                else:
+                    return ProcessResult(response_text="Reply with a number from the list (or /cancel).")
+
+                from app.ai.deterministic.execution import execute_deterministic_tool
+                tool_response = execute_deterministic_tool(
+                    db=db,
+                    user=user,
+                    tool=tool_name,
+                    args=args,
+                    context=context.to_dict(),
+                )
+
+                context_update: dict[str, Any] = {"clear_pending_action": True}
+                try:
+                    parsed = json.loads(tool_response)
+                    if isinstance(parsed, dict) and isinstance(parsed.get("context_update"), dict):
+                        context_update.update(parsed["context_update"])
+                        parsed = dict(parsed)
+                        parsed.pop("context_update", None)
+                        tool_response = json.dumps(parsed, indent=2)
+                except Exception:
+                    pass
+
+                # Refresh last_list for subsequent follow-ups if we executed an item search.
+                if tool_name == "supplier_items_search":
+                    try:
+                        parsed = json.loads(tool_response)
+                        if isinstance(parsed, dict):
+                            scope2: dict[str, Any] = {}
+                            if restaurant_name:
+                                scope2["restaurant_name"] = restaurant_name
+                            if supplier_name:
+                                scope2["supplier_name"] = supplier_name
+                            context_update["last_list"] = {
+                                "tool": "supplier_items_search",
+                                "args": args,
+                                "created_at": dt.datetime.now(dt.UTC).isoformat(),
+                                "scope": scope2,
+                                "cursor": parsed.get("cursor") if isinstance(parsed.get("cursor"), str) else None,
+                                "has_more": bool(parsed.get("has_more")) if "has_more" in parsed else None,
+                            }
+                    except Exception:
+                        pass
+
+                context = update_context_from_result(
+                    db=db,
+                    user=user,
+                    context=context,
+                    context_update=context_update,
+                )
+                db.commit()
+
+                # Presenter: use PresenterLLM (model selectable). If it fails, deterministic fallback.
+                formatted_text, response_llm_call_id = _format_tool_response_with_llm(
+                    db=db,
+                    settings=settings,
+                    session_id=session_id,
+                    chat_id=chat_id,
+                    message_text=message_text,
+                    tool_response=tool_response,
+                )
+                if formatted_text:
+                    final_text = formatted_text
+                else:
+                    from app.ai.deterministic.presenter import present_tool_result
+                    final_text = present_tool_result(tool=tool_name, tool_response_json=tool_response)
+
+                user.last_interaction_at = dt.datetime.now(dt.UTC)
+                db.add(
+                    ProcessingEvents(
+                        session_id=session_id,
+                        at=dt.datetime.now(dt.UTC),
+                        event="followup_scope_choice_v1",
+                        payload_json=json.dumps(
+                            {
+                                "choice": choice,
+                                "tool": tool_name,
+                            }
+                        ),
+                        error=None,
+                    )
+                )
+                db.commit()
+                return ProcessResult(response_text=final_text, response_llm_call_id=response_llm_call_id)
+
+            return ProcessResult(response_text="Reply with a number from the list (or /cancel).")
+
         pending_result = _handle_pending_file_processing_missing_field(
             db=db,
             user=user,
@@ -530,6 +706,130 @@ def process_message_instant(
         from app.ai.deterministic.schemas import PlannerCallTool, PlannerClarify
         from app.ai.deterministic.tool_catalog import tool_catalog_as_planner_json
         from app.ai.deterministic.validation import validate_planner_decision
+
+        # Deterministic follow-up: "how about X?" after an item search list.
+        follow_q = _extract_followup_query(message_text or "")
+        last_list = context.last_list if hasattr(context, "last_list") else None
+        if (
+            follow_q
+            and isinstance(last_list, dict)
+            and last_list.get("tool") == "supplier_items_search"
+            and _last_list_is_fresh(settings, last_list)
+        ):
+            scope = last_list.get("scope") if isinstance(last_list.get("scope"), dict) else {}
+            supplier_name = scope.get("supplier_name") if isinstance(scope.get("supplier_name"), str) else None
+            restaurant_name = scope.get("restaurant_name") if isinstance(scope.get("restaurant_name"), str) else None
+
+            if not supplier_name and not restaurant_name:
+                # Ambiguous: ask user what scope they meant.
+                lines = [
+                    f'Do you want me to search items for "{follow_q}":',
+                    "1) across all suppliers",
+                    "2) or list suppliers to choose from",
+                    "",
+                    "Reply with 1 or 2 (or /cancel).",
+                ]
+                context = update_context_from_result(
+                    db=db,
+                    user=user,
+                    context=context,
+                    context_update={
+                        "pending_action": {
+                            "type": "followup_item_search_scope",
+                            "item_query": follow_q,
+                            "scope": scope,
+                        }
+                    },
+                )
+                db.commit()
+                return ProcessResult(response_text="\n".join(lines).strip())
+
+            # Unambiguous: reuse last scope, run directly (no planner needed).
+            args: dict[str, Any] = {"item_query": follow_q}
+            if restaurant_name:
+                args["restaurant_query"] = restaurant_name
+            if supplier_name:
+                args["supplier_query"] = supplier_name
+
+            tool_response = execute_deterministic_tool(
+                db=db,
+                user=user,
+                tool="supplier_items_search",
+                args=args,
+                context=context.to_dict(),
+            )
+
+            try:
+                parsed = json.loads(tool_response)
+                if isinstance(parsed, dict) and isinstance(parsed.get("context_update"), dict):
+                    context = update_context_from_result(
+                        db=db,
+                        user=user,
+                        context=context,
+                        context_update=parsed["context_update"],
+                    )
+                    parsed = dict(parsed)
+                    parsed.pop("context_update", None)
+                    tool_response = json.dumps(parsed, indent=2)
+            except Exception:
+                pass
+
+            # Refresh last_list for subsequent follow-ups.
+            try:
+                parsed = json.loads(tool_response)
+                if isinstance(parsed, dict):
+                    scope2: dict[str, Any] = {}
+                    if restaurant_name:
+                        scope2["restaurant_name"] = restaurant_name
+                    if supplier_name:
+                        scope2["supplier_name"] = supplier_name
+                    context = update_context_from_result(
+                        db=db,
+                        user=user,
+                        context=context,
+                        context_update={
+                            "last_list": {
+                                "tool": "supplier_items_search",
+                                "args": args,
+                                "created_at": dt.datetime.now(dt.UTC).isoformat(),
+                                "scope": scope2,
+                                "cursor": parsed.get("cursor") if isinstance(parsed.get("cursor"), str) else None,
+                                "has_more": bool(parsed.get("has_more")) if "has_more" in parsed else None,
+                            }
+                        },
+                    )
+                    db.commit()
+            except Exception:
+                pass
+
+            formatted_text, response_llm_call_id = _format_tool_response_with_llm(
+                db=db,
+                settings=settings,
+                session_id=session_id,
+                chat_id=chat_id,
+                message_text=message_text,
+                tool_response=tool_response,
+            )
+            if formatted_text:
+                final_text = formatted_text
+            else:
+                from app.ai.deterministic.presenter import present_tool_result
+                final_text = present_tool_result(tool="supplier_items_search", tool_response_json=tool_response)
+
+            db.add(
+                ProcessingEvents(
+                    session_id=session_id,
+                    at=dt.datetime.now(dt.UTC),
+                    event="deterministic_followup_item_search_v1",
+                    payload_json=json.dumps(
+                        {"item_query": follow_q, "scope": scope},
+                        ensure_ascii=False,
+                    ),
+                    error=None,
+                )
+            )
+            db.commit()
+            return ProcessResult(response_text=final_text, response_llm_call_id=response_llm_call_id)
 
         tool_catalog = tool_catalog_as_planner_json()
         decision, telemetry = plan_next_action(
@@ -670,6 +970,44 @@ def process_message_instant(
                     tool_response = json.dumps(parsed, indent=2)
         except Exception:
             context_update = None
+
+        # Cache last list context for follow-ups ("how about X?") and numbered selection.
+        if validated.tool in {"supplier_items_search", "restaurants_list", "staff_list", "suppliers_list", "invite_codes_list"}:
+            try:
+                parsed = json.loads(tool_response)
+                if isinstance(parsed, dict):
+                    scope: dict[str, Any] = {}
+                    if isinstance(parsed.get("restaurant_name"), str) and parsed["restaurant_name"].strip():
+                        scope["restaurant_name"] = parsed["restaurant_name"].strip()
+                    supplier_name = parsed.get("supplier_name")
+                    if isinstance(supplier_name, str) and supplier_name.strip():
+                        scope["supplier_name"] = supplier_name.strip()
+                    if validated.tool == "supplier_items_search" and "supplier_name" not in scope:
+                        items = parsed.get("items")
+                        if isinstance(items, list):
+                            suppliers = {
+                                it.get("supplier", "").strip()
+                                for it in items
+                                if isinstance(it, dict) and isinstance(it.get("supplier"), str) and it.get("supplier").strip()
+                            }
+                            if len(suppliers) == 1:
+                                scope["supplier_name"] = next(iter(suppliers))
+
+                    last_list = {
+                        "tool": validated.tool,
+                        "args": validated.args,
+                        "created_at": dt.datetime.now(dt.UTC).isoformat(),
+                        "scope": scope,
+                    }
+                    if "cursor" in parsed and isinstance(parsed.get("cursor"), str):
+                        last_list["cursor"] = parsed.get("cursor")
+                    if "has_more" in parsed:
+                        last_list["has_more"] = bool(parsed.get("has_more"))
+                    if context_update is None:
+                        context_update = {}
+                    context_update["last_list"] = last_list
+            except Exception:
+                pass
 
         if context_update:
             context = update_context_from_result(
@@ -1166,10 +1504,8 @@ def send_ack_message(
     """
     text = responses.ACK_FILE_PROCESSING if has_file else responses.ACK_PROCESSING
     llm_call_id: uuid.UUID | None = None
-    should_skip_llm_ack = (
-        not has_file and isinstance(message_text, str) and bool(_ITEM_SEARCH_ACK_SKIP_RE.search(message_text))
-    )
-    if (message_text.strip() or has_file) and not should_skip_llm_ack:
+    # Always attempt LLM ack (best-effort). Fall back to static ACK if it fails.
+    if message_text.strip() or has_file:
         ack_text, llm_call_id = _generate_ack_text(
             settings=settings,
             message_text=message_text,
@@ -1206,9 +1542,9 @@ def send_ack_message(
         return None
 
 ACK_SYSTEM_PROMPT = """You are an acknowledgment generator for a restaurant management bot.
-Return a single short sentence (max 6 words). No emojis, no markdown.
+Return a single short sentence (max 10 words). No emojis, no markdown.
 If has_file is true, acknowledge receipt of the file.
-Do not answer the user or provide options. Just acknowledge."""
+Do not answer the user, ask questions, or provide options. Just acknowledge receipt."""
 
 FINAL_RESPONSE_SYSTEM_PROMPT = """You are a response composer for a restaurant management bot.
 Use only the provided tool response and user message. Do not invent facts.
