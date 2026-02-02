@@ -18,6 +18,9 @@ class Settings(BaseSettings):
     telegram_webhook_secret_token: str = ""
     telegram_superuser_ids: list[int] = []
 
+    # Local dev/testing side-channel (bypasses Telegram network and can run inline).
+    side_channel_secret_token: str = ""
+
     # Optional AWS profile name for local dev.
     # If set, the app will use this profile for AWS SDK calls (including Celery SQS broker)
     # unless AWS_PROFILE is already set in the environment.

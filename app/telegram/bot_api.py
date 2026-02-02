@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 import logging
 from typing import Any
 import urllib.parse
@@ -13,6 +15,11 @@ from app.core.config import Settings
 logger = logging.getLogger(__name__)
 
 TELEGRAM_MAX_MESSAGE_LEN = 4096
+
+_OUTGOING_MESSAGE_SINK: ContextVar[callable[[int, str], None] | None] = ContextVar(
+    "_OUTGOING_MESSAGE_SINK",
+    default=None,
+)
 
 
 class TelegramFileError(Exception):
@@ -90,6 +97,24 @@ def send_message(chat_id: int, text: str, settings: Settings) -> int | None:
         httpx.HTTPError: If the API request fails
         ValueError: If the bot token is not configured
     """
+    sink = _OUTGOING_MESSAGE_SINK.get()
+    if sink is not None:
+        if not isinstance(text, str) or not text.strip():
+            return None
+        for part in _split_telegram_message_text(text=text, limit=TELEGRAM_MAX_MESSAGE_LEN):
+            sink(chat_id, part)
+        # Return a deterministic placeholder message_id for telemetry.
+        return 1
+
+    # Console sink for local/dev testing: chat_id=0 prints instead of calling Telegram.
+    # Telegram chat IDs are never 0, so this is safe and explicit.
+    if chat_id == 0:
+        if not isinstance(text, str) or not text.strip():
+            return None
+        for part in _split_telegram_message_text(text=text, limit=TELEGRAM_MAX_MESSAGE_LEN):
+            print(part, flush=True)  # noqa: T201
+        return 1
+
     if not settings.telegram_bot_token:
         raise ValueError("Telegram bot token is not configured")
 
@@ -173,6 +198,26 @@ def send_message(chat_id: int, text: str, settings: Settings) -> int | None:
             )
 
     return message_id
+
+
+@contextmanager
+def capture_outgoing_messages() -> Any:
+    """
+    Capture outgoing bot messages within the current context.
+
+    This is used by local dev side-channel APIs to exercise the full pipeline
+    without calling the real Telegram network.
+    """
+    captured: list[dict[str, Any]] = []
+
+    def _sink(chat_id: int, text: str) -> None:
+        captured.append({"chat_id": chat_id, "text": text})
+
+    token = _OUTGOING_MESSAGE_SINK.set(_sink)
+    try:
+        yield captured
+    finally:
+        _OUTGOING_MESSAGE_SINK.reset(token)
 
 
 def get_file_bytes(*, file_id: str, settings: Settings, max_bytes: int = 20_000_000) -> bytes:

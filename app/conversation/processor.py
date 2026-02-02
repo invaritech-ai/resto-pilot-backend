@@ -13,6 +13,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
+import os
 import re
 import uuid
 from dataclasses import dataclass
@@ -48,6 +49,19 @@ _ITEM_SEARCH_ACK_SKIP_RE = re.compile(
     flags=re.IGNORECASE,
 )
 
+_DETERMINISTIC_SHADOW_MODE = os.getenv("APP_DETERMINISTIC_SHADOW_MODE", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+_DETERMINISTIC_EXECUTION_MODE = os.getenv("APP_DETERMINISTIC_EXECUTION", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 @dataclass
 class ProcessResult:
@@ -503,6 +517,205 @@ def process_message_instant(
             response_text=final_text,
             response_llm_call_id=response_llm_call_id,
         )
+
+    # Deterministic execution mode: Planner -> (Clarify OR call one deterministic tool) -> Presenter.
+    # Runs on the worker via handle_update_v2, so the API is never blocked.
+    if _DETERMINISTIC_EXECUTION_MODE:
+        from app.ai.deterministic.execution import execute_deterministic_tool
+        from app.ai.deterministic.planner import plan_next_action
+        from app.ai.deterministic.schemas import PlannerCallTool, PlannerClarify
+        from app.ai.deterministic.tool_catalog import tool_catalog_as_planner_json
+        from app.ai.deterministic.validation import validate_planner_decision
+
+        tool_catalog = tool_catalog_as_planner_json()
+        decision, telemetry = plan_next_action(
+            settings=settings,
+            message_text=message_text or "",
+            recent_turns=history,
+            context=context.to_dict(),
+            available_tools=tool_catalog,
+        )
+        validation = validate_planner_decision(
+            decision=decision,
+            tool_catalog=tool_catalog,
+            no_ids=True,
+        )
+
+        planner_llm_call_id: uuid.UUID | None = None
+        if telemetry is not None:
+            planner_llm_call_id = record_llm_call(
+                db=db,
+                session_id=session_id,
+                chat_id=chat_id,
+                purpose="planner",
+                model=telemetry.model,
+                openrouter_generation_id=telemetry.generation_id,
+                usage=telemetry.usage,
+                latency_ms=telemetry.latency_ms,
+            )
+            db.add(
+                ProcessingEvents(
+                    session_id=session_id,
+                    at=dt.datetime.now(dt.UTC),
+                    event="planner_decision_v1",
+                    payload_json=json.dumps(
+                        {
+                            "decision": decision.model_dump(),
+                            "validated_decision": validation.decision.model_dump(),
+                            "validation_errors": validation.errors,
+                            "llm_call_id": str(planner_llm_call_id),
+                        },
+                        ensure_ascii=False,
+                    ),
+                    error=None,
+                )
+            )
+            db.commit()
+
+        validated = validation.decision
+        if isinstance(validated, PlannerClarify):
+            lines: list[str] = []
+            question = validated.question.strip() if isinstance(validated.question, str) else ""
+            lines.append(question or "Please clarify what you want to do.")
+            if validated.choices:
+                for choice in validated.choices:
+                    label = str(choice.label).strip()
+                    text = str(choice.text).strip()
+                    if label and text:
+                        if label.endswith(")"):
+                            lines.append(f"{label} {text}")
+                        else:
+                            lines.append(f"{label}) {text}")
+            final_text = "\n".join([ln for ln in lines if ln.strip()]).strip()
+
+            user.last_interaction_at = dt.datetime.now(dt.UTC)
+            db.add(
+                ProcessingEvents(
+                    session_id=session_id,
+                    at=dt.datetime.now(dt.UTC),
+                    event="deterministic_clarify_v1",
+                    payload_json=json.dumps(
+                        {
+                            "clarify_kind": validated.clarify_kind,
+                            "llm_call_id": str(planner_llm_call_id) if planner_llm_call_id else None,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    error=None,
+                )
+            )
+            db.commit()
+            return ProcessResult(response_text=final_text)
+
+        assert isinstance(validated, PlannerCallTool)
+        tool_response = execute_deterministic_tool(
+            db=db,
+            user=user,
+            tool=validated.tool,
+            args=validated.args or {},
+            context=context.to_dict(),
+        )
+
+        # Apply context updates if the tool returned one.
+        context_update: dict[str, Any] | None = None
+        try:
+            parsed = json.loads(tool_response)
+            if isinstance(parsed, dict) and isinstance(parsed.get("context_update"), dict):
+                context_update = parsed["context_update"]
+        except Exception:
+            context_update = None
+
+        if context_update:
+            context = update_context_from_result(
+                db=db,
+                user=user,
+                context=context,
+                context_update=context_update,
+            )
+
+        formatted_text, response_llm_call_id = _format_tool_response_with_llm(
+            db=db,
+            settings=settings,
+            session_id=session_id,
+            chat_id=chat_id,
+            message_text=message_text,
+            tool_response=tool_response,
+        )
+        final_text = formatted_text or tool_response
+
+        user.last_interaction_at = dt.datetime.now(dt.UTC)
+        db.add(
+            ProcessingEvents(
+                session_id=session_id,
+                at=dt.datetime.now(dt.UTC),
+                event="deterministic_tool_execution_v1",
+                payload_json=json.dumps(
+                    {
+                        "tool": validated.tool,
+                        "args": validated.args,
+                        "planner_llm_call_id": str(planner_llm_call_id) if planner_llm_call_id else None,
+                        "response_llm_call_id": str(response_llm_call_id) if response_llm_call_id else None,
+                        "validation_errors": validation.errors,
+                        "has_context_update": bool(context_update),
+                    },
+                    ensure_ascii=False,
+                ),
+                error=None,
+            )
+        )
+        db.commit()
+        return ProcessResult(response_text=final_text, response_llm_call_id=response_llm_call_id)
+
+    # Shadow mode: run deterministic PlannerLLM (no tool execution) and record telemetry.
+    # This is used to tune prompts locally/in staging without affecting behavior.
+    if _DETERMINISTIC_SHADOW_MODE:
+        try:
+            from app.ai.deterministic.planner import plan_next_action
+            from app.ai.deterministic.tool_catalog import tool_catalog_as_planner_json
+            from app.ai.deterministic.validation import validate_planner_decision
+
+            decision, telemetry = plan_next_action(
+                settings=settings,
+                message_text=message_text or "",
+                recent_turns=history,
+                context=context.to_dict(),
+                available_tools=tool_catalog_as_planner_json(),
+            )
+            validation = validate_planner_decision(
+                decision=decision,
+                tool_catalog=tool_catalog_as_planner_json(),
+                no_ids=True,
+            )
+            if telemetry is not None:
+                llm_call_id = record_llm_call(
+                    db=db,
+                    session_id=session_id,
+                    chat_id=chat_id,
+                    purpose="planner_shadow",
+                    model=telemetry.model,
+                    openrouter_generation_id=telemetry.generation_id,
+                    usage=telemetry.usage,
+                    latency_ms=telemetry.latency_ms,
+                )
+                db.add(
+                    ProcessingEvents(
+                        session_id=session_id,
+                        at=dt.datetime.now(dt.UTC),
+                        event="planner_shadow_decision_v1",
+                        payload_json=json.dumps(
+                            {
+                                "decision": decision.model_dump(),
+                                "validated_decision": validation.decision.model_dump(),
+                                "validation_errors": validation.errors,
+                                "llm_call_id": str(llm_call_id),
+                            },
+                            ensure_ascii=False,
+                        ),
+                        error=None,
+                    )
+                )
+        except Exception:
+            logger.exception("planner_shadow_failed")
 
     # Item search fast-path (minimize LLM calls + deterministic formatting)
     fast = try_handle_item_search_fast_path(
