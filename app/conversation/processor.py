@@ -169,6 +169,7 @@ def _format_tool_response_with_llm(
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.2,
+            purpose="presenter",
             extra_body={"max_tokens": 400},
         )
     except OpenAIError as exc:
@@ -242,6 +243,7 @@ def _generate_ack_text(
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.2,
+            purpose="ack",
             extra_body={"max_tokens": 20},
         )
     except OpenAIError as exc:
@@ -385,6 +387,7 @@ def process_message_instant(
     chat_id = user.chat_id
     message_text = _get_message_text(messages)
     has_file, file_kind, file_id = _has_file(messages)
+    deterministic_enabled = bool(getattr(settings, "deterministic_execution", False))
 
     # Create session for telemetry if not provided
     if session_id is None:
@@ -398,6 +401,22 @@ def process_message_instant(
 
     # Record start time
     started_at = dt.datetime.now(dt.UTC)
+
+    db.add(
+        ProcessingEvents(
+            session_id=session_id,
+            at=dt.datetime.now(dt.UTC),
+            event="pipeline_selected_v1",
+            payload_json=json.dumps(
+                {
+                    "deterministic_execution": deterministic_enabled,
+                    "has_file": bool(has_file),
+                }
+            ),
+            error=None,
+        )
+    )
+    db.commit()
 
     if not has_file and context.pending_action:
         pending_result = _handle_pending_file_processing_missing_field(
@@ -505,7 +524,7 @@ def process_message_instant(
 
     # Deterministic execution mode: Planner -> (Clarify OR call one deterministic tool) -> Presenter.
     # Runs on the worker via handle_update_v2, so the API is never blocked.
-    if bool(getattr(settings, "deterministic_execution", False)):
+    if deterministic_enabled:
         from app.ai.deterministic.execution import execute_deterministic_tool
         from app.ai.deterministic.planner import plan_next_action
         from app.ai.deterministic.schemas import PlannerCallTool, PlannerClarify

@@ -52,6 +52,7 @@ def clarify_text(
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
             ],
             temperature=0.2,
+            purpose="clarifier",
             extra_body={"max_tokens": 200},
         )
     except OpenAIError as exc:
@@ -78,4 +79,3 @@ def clarify_text(
         pass
 
     return None, telemetry
-

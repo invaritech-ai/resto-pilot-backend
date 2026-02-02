@@ -136,6 +136,7 @@ def plan_next_action(
             ],
             temperature=0.1,
             tools=_planner_tool_schema(),
+            purpose="planner",
             # Keep provider defaults ("auto"). Some OpenRouter providers reject forced tool_choice.
             extra_body={"max_tokens": 500},
         )

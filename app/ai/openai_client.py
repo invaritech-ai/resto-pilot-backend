@@ -242,6 +242,7 @@ def chat_completions_create_with_http_info(
     tools: list[dict[str, Any]] | None = None,
     tool_choice: str | dict[str, Any] | None = None,
     temperature: float = 0.2,
+    purpose: str | None = None,
     extra_headers: dict[str, str] | None = None,
     extra_body: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, str], int]:
@@ -299,6 +300,8 @@ def chat_completions_create_with_http_info(
                         "status_code": resp.status_code,
                         "attempt": attempt,
                         "attempts": attempts,
+                        "purpose": purpose,
+                        "model": payload.get("model"),
                     },
                 )
                 delay = min(retry_max, retry_initial * (2 ** (attempt - 1)))
@@ -359,6 +362,8 @@ def chat_completions_create_with_http_info(
                         "error": repr(exc),
                         "attempt": attempt,
                         "attempts": attempts,
+                        "purpose": purpose,
+                        "model": payload.get("model"),
                     },
                 )
                 delay = min(retry_max, retry_initial * (2 ** (attempt - 1)))
@@ -377,6 +382,8 @@ def chat_completions_create_with_http_info(
                         "error": repr(exc),
                         "attempt": attempt,
                         "attempts": attempts,
+                        "purpose": purpose,
+                        "model": payload.get("model"),
                     },
                 )
                 delay = min(retry_max, retry_initial * (2 ** (attempt - 1)))
@@ -418,6 +425,7 @@ def create_chat_completion_text_allow_empty_with_http_info(
     settings: Settings,
     messages: list[dict[str, Any]],
     temperature: float = 0.2,
+    purpose: str | None = None,
     extra_headers: dict[str, str] | None = None,
     extra_body: dict[str, Any] | None = None,
 ) -> tuple[str | None, dict[str, Any], dict[str, str], int]:
@@ -425,6 +433,7 @@ def create_chat_completion_text_allow_empty_with_http_info(
         settings=settings,
         messages=messages,
         temperature=temperature,
+        purpose=purpose,
         extra_headers=extra_headers,
         extra_body=extra_body,
     )
