@@ -62,6 +62,7 @@ When listing staff, include the outlet name if provided by the tool.
 When the user says "list suppliers" without specifying an outlet, call list_my_suppliers.
 When the user specifies an outlet (e.g., "for Mercato"), call list_suppliers with restaurant_id.
 When the user asks to link suppliers and outlets in any combination (1→1, 1→many, many→many, many→1, or all outlets), call link_suppliers.
+When the user asks to list or show outlets/restaurants, always call list_my_restaurants to fetch them; do not answer without a tool call.
 """
 
 
