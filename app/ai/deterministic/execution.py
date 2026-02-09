@@ -193,6 +193,41 @@ def _resolve_supplier_id_visible(
     return None, None, {"error": "Supplier not found. Upload a supplier price list to add it."}
 
 
+def _resolve_staging_id_from_context(
+    *,
+    args: dict[str, Any],
+    context: dict[str, Any] | None,
+) -> str | None:
+    if isinstance(args.get("staging_id"), str) and args["staging_id"].strip():
+        return args["staging_id"].strip()
+    ctx = context or {}
+    last_file = ctx.get("last_file")
+    if isinstance(last_file, dict):
+        staging_id = last_file.get("staging_id")
+        if isinstance(staging_id, str) and staging_id.strip():
+            return staging_id.strip()
+    pending = ctx.get("pending_action")
+    if isinstance(pending, dict):
+        staging_id = pending.get("staging_id")
+        if isinstance(staging_id, str) and staging_id.strip():
+            return staging_id.strip()
+    return None
+
+
+def _wrap_tool_text(result: str) -> str:
+    if isinstance(result, str):
+        stripped = result.strip()
+        lower = stripped.lower()
+        if lower.startswith("error"):
+            if ":" in stripped:
+                message = stripped.split(":", 1)[1].strip()
+            else:
+                message = stripped
+            return json.dumps({"error": message or "Error."}, indent=2)
+        return json.dumps({"text": stripped}, indent=2)
+    return json.dumps({"text": result}, indent=2)
+
+
 def execute_deterministic_tool(
     *,
     db: Session,
@@ -649,8 +684,6 @@ def execute_deterministic_tool(
         if tool == "supplier_items_search":
             item_query_raw = args.get("item_query")
             item_query = item_query_raw.strip() if isinstance(item_query_raw, str) else ""
-            if not item_query:
-                return json.dumps({"error": "item_query is required"}, indent=2)
 
             limit_raw = args.get("limit")
             limit = int(limit_raw) if isinstance(limit_raw, int) and limit_raw > 0 else 10
@@ -659,8 +692,9 @@ def execute_deterministic_tool(
             cursor_raw = args.get("cursor")
             offset = int(cursor_raw.strip()) if isinstance(cursor_raw, str) and cursor_raw.strip().isdigit() else 0
 
-            restaurant_query = args.get("restaurant_query")
             supplier_query = args.get("supplier_query")
+            supplier_query_s = supplier_query.strip() if isinstance(supplier_query, str) else ""
+            restaurant_query = args.get("restaurant_query") if supplier_query_s else None
 
             restaurant_id: uuid.UUID | None = None
             restaurant_name: str | None = None
@@ -676,10 +710,10 @@ def execute_deterministic_tool(
             supplier_id, supplier_name, serr = _resolve_supplier_id_visible(
                 db=db,
                 user=user,
-                supplier_query=supplier_query.strip() if isinstance(supplier_query, str) else None,
+                supplier_query=supplier_query_s if supplier_query_s else None,
                 restaurant_id=restaurant_id,
             )
-            if serr and supplier_query:
+            if serr and supplier_query_s:
                 return json.dumps(serr, indent=2)
 
             visible_suppliers = _visible_supplier_candidates(db=db, user=user)
@@ -689,16 +723,10 @@ def execute_deterministic_tool(
                 return json.dumps({"items": [], "has_more": False}, indent=2)
 
             now = dt.datetime.now(dt.UTC)
-            pattern = f"%{item_query}%"
 
             conditions = [Suppliers.is_active == True, Suppliers.id.in_(visible_ids)]
             if supplier_id is not None:
                 conditions.append(Suppliers.id == supplier_id)
-
-            text_match = or_(
-                SupplierItems.supplier_name_raw.ilike(pattern),
-                SupplierItems.supplier_sku.ilike(pattern),
-            )
 
             stmt = (
                 select(
@@ -709,11 +737,17 @@ def execute_deterministic_tool(
                 )
                 .join(Suppliers, Suppliers.id == SupplierItems.supplier_id)
                 .where(*conditions)
-                .where(text_match)
                 .order_by(func.length(SupplierItems.supplier_name_raw).asc(), Suppliers.name.asc())
                 .offset(offset)
                 .limit(limit + 1)
             )
+            if item_query:
+                pattern = f"%{item_query}%"
+                text_match = or_(
+                    SupplierItems.supplier_name_raw.ilike(pattern),
+                    SupplierItems.supplier_sku.ilike(pattern),
+                )
+                stmt = stmt.where(text_match)
             rows = db.execute(stmt).all()
             has_more = len(rows) > limit
             rows = rows[:limit]
@@ -757,6 +791,7 @@ def execute_deterministic_tool(
                 )
 
             payload: dict[str, Any] = {"items": items, "has_more": has_more}
+            payload["item_query"] = item_query
             if restaurant_name:
                 payload["restaurant_name"] = restaurant_name
             if supplier_name:
@@ -764,6 +799,34 @@ def execute_deterministic_tool(
             if has_more:
                 payload["cursor"] = str(offset + limit)
             return json.dumps(payload, indent=2)
+
+        if tool in {
+            "review_file_processing",
+            "update_file_processing_data",
+            "update_missing_field",
+            "confirm_file_processing",
+            "check_file_processing_status",
+        }:
+            from app.ai.db_tools import file_processing as file_processing_tools
+
+            tools = file_processing_tools.create_file_processing_tools(
+                db=db,
+                user_id=user.id,
+                actor_role="staff",
+                restaurant_roles={},
+            )
+            handler = tools.get(tool)
+            if handler is None:
+                return json.dumps({"error": "Tool not available."}, indent=2)
+
+            if tool != "check_file_processing_status":
+                staging_id = _resolve_staging_id_from_context(args=args, context=context)
+                if staging_id:
+                    args = dict(args)
+                    args["staging_id"] = staging_id
+
+            result = handler.handler(args)
+            return _wrap_tool_text(result)
 
         if tool == "help":
             topic_raw = args.get("topic")

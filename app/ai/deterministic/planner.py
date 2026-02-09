@@ -101,6 +101,23 @@ def _extract_tool_call_args(data: dict[str, Any]) -> dict[str, Any] | None:
         return None
 
 
+def _augment_recent_turns(
+    *,
+    recent_turns: list[dict[str, str]] | None,
+    context: dict[str, Any] | None,
+) -> list[dict[str, str]]:
+    turns = list(recent_turns or [])
+    ctx = context or {}
+    last_file = ctx.get("last_file")
+    if isinstance(last_file, dict) and last_file.get("staging_id"):
+        note = {
+            "role": "context",
+            "content": json.dumps({"last_file": last_file}, ensure_ascii=False),
+        }
+        turns.append(note)
+    return turns
+
+
 def plan_next_action(
     *,
     settings: Settings,
@@ -115,7 +132,7 @@ def plan_next_action(
 
     payload = {
         "message_text": message_text,
-        "recent_turns": recent_turns or [],
+        "recent_turns": _augment_recent_turns(recent_turns=recent_turns, context=context),
         "context": context or {},
         "available_tools": available_tools,
         "hard_rules": hard_rules
@@ -169,7 +186,7 @@ def plan_next_action(
             PlannerClarify(
                 action="clarify",
                 clarify_kind="unknown",
-                question="Please rephrase your request in one sentence.",
+                question="I couldn't figure out the exact action from that.",
                 choices=None,
             ),
             telemetry,
@@ -187,7 +204,7 @@ def plan_next_action(
             PlannerClarify(
                 action="clarify",
                 clarify_kind="unknown",
-                question="Please clarify what you want to do.",
+                question="I couldn't figure out the exact action from that.",
                 choices=None,
             ),
             telemetry,

@@ -52,6 +52,10 @@ _FOLLOWUP_RE = re.compile(
     r"^\s*(?:how\s+about|what\s+about|howbout|how\s+abt|what\s+abt|any)\s+(?P<q>.+?)\s*[\?\!\.]*\s*$",
     flags=re.IGNORECASE,
 )
+_SHOW_AGAIN_RE = re.compile(
+    r"\b(show|print|view|see)\b.*\b(again|preview|invoice|price\s*list|inventory|line\s*items|items)\b",
+    flags=re.IGNORECASE,
+)
 
 
 def _extract_followup_query(message_text: str) -> str | None:
@@ -61,6 +65,15 @@ def _extract_followup_query(message_text: str) -> str | None:
     q = (m.group("q") or "").strip()
     q = q.strip(" \t\r\n?.!,")
     return q if q else None
+
+
+def _is_show_again_request(message_text: str) -> bool:
+    text = (message_text or "").strip().lower()
+    if not text:
+        return False
+    if text in {"show", "show again", "print", "print again", "show preview", "print preview"}:
+        return True
+    return _SHOW_AGAIN_RE.search(text) is not None
 
 
 def _last_list_is_fresh(settings: Settings, last_list: dict[str, Any] | None) -> bool:
@@ -622,6 +635,7 @@ def process_message_instant(
             message_text=message_text,
             chat_id=chat_id,
             session_id=session_id,
+            settings=settings,
         )
         if pending_result is not None:
             response_text, context_update = pending_result
@@ -719,30 +733,6 @@ def process_message_instant(
             scope = last_list.get("scope") if isinstance(last_list.get("scope"), dict) else {}
             supplier_name = scope.get("supplier_name") if isinstance(scope.get("supplier_name"), str) else None
             restaurant_name = scope.get("restaurant_name") if isinstance(scope.get("restaurant_name"), str) else None
-
-            if not supplier_name and not restaurant_name:
-                # Ambiguous: ask user what scope they meant.
-                lines = [
-                    f'Do you want me to search items for "{follow_q}":',
-                    "1) across all suppliers",
-                    "2) or list suppliers to choose from",
-                    "",
-                    "Reply with 1 or 2 (or /cancel).",
-                ]
-                context = update_context_from_result(
-                    db=db,
-                    user=user,
-                    context=context,
-                    context_update={
-                        "pending_action": {
-                            "type": "followup_item_search_scope",
-                            "item_query": follow_q,
-                            "scope": scope,
-                        }
-                    },
-                )
-                db.commit()
-                return ProcessResult(response_text="\n".join(lines).strip())
 
             # Unambiguous: reuse last scope, run directly (no planner needed).
             args: dict[str, Any] = {"item_query": follow_q}
@@ -909,6 +899,10 @@ def process_message_instant(
                         ]
                         if validated.choices
                         else None,
+                        user_message=message_text or "",
+                        recent_turns=history,
+                        context=context.to_dict(),
+                        available_tools=tool_catalog,
                     )
                     if clarifier_telemetry is not None:
                         clarifier_llm_call_id = record_llm_call(
@@ -1348,6 +1342,7 @@ def _handle_pending_file_processing_confirm(
     message_text: str,
     chat_id: int,
     session_id: uuid.UUID,
+    settings: Settings,
 ) -> tuple[str, dict[str, Any]] | None:
     pending_action = context.pending_action
     if not pending_action or pending_action.get("type") != "file_processing_confirm":
@@ -1358,18 +1353,38 @@ def _handle_pending_file_processing_confirm(
         return None
 
     text_lower = message_text.strip().lower().rstrip("!?.,")
-    if text_lower not in (
-        "/confirm",
-        "confirm",
-        "yes",
-        "looks good",
-        "save",
-        "ok",
-    ):
-        return (
-            "Say /confirm to save this file.",
-            {"pending_action": pending_action},
+    confirm_tokens = {"/confirm", "confirm", "yes", "looks good", "save", "ok"}
+    if text_lower in confirm_tokens:
+        from app.ai.db_tools import file_processing as file_processing_tools
+        from app.db.models.file_processing_staging import FileProcessingStaging
+
+        tools = file_processing_tools.create_file_processing_tools(
+            db=db,
+            user_id=user.id,
+            actor_role="staff",
+            restaurant_roles={},
+            chat_id=chat_id,
+            session_id=session_id,
         )
+        tool = tools.get("confirm_file_processing")
+        if not tool:
+            return responses.CANT_HELP, {"pending_action": pending_action}
+
+        result = tool.handler({"staging_id": staging_id})
+        if isinstance(result, str) and result.startswith("Error:"):
+            return result, {"pending_action": pending_action}
+
+        try:
+            staging_uuid = uuid.UUID(staging_id)
+        except ValueError:
+            return result, {"clear_pending_action": True}
+
+        staging = db.get(FileProcessingStaging, staging_uuid)
+        context_update = {"clear_pending_action": True}
+        if staging:
+            context_update["active_restaurant_id"] = str(staging.restaurant_id)
+
+        return result, context_update
 
     from app.ai.db_tools import file_processing as file_processing_tools
     from app.db.models.file_processing_staging import FileProcessingStaging
@@ -1382,25 +1397,76 @@ def _handle_pending_file_processing_confirm(
         chat_id=chat_id,
         session_id=session_id,
     )
-    tool = tools.get("confirm_file_processing")
-    if not tool:
-        return responses.CANT_HELP, {"pending_action": pending_action}
 
-    result = tool.handler({"staging_id": staging_id})
-    if isinstance(result, str) and result.startswith("Error:"):
+    if _is_show_again_request(message_text):
+        review_tool = tools.get("review_file_processing")
+        if not review_tool:
+            return responses.CANT_HELP, {"pending_action": pending_action}
+        result = review_tool.handler({"staging_id": staging_id})
         return result, {"pending_action": pending_action}
 
     try:
         staging_uuid = uuid.UUID(staging_id)
     except ValueError:
-        return result, {"clear_pending_action": True}
+        return "Say /confirm to save this file.", {"pending_action": pending_action}
 
     staging = db.get(FileProcessingStaging, staging_uuid)
-    context_update = {"clear_pending_action": True}
-    if staging:
-        context_update["active_restaurant_id"] = str(staging.restaurant_id)
+    if not staging:
+        return "File processing record not found.", {"pending_action": pending_action}
 
-    return result, context_update
+    from app.ai.file_processing_edit_parser import parse_file_processing_edits
+
+    extracted_data = staging.extracted_data_json if isinstance(staging.extracted_data_json, dict) else {}
+    updates, telemetry = parse_file_processing_edits(
+        settings=settings,
+        user_message=message_text,
+        processing_type=staging.processing_type,
+        extracted_data=extracted_data,
+    )
+    if telemetry is not None:
+        record_llm_call(
+            db=db,
+            session_id=session_id,
+            chat_id=chat_id,
+            purpose="file_processing_edit_parse",
+            model=telemetry.model,
+            openrouter_generation_id=telemetry.generation_id,
+            usage=telemetry.usage,
+            latency_ms=telemetry.latency_ms,
+        )
+        db.commit()
+
+    if not updates:
+        return (
+            "Tell me what to change, or say /confirm to save.",
+            {"pending_action": pending_action},
+        )
+
+    update_tool = tools.get("update_file_processing_data")
+    review_tool = tools.get("review_file_processing")
+    if not update_tool or not review_tool:
+        return responses.CANT_HELP, {"pending_action": pending_action}
+
+    for update in updates:
+        field_path = update.get("field_path")
+        if not isinstance(field_path, str) or not field_path.strip():
+            continue
+        result = update_tool.handler(
+            {
+                "staging_id": staging_id,
+                "field_path": field_path.strip(),
+                "new_value": update.get("new_value"),
+            }
+        )
+        if isinstance(result, str) and result.startswith("Error:"):
+            return result, {"pending_action": pending_action}
+
+    preview = review_tool.handler({"staging_id": staging_id})
+    context_update = {
+        "pending_action": pending_action,
+        "last_file": {"staging_id": staging_id, "processing_type": staging.processing_type},
+    }
+    return preview, context_update
 
 
 def _handle_file_upload(

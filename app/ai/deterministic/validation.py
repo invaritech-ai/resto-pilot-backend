@@ -100,7 +100,7 @@ def validate_planner_decision(
             decision=PlannerClarify(
                 action="clarify",
                 clarify_kind="validation",
-                question="Please clarify what you want to do.",
+                question="I couldn't figure out the exact action from that.",
                 choices=None,
             ),
             errors=["Planner decision type is not recognized."],
@@ -129,11 +129,10 @@ def validate_planner_decision(
             decision=PlannerClarify(
                 action="clarify",
                 clarify_kind="validation",
-                question="Please clarify what you want to do.",
+                question="I couldn't figure out the exact action from that.",
                 choices=None,
             ),
             errors=errors,
         )
 
     return DecisionValidation(decision=decision, errors=[])
-

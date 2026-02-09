@@ -322,6 +322,7 @@ def _set_pending_file_processing_action(
     staging_id: uuid.UUID,
     field: str,
     supplier_id: uuid.UUID | None = None,
+    processing_type: str | None = None,
 ) -> None:
     user = db.get(User, user_id)
     if not user:
@@ -333,6 +334,11 @@ def _set_pending_file_processing_action(
         "staging_id": str(staging_id),
         "field": field,
     }
+    if processing_type:
+        context.last_file = {
+            "staging_id": str(staging_id),
+            "processing_type": processing_type,
+        }
     context.active_restaurant_id = str(restaurant_id)
     if supplier_id:
         context.active_supplier_id = str(supplier_id)
@@ -404,6 +410,7 @@ def _set_pending_file_processing_confirm_action(
     restaurant_id: uuid.UUID,
     staging_id: uuid.UUID,
     supplier_id: uuid.UUID | None = None,
+    processing_type: str | None = None,
 ) -> None:
     user = db.get(User, user_id)
     if not user:
@@ -414,6 +421,11 @@ def _set_pending_file_processing_confirm_action(
         "type": "file_processing_confirm",
         "staging_id": str(staging_id),
     }
+    if processing_type:
+        context.last_file = {
+            "staging_id": str(staging_id),
+            "processing_type": processing_type,
+        }
     context.active_restaurant_id = str(restaurant_id)
     if supplier_id:
         context.active_supplier_id = str(supplier_id)
@@ -1781,6 +1793,7 @@ def finalize_run_task(run_id: str) -> None:
                     staging_id=staging.id,
                     field="supplier",
                     supplier_id=supplier_uuid,
+                    processing_type=run.processing_type,
                 )
                 db.commit()
                 _send_message_with_telemetry(
@@ -1801,6 +1814,7 @@ def finalize_run_task(run_id: str) -> None:
                     staging_id=staging.id,
                     field="currency",
                     supplier_id=supplier_uuid,
+                    processing_type=run.processing_type,
                 )
                 db.commit()
                 _send_message_with_telemetry(
@@ -1826,6 +1840,7 @@ def finalize_run_task(run_id: str) -> None:
                     restaurant_id=run.restaurant_id,
                     staging_id=staging.id,
                     supplier_id=supplier_uuid,
+                    processing_type=run.processing_type,
                 )
                 db.commit()
 

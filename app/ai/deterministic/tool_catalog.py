@@ -223,17 +223,84 @@ def get_planner_tool_catalog() -> list[ToolSpec]:
         ),
         ToolSpec(
             name="supplier_items_search",
-            description="Search supplier catalog items by keyword(s). If no outlet/supplier specified, search across all accessible outlets/suppliers.",
+            description="Search supplier catalog items by keyword(s). If item_query is omitted, return all items. If no supplier specified, search across all accessible suppliers/outlets.",
             parameters={
                 "type": "object",
                 "properties": {
-                    "item_query": {"type": "string", "description": "Search query, e.g. 'pork belly'."},
+                    "item_query": {"type": "string", "description": "Search query (optional)."},
                     "restaurant_query": {"type": "string", "description": "Optional outlet name to scope search."},
                     "supplier_query": {"type": "string", "description": "Optional supplier name to scope search."},
                     "limit": {"type": "integer", "description": "Page size (optional)."},
                     "cursor": {"type": "string", "description": "Opaque cursor for pagination (optional)."},
                 },
-                "required": ["item_query"],
+                "additionalProperties": False,
+            },
+            is_write=False,
+        ),
+        ToolSpec(
+            name="review_file_processing",
+            description="Show extracted data from the most recent file processing (uses context if staging_id omitted).",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "staging_id": {"type": "string", "description": "File processing staging UUID (optional)."},
+                },
+                "additionalProperties": False,
+            },
+            is_write=False,
+        ),
+        ToolSpec(
+            name="update_file_processing_data",
+            description="Update a specific field in extracted file data before confirming (uses context if staging_id omitted).",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "staging_id": {"type": "string", "description": "File processing staging UUID (optional)."},
+                    "field_path": {
+                        "type": "string",
+                        "description": "Path to the field to update (e.g., 'supplier_name', 'line_items.0.quantity').",
+                    },
+                    "new_value": {"description": "New value for the field."},
+                },
+                "required": ["field_path", "new_value"],
+                "additionalProperties": False,
+            },
+            is_write=True,
+        ),
+        ToolSpec(
+            name="update_missing_field",
+            description="Provide a missing supplier or currency value for file processing (uses context if staging_id omitted).",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "staging_id": {"type": "string", "description": "File processing staging UUID (optional)."},
+                    "value": {"type": "string", "description": "Supplier name or currency value."},
+                },
+                "required": ["value"],
+                "additionalProperties": False,
+            },
+            is_write=True,
+        ),
+        ToolSpec(
+            name="confirm_file_processing",
+            description="Confirm and save extracted file data (uses context if staging_id omitted).",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "staging_id": {"type": "string", "description": "File processing staging UUID (optional)."},
+                },
+                "additionalProperties": False,
+            },
+            is_write=True,
+        ),
+        ToolSpec(
+            name="check_file_processing_status",
+            description="Check the status of a file processing job.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "run_id": {"type": "string", "description": "File processing run UUID (optional)."},
+                },
                 "additionalProperties": False,
             },
             is_write=False,

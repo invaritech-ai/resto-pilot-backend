@@ -25,6 +25,7 @@ class UserContext:
     active_supplier_id: str | None = None
     pending_action: dict[str, Any] | None = None
     last_list: dict[str, Any] | None = None
+    last_file: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -35,6 +36,8 @@ class UserContext:
             result["pending_action"] = self.pending_action
         if self.last_list:
             result["last_list"] = self.last_list
+        if self.last_file:
+            result["last_file"] = self.last_file
         return result
 
     @classmethod
@@ -46,6 +49,7 @@ class UserContext:
             active_supplier_id=data.get("active_supplier_id"),
             pending_action=data.get("pending_action"),
             last_list=data.get("last_list"),
+            last_file=data.get("last_file"),
         )
 
 
@@ -148,6 +152,10 @@ def update_context_from_result(
         context.last_list = context_update["last_list"]
     if context_update.get("clear_last_list"):
         context.last_list = None
+    if "last_file" in context_update:
+        context.last_file = context_update["last_file"]
+    if context_update.get("clear_last_file"):
+        context.last_file = None
 
     save_context(db, user, context)
     return context

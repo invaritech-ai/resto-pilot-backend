@@ -36,6 +36,18 @@ def present_tool_result(*, tool: str, tool_response_json: str) -> str:
     if "error" in data:
         return _format_error(data)
 
+    if tool in {
+        "review_file_processing",
+        "update_file_processing_data",
+        "update_missing_field",
+        "confirm_file_processing",
+        "check_file_processing_status",
+    }:
+        text = data.get("text")
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+        return tool_response_json
+
     if tool == "help":
         text = data.get("text")
         return text if isinstance(text, str) and text.strip() else responses.MAIN_MENU
@@ -171,6 +183,10 @@ def present_tool_result(*, tool: str, tool_response_json: str) -> str:
         header = "🔎 Items"
         if isinstance(supplier_name, str) and supplier_name.strip():
             header = f"🔎 Items — {supplier_name.strip()}"
+        item_query = data.get("item_query")
+        query_empty = not (isinstance(item_query, str) and item_query.strip())
+        if query_empty:
+            header = f"{header} ({len(items)} shown)"
 
         if not items:
             return f"{header}\n\nNo results. Try a different search."
@@ -202,4 +218,3 @@ def present_tool_result(*, tool: str, tool_response_json: str) -> str:
         return "\n".join(lines).strip()
 
     return tool_response_json
-
