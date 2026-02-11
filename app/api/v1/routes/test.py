@@ -253,7 +253,7 @@ def test_message(
         extra={
             "user_id": str(user.id),
             "telegram_id": user.telegram_id,
-            "message": payload.message,
+            "user_message": payload.message,
             "console_mode": payload.console_mode,
         },
     )
