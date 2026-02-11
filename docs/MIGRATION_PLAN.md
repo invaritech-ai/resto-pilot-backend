@@ -377,28 +377,19 @@ With testing and buffer: **~2-3 weeks**
 
 ---
 
-## ❓ Questions to Resolve
+## ✅ Decisions Made
 
-Before starting Phase 0:
+1. **Ack model**: LLM (cheap model) - More natural responses
+2. **Lookup tool limit**: 3 reads max - Optimal balance of flexibility vs. cost control
+3. **Clarification strategy**: Hybrid
+   - LLM decides what to clarify
+   - Deterministic parser for numeric selections ("1", "2", "first")
+   - LLM fallback for complex responses
+4. **Search priority**:
+   1. Trigram (typo tolerance)
+   2. Fuzzy matching
+   3. Contextual (recent items ranked higher)
+   4. Vector search (Phase 8 - future)
+5. **Testing database**: Use existing test/dev DB from `.env`
 
-1. **Ack model preference**: Use LLM or deterministic templates?
-   - LLM: More natural, slight cost
-   - Templates: Free, less flexible
-
-2. **Lookup tool limit**: Confirm max 3 reads is acceptable?
-   - Could be 2, 5, or configurable
-
-3. **Clarification strategy**: Always LLM or try deterministic parse first?
-   - Hybrid recommended (fast path for "1", "2", LLM for rest)
-
-4. **Search priority**: Which search features are most important?
-   - Trigram (typo tolerance)?
-   - Fuzzy matching?
-   - Contextual (recent items)?
-   - All of the above?
-
-5. **Testing database**: Use existing test DB or create new one?
-   - Existing: Faster
-   - New: Cleaner isolation
-
-Ready to proceed when you approve the plan! 🚀
+**Status:** ✅ Approved - Ready to implement Phase 0
