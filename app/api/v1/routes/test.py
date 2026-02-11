@@ -226,8 +226,9 @@ def test_message(
     # Track console output if in console mode
     console_output: list[str] = [] if payload.console_mode else []
 
-    # Load context
-    context = load_context(db=db, user=user)
+    # Load context (returns UserContext object, convert to dict)
+    user_context = load_context(db=db, user=user)
+    context = user_context.to_dict()
 
     # Override active restaurant if provided
     if payload.restaurant_id:
