@@ -14,7 +14,9 @@ Security:
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import logging
+import os
 import secrets
 from typing import Any, Literal, cast
 
@@ -26,6 +28,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_db_dep, get_settings_dep
 from app.core.config import Settings
 from app.db.models.user import User
+from app.telegram.ack_handler import send_instant_ack
 from app.workers.celery_types import CeleryDelayable
 from app.workers.tasks import handle_telegram_update
 
@@ -44,6 +47,18 @@ class TestMessageRequest(BaseModel):
     console_mode: bool = Field(
         default=True,
         description="If true, print bot responses to console instead of sending to Telegram.",
+    )
+    file_id: str | None = Field(
+        default=None,
+        description="Optional file_id to simulate file upload (for testing file processing).",
+    )
+    file_type: str | None = Field(
+        default=None,
+        description="Optional file type: document, photo, voice, video, or audio.",
+    )
+    file_path: str | None = Field(
+        default=None,
+        description="Optional local file path for actual file processing (bypasses Telegram API).",
     )
 
 
@@ -82,19 +97,83 @@ def _require_test_secret(
         )
 
 
-def _make_update(*, chat_id: int, telegram_id: int, text: str) -> dict[str, Any]:
+def _make_update(
+    *,
+    chat_id: int,
+    telegram_id: int,
+    text: str,
+    file_id: str | None = None,
+    file_type: str | None = None,
+) -> dict[str, Any]:
     """Create Telegram update dict."""
     now = dt.datetime.now(dt.UTC)
     ts = int(now.timestamp())
+
+    message: dict[str, Any] = {
+        "message_id": ts,
+        "date": ts,
+        "chat": {"id": chat_id},
+        "from": {"id": telegram_id, "first_name": "Test"},
+    }
+
+    # Add text if provided (can be empty for file-only messages)
+    if text:
+        message["text"] = text
+
+    # Add file if provided
+    if file_id and file_type:
+        if file_type == "document":
+            message["document"] = {
+                "file_id": file_id,
+                "file_unique_id": f"test_{file_id[:8]}",
+                "file_name": "test_file.pdf",
+                "mime_type": "application/pdf",
+                "file_size": 12345,
+            }
+        elif file_type == "photo":
+            message["photo"] = [
+                {
+                    "file_id": file_id,
+                    "file_unique_id": f"test_{file_id[:8]}",
+                    "width": 1920,
+                    "height": 1080,
+                    "file_size": 54321,
+                }
+            ]
+        elif file_type == "voice":
+            message["voice"] = {
+                "file_id": file_id,
+                "file_unique_id": f"test_{file_id[:8]}",
+                "duration": 30,
+                "mime_type": "audio/ogg",
+                "file_size": 9876,
+            }
+        elif file_type == "video":
+            message["video"] = {
+                "file_id": file_id,
+                "file_unique_id": f"test_{file_id[:8]}",
+                "width": 1920,
+                "height": 1080,
+                "duration": 60,
+                "mime_type": "video/mp4",
+                "file_size": 123456,
+            }
+        elif file_type == "audio":
+            message["audio"] = {
+                "file_id": file_id,
+                "file_unique_id": f"test_{file_id[:8]}",
+                "duration": 180,
+                "mime_type": "audio/mpeg",
+                "file_size": 45678,
+            }
+
+        # File messages can have caption instead of text
+        if text:
+            message["caption"] = message.pop("text", "")
+
     return {
         "update_id": ts,
-        "message": {
-            "message_id": ts,
-            "date": ts,
-            "chat": {"id": chat_id},
-            "from": {"id": telegram_id, "first_name": "Test"},
-            "text": text,
-        },
+        "message": message,
     }
 
 
@@ -134,11 +213,67 @@ def test_message(
     # chat_id=0 for console mode (prints to console), else use real chat_id
     chat_id = 0 if payload.console_mode else user.chat_id
 
+    # Handle local file if provided
+    file_id = payload.file_id
+    file_type = payload.file_type
+    local_file_path: str | None = None
+
+    if payload.file_path:
+        # Verify file exists
+        if not os.path.isfile(payload.file_path):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"File not found: {payload.file_path}",
+            )
+
+        # Auto-detect file type from extension if not provided
+        if not file_type:
+            ext = os.path.splitext(payload.file_path)[1].lower()
+            if ext in [".pdf", ".doc", ".docx", ".txt", ".csv", ".xlsx"]:
+                file_type = "document"
+            elif ext in [".jpg", ".jpeg", ".png", ".gif", ".webp"]:
+                file_type = "photo"
+            elif ext in [".mp3", ".m4a", ".wav", ".flac"]:
+                file_type = "audio"
+            elif ext in [".mp4", ".mov", ".avi", ".mkv"]:
+                file_type = "video"
+            elif ext in [".ogg", ".oga"]:
+                file_type = "voice"
+            else:
+                file_type = "document"  # Default to document
+
+        # Generate file_id from path hash if not provided
+        if not file_id:
+            path_hash = hashlib.sha256(payload.file_path.encode()).hexdigest()[:16]
+            file_id = f"local_{path_hash}"
+
+        # Store absolute path for worker
+        local_file_path = os.path.abspath(payload.file_path)
+
+    # Build Telegram update first (same structure as real Telegram)
     update = _make_update(
         chat_id=chat_id,
         telegram_id=payload.telegram_id,
         text=payload.message,
+        file_id=file_id,
+        file_type=file_type,
     )
+
+    # Send instant ACK and create session for telemetry (shared with telegram endpoint)
+    session_id_str = send_instant_ack(
+        db=db,
+        settings=settings,
+        update=update,
+        console_mode=payload.console_mode,
+    )
+
+    # Add session_id to update so worker can reuse it
+    if session_id_str:
+        update["_session_id"] = session_id_str
+
+    # Add local file path to update so worker can read it directly
+    if local_file_path:
+        update["_local_file_path"] = local_file_path
 
     try:
         async_result = cast(CeleryDelayable, handle_telegram_update).delay(update)

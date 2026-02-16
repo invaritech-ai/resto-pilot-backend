@@ -220,6 +220,99 @@ def capture_outgoing_messages() -> Any:
         _OUTGOING_MESSAGE_SINK.reset(token)
 
 
+def get_file_bytes_unified(
+    *,
+    file_id: str,
+    settings: Settings,
+    local_file_path: str | None = None,
+    max_bytes: int = 20_000_000,
+) -> bytes:
+    """
+    Download file bytes from either local path or Telegram.
+
+    This unified function ensures identical behavior for test and production:
+    - If local_file_path is provided, read from local disk
+    - Otherwise, download from Telegram
+
+    Both paths use identical error handling and size limits.
+
+    Args:
+        file_id: Telegram file identifier (used if local_file_path not provided)
+        settings: Application settings containing bot token
+        local_file_path: Optional local file path (bypasses Telegram download)
+        max_bytes: Maximum file size in bytes (default 20MB)
+
+    Returns:
+        File bytes
+
+    Raises:
+        TelegramFileExpiredError: File not found/accessible
+        TelegramFileTooBigError: File exceeds max_bytes limit
+        TelegramFileNetworkError: Download/read error
+    """
+    if local_file_path:
+        return get_file_bytes_from_local_path(file_path=local_file_path, max_bytes=max_bytes)
+    else:
+        return get_file_bytes(file_id=file_id, settings=settings, max_bytes=max_bytes)
+
+
+def get_file_bytes_from_local_path(*, file_path: str, max_bytes: int = 20_000_000) -> bytes:
+    """
+    Read a local file with the same error handling as Telegram file downloads.
+
+    This is the exact replica of get_file_bytes() but for local files,
+    ensuring identical behavior for test and production.
+
+    Args:
+        file_path: Absolute path to local file
+        max_bytes: Maximum file size in bytes (default 20MB)
+
+    Returns:
+        File bytes
+
+    Raises:
+        TelegramFileExpiredError: File not found/accessible (matches Telegram 404)
+        TelegramFileTooBigError: File exceeds max_bytes limit
+        TelegramFileNetworkError: File read error (matches Telegram network errors)
+    """
+    import os
+
+    # Check file exists (equivalent to Telegram 404)
+    if not os.path.isfile(file_path):
+        raise TelegramFileExpiredError(
+            f"Local file not found: {file_path}. This matches Telegram's behavior for expired files."
+        )
+
+    # Check file is readable (equivalent to Telegram 403)
+    if not os.access(file_path, os.R_OK):
+        raise TelegramFileExpiredError(
+            f"Cannot read local file: {file_path}. This matches Telegram's permission errors."
+        )
+
+    # Read file with size limit checking (matches Telegram streaming behavior)
+    try:
+        chunks: list[bytes] = []
+        total = 0
+        with open(file_path, "rb") as f:
+            while True:
+                chunk = f.read(8192)  # Read in 8KB chunks like httpx
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise TelegramFileTooBigError(
+                        f"File is too large ({total / 1024 / 1024:.1f}MB). "
+                        f"Maximum size is {max_bytes / 1024 / 1024:.0f}MB."
+                    )
+                chunks.append(chunk)
+        return b"".join(chunks)
+    except (IOError, OSError) as e:
+        # File read errors (equivalent to Telegram network errors)
+        raise TelegramFileNetworkError(
+            f"Error reading local file: {type(e).__name__}"
+        ) from None
+
+
 def get_file_bytes(*, file_id: str, settings: Settings, max_bytes: int = 20_000_000) -> bytes:
     """
     Download a Telegram file by file_id with specific error handling.

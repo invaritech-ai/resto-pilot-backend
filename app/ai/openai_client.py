@@ -33,12 +33,7 @@ def _apply_reasoning_policy(
     if "reasoning" in payload:
         return
 
-    reasoning_model = settings.openai_reasoning_model.strip()
-    if reasoning_model and model.strip() == reasoning_model:
-        payload["reasoning"] = {"enabled": True}
-        return
-
-    # For non-reasoning models, set effort to "low" to minimize thinking time
+    # For all models, set effort to "low" to minimize thinking time
     # Some endpoints require reasoning but allow low effort to reduce latency
     payload["reasoning"] = {"effort": "low"}
 

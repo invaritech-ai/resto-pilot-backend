@@ -612,6 +612,90 @@ def create_file_processing_tools(
             logger.exception("confirm_file_processing_failed")
             return f"Error confirming file processing: {str(e)}"
 
+    def correct_invoice_line_item(args: dict[str, Any]) -> str:
+        """Correct a line item in an invoice using natural language like 'Onion is 4kg, 10, $40'."""
+        from app.context.user import get_context_from_db
+
+        # Get staging_id from context or args
+        staging_id_str = args.get("staging_id", "").strip()
+        if not staging_id_str:
+            context = get_context_from_db(db, user_id)
+            if context and context.last_file:
+                staging_id_str = context.last_file.get("staging_id", "")
+
+        if not staging_id_str:
+            return "Error: No invoice found in context. Please specify staging_id."
+
+        try:
+            staging_id = uuid.UUID(staging_id_str)
+        except ValueError:
+            return "Error: Invalid staging_id format."
+
+        staging = db.get(FileProcessingStaging, staging_id)
+        if not staging:
+            return "Error: Invoice not found."
+
+        if staging.status != "pending_review":
+            return f"Error: This invoice is already {staging.status}. Cannot correct."
+
+        if staging.processing_type != "invoice":
+            return "Error: This tool only works with invoices."
+
+        item_name = args.get("item_name", "").strip().lower()
+        if not item_name:
+            return "Error: item_name is required (e.g., 'onion', 'fennel')."
+
+        # Parse the correction data
+        quantity_str = args.get("quantity")
+        unit_price = args.get("unit_price")
+        line_total = args.get("line_total")
+
+        # Find the line item by name (fuzzy match)
+        extracted_data = staging.extracted_data_json.copy()
+        line_items = extracted_data.get("line_items", [])
+
+        item_index = None
+        for i, item in enumerate(line_items):
+            desc = (item.get("description_raw") or "").lower()
+            if item_name in desc or desc in item_name:
+                item_index = i
+                break
+
+        if item_index is None:
+            return f"Error: Item '{item_name}' not found in invoice. Available items: {', '.join([item.get('description_raw', '?') for item in line_items[:5]])}..."
+
+        # Parse quantity_str like "4kg" into quantity and unit
+        quantity = None
+        unit = None
+        if quantity_str:
+            import re
+            match = re.match(r'^(\d+(?:\.\d+)?)\s*([a-zA-Z]+)?$', str(quantity_str).strip())
+            if match:
+                quantity = float(match.group(1))
+                unit = match.group(2) or None
+
+        # Update the line item
+        if quantity is not None:
+            line_items[item_index]["quantity"] = quantity
+        if unit is not None:
+            line_items[item_index]["unit"] = unit
+        if unit_price is not None:
+            line_items[item_index]["unit_price"] = float(unit_price)
+        if line_total is not None:
+            line_items[item_index]["line_total"] = float(line_total)
+
+        extracted_data["line_items"] = line_items
+        staging.extracted_data_json = extracted_data
+
+        try:
+            db.commit()
+            updated_item = line_items[item_index]
+            return f"✅ Corrected '{updated_item.get('description_raw')}': quantity={updated_item.get('quantity')} {updated_item.get('unit') or ''}, unit_price={updated_item.get('unit_price')}, total={updated_item.get('line_total')}"
+        except Exception as e:
+            db.rollback()
+            logger.exception("correct_invoice_line_item_failed")
+            return f"Error: {str(e)}"
+
     return {
         "process_invoice_file": Tool(
             name="process_invoice_file",
@@ -771,5 +855,37 @@ def create_file_processing_tools(
                 "additionalProperties": False,
             },
             handler=confirm_file_processing,
+        ),
+        "correct_invoice_line_item": Tool(
+            name="correct_invoice_line_item",
+            description="Correct a line item in an invoice with natural language like 'Onion is 4kg, 10, $40'. Automatically finds the item by name and updates quantity, unit_price, and line_total.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "staging_id": {
+                        "type": "string",
+                        "description": "The file processing staging record UUID (optional, uses context if omitted).",
+                    },
+                    "item_name": {
+                        "type": "string",
+                        "description": "The product name to correct (e.g., 'onion', 'fennel'). Case-insensitive fuzzy match.",
+                    },
+                    "quantity": {
+                        "type": "string",
+                        "description": "Quantity with optional unit (e.g., '4kg', '2.5', '10pcs'). Will be parsed into quantity and unit.",
+                    },
+                    "unit_price": {
+                        "type": "number",
+                        "description": "Unit price per unit (e.g., 10 for $10 per kg).",
+                    },
+                    "line_total": {
+                        "type": "number",
+                        "description": "Total amount for this line (e.g., 40 for $40).",
+                    },
+                },
+                "required": ["item_name"],
+                "additionalProperties": False,
+            },
+            handler=correct_invoice_line_item,
         ),
     }

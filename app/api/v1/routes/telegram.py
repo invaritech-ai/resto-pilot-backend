@@ -11,9 +11,11 @@ from typing import cast
 
 from fastapi import APIRouter, Request, Depends, Header, HTTPException, status
 from fastapi.responses import JSONResponse
+from sqlalchemy.orm import Session
 
-from app.api.deps import get_settings_dep
+from app.api.deps import get_settings_dep, get_db_dep
 from app.core.config import Settings
+from app.telegram.ack_handler import send_instant_ack
 from app.workers.celery_types import CeleryDelayable
 from app.workers.tasks import handle_telegram_update
 
@@ -25,6 +27,7 @@ logger = logging.getLogger(__name__)
 async def telegram_webhook(
     request: Request,
     settings: Settings = Depends(get_settings_dep),
+    db: Session = Depends(get_db_dep),
     x_telegram_bot_api_secret_token: str | None = Header(
         default=None, alias="X-Telegram-Bot-Api-Secret-Token"
     ),
@@ -32,7 +35,7 @@ async def telegram_webhook(
     """
     Receive Telegram webhook updates and enqueue for processing.
 
-    All messages are processed instantly via Celery task.
+    Sends instant ACK before enqueueing to Celery for background processing.
     The handler uses intent classification to determine the appropriate response.
     """
     # Validate configuration
@@ -83,6 +86,18 @@ async def telegram_webhook(
         update_id,
         chat_id,
     )
+
+    # Send instant ACK and create session for telemetry
+    session_id_str = send_instant_ack(
+        db=db,
+        settings=settings,
+        update=update,
+        console_mode=False,
+    )
+
+    # Add session_id to update so worker can reuse it
+    if session_id_str and isinstance(update, dict):
+        update["_session_id"] = session_id_str
 
     # Enqueue for instant processing
     try:

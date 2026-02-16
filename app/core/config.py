@@ -44,21 +44,17 @@ class Settings(BaseSettings):
 
     openai_api_key: str = ""
     openai_model: str = "gpt-4o-mini"
-    # Fine-grained text models (optional; fall back to openai_model)
-    ack_model: str = ""
-    planner_model: str = ""
-    clarification_model: str = ""
-    presenter_model: str = ""
-    # Model for intent classification and file type detection (legacy alias)
-    openai_gate_model: str = ""
-    # Purpose-specific models (all optional, fall back to openai_model)
-    openai_intent_model: str = ""
-    openai_response_model: str = ""
-    openai_reasoning_model: str = ""
-    openai_file_type_model: str = ""
-    openai_item_search_parse_model: str = ""
-    openai_audio_model: str = ""
-    openai_video_model: str = ""
+
+    # Deterministic architecture LLM blocks (all optional; fall back to openai_model)
+    ack_model: str = ""           # Fast acknowledgments ("Got it...")
+    planner_model: str = ""       # Intent classification & tool selection
+    clarification_model: str = "" # Rephrase clarification questions (optional)
+    presenter_model: str = ""     # Format final responses
+
+    # File processing models
+    openai_file_type_model: str = ""  # File type detection
+    openai_audio_model: str = ""      # Audio transcription
+    openai_video_model: str = ""      # Video processing
     openai_base_url: str = "https://api.openai.com/v1"
     # This primarily controls the HTTP read timeout (how long we wait for the model response).
     openai_timeout_seconds: float = 120.0
@@ -73,6 +69,17 @@ class Settings(BaseSettings):
     vision_api_key: str = ""  # Optional, defaults to openai_api_key if empty
     vision_base_url: str = ""  # Optional, defaults to openai_base_url if empty
     vision_pdf_chunk_size: int = 3
+
+    # Google Document AI - Premium OCR for invoices
+    use_google_vision_ocr: bool = False  # Enable Google Document AI (reusing this flag)
+    google_cloud_credentials_path: str = ""  # Path to Google Cloud credentials JSON file (local dev)
+    # Individual env vars for deployment (extract from JSON file):
+    google_cloud_project_id: str = ""  # From JSON: "project_id"
+    google_cloud_private_key: str = ""  # From JSON: "private_key" (keep the \n escaped)
+    google_cloud_client_email: str = ""  # From JSON: "client_email"
+    # Document AI specific settings:
+    google_document_ai_processor_id: str = ""  # Invoice Parser processor ID from Google Cloud Console
+    google_cloud_location: str = "us"  # Processor location: us, eu, asia, etc.
 
     # Item search fast-path configuration
     item_search_session_ttl_minutes: int = 30

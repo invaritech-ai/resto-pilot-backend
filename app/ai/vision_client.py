@@ -22,6 +22,465 @@ from app.core.config import Settings
 logger = logging.getLogger(__name__)
 
 
+def _parse_vision_blocks_to_table(full_text_annotation) -> str:
+    """
+    Parse Google Vision's block structure into a markdown table.
+
+    Groups words by their vertical position (rows) and horizontal position (columns)
+    to reconstruct the table layout from the invoice.
+    """
+    if not full_text_annotation.pages:
+        return full_text_annotation.text or ""
+
+    # Extract all words with their bounding boxes
+    words_with_positions = []
+    for page in full_text_annotation.pages:
+        for block in page.blocks:
+            for paragraph in block.paragraphs:
+                for word in paragraph.words:
+                    # Get word text
+                    word_text = ''.join([symbol.text for symbol in word.symbols])
+
+                    # Get bounding box (use first vertex for position)
+                    vertices = word.bounding_box.vertices
+                    if vertices:
+                        x = vertices[0].x
+                        y = vertices[0].y
+                        words_with_positions.append({
+                            'text': word_text,
+                            'x': x,
+                            'y': y,
+                            'vertices': vertices
+                        })
+
+    if not words_with_positions:
+        return full_text_annotation.text or ""
+
+    # Sort by Y position first (top to bottom), then X position (left to right)
+    words_with_positions.sort(key=lambda w: (w['y'], w['x']))
+
+    # Group words into rows based on Y position (allow some tolerance for same row)
+    rows = []
+    current_row = []
+    last_y = None
+    y_tolerance = 15  # pixels - words within this distance are considered same row
+
+    for word in words_with_positions:
+        if last_y is None or abs(word['y'] - last_y) <= y_tolerance:
+            current_row.append(word)
+            last_y = word['y'] if last_y is None else (last_y + word['y']) / 2
+        else:
+            if current_row:
+                rows.append(current_row)
+            current_row = [word]
+            last_y = word['y']
+
+    if current_row:
+        rows.append(current_row)
+
+    # Build markdown output with table structure
+    lines = []
+    for row in rows:
+        # Sort words in row by X position (left to right)
+        row.sort(key=lambda w: w['x'])
+
+        # Join words with spacing (detect column breaks by X distance)
+        row_text = []
+        last_x = None
+        for word in row:
+            if last_x is not None and word['x'] - last_x > 50:  # Column break
+                row_text.append(' | ')
+            elif last_x is not None:
+                row_text.append(' ')
+            row_text.append(word['text'])
+            # Approximate word width
+            last_x = word['x'] + len(word['text']) * 8
+
+        lines.append(''.join(row_text))
+
+    return '\n'.join(lines)
+
+
+def paddle_ocr(image_bytes: bytes, settings: Settings) -> tuple[str, int]:
+    """
+    Use PaddleOCR - excellent for handwriting and Chinese/English mixed text.
+
+    Self-hosted, free, and much better than Google Vision for handwritten invoices.
+
+    Returns: (extracted_text, latency_ms)
+    """
+    try:
+        from paddleocr import PaddleOCR
+        import numpy as np
+        from PIL import Image
+        import io
+
+        start_time = time.time()
+
+        # Initialize PaddleOCR (cached after first use)
+        if not hasattr(paddle_ocr, '_ocr_instance'):
+            paddle_ocr._ocr_instance = PaddleOCR(
+                use_angle_cls=True,
+                lang='ch'  # Chinese + English
+            )
+
+        ocr = paddle_ocr._ocr_instance
+
+        # Convert bytes to image
+        image = Image.open(io.BytesIO(image_bytes))
+
+        # Resize if largest side exceeds 2000px to prevent memory issues
+        max_side = 2000
+        if max(image.width, image.height) > max_side:
+            ratio = max_side / max(image.width, image.height)
+            new_width = int(image.width * ratio)
+            new_height = int(image.height * ratio)
+            image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+            logger.info(f"Resized image for PaddleOCR: {new_width}x{new_height} (ratio: {ratio:.2f})")
+
+        img_array = np.array(image)
+
+        # Run OCR
+        result = ocr.ocr(img_array)
+
+        # Extract text with layout preservation
+        lines = []
+        if result and result[0]:
+            # Collect all text boxes with positions
+            boxes_with_text = []
+            for line in result[0]:
+                box = line[0]  # Bounding box
+
+                # Handle different result formats
+                if isinstance(line[1], tuple) and len(line[1]) >= 2:
+                    text = line[1][0]  # Text
+                    conf = line[1][1]  # Confidence
+                elif isinstance(line[1], (list, tuple)) and len(line[1]) >= 1:
+                    text = line[1][0]
+                    conf = 1.0
+                else:
+                    text = str(line[1])
+                    conf = 1.0
+
+                y_pos = box[0][1]  # Top Y position
+                x_pos = box[0][0]  # Left X position
+
+                boxes_with_text.append({
+                    'text': text,
+                    'y': y_pos,
+                    'x': x_pos,
+                    'conf': conf
+                })
+
+            # Sort by Y (top to bottom), then X (left to right)
+            boxes_with_text.sort(key=lambda b: (b['y'], b['x']))
+
+            # Group into rows
+            current_row = []
+            last_y = None
+            y_tolerance = 20
+
+            for box in boxes_with_text:
+                if last_y is None or abs(box['y'] - last_y) <= y_tolerance:
+                    current_row.append(box['text'])
+                    last_y = box['y'] if last_y is None else last_y
+                else:
+                    if current_row:
+                        lines.append(' '.join(current_row))
+                    current_row = [box['text']]
+                    last_y = box['y']
+
+            if current_row:
+                lines.append(' '.join(current_row))
+
+        extracted_text = '\n'.join(lines)
+        latency_ms = int((time.time() - start_time) * 1000)
+
+        logger.info(
+            "paddle_ocr_success",
+            extra={
+                "chars_extracted": len(extracted_text),
+                "latency_ms": latency_ms,
+                "lines": len(lines)
+            }
+        )
+
+        return extracted_text, latency_ms
+
+    except Exception as exc:
+        logger.exception("paddle_ocr_failed")
+        return "", 0
+
+
+def google_vision_ocr(image_bytes: bytes, settings: Settings) -> tuple[str, int]:
+    """
+    Use Google Cloud Vision API for OCR (much better for handwriting than LLMs).
+
+    Supports two authentication methods:
+    1. Individual env vars (for deployment): GOOGLE_CLOUD_PROJECT_ID, GOOGLE_CLOUD_PRIVATE_KEY, GOOGLE_CLOUD_CLIENT_EMAIL
+    2. JSON file path: GOOGLE_CLOUD_CREDENTIALS_PATH (for local dev)
+
+    Returns: (extracted_text, latency_ms)
+    """
+    try:
+        from google.cloud import vision
+        from google.oauth2 import service_account
+        import os
+
+        start_time = time.time()
+
+        # Method 1: Use individual env vars (deployment-friendly)
+        project_id = getattr(settings, 'google_cloud_project_id', None)
+        private_key = getattr(settings, 'google_cloud_private_key', None)
+        client_email = getattr(settings, 'google_cloud_client_email', None)
+
+        if project_id and private_key and client_email:
+            # Construct credentials from env vars
+            credentials_info = {
+                "type": "service_account",
+                "project_id": project_id,
+                "private_key": private_key.replace('\\n', '\n'),  # Handle escaped newlines
+                "client_email": client_email,
+                "token_uri": "https://oauth2.googleapis.com/token",
+            }
+            credentials = service_account.Credentials.from_service_account_info(credentials_info)
+            client = vision.ImageAnnotatorClient(credentials=credentials)
+            logger.info("google_vision_using_env_vars")
+
+        # Method 2: Use JSON file (local dev)
+        elif hasattr(settings, 'google_cloud_credentials_path') and settings.google_cloud_credentials_path:
+            os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = settings.google_cloud_credentials_path
+            client = vision.ImageAnnotatorClient()
+            logger.info("google_vision_using_json_file")
+
+        # Method 3: Use Application Default Credentials (gcloud CLI)
+        else:
+            client = vision.ImageAnnotatorClient()
+            logger.info("google_vision_using_default_credentials")
+
+        image = vision.Image(content=image_bytes)
+
+        # Use document_text_detection for better OCR (handles handwriting + structure)
+        response = client.document_text_detection(image=image)
+
+        if response.error.message:
+            raise Exception(f"Google Vision API error: {response.error.message}")
+
+        # Extract raw text (Google Vision preserves reading order well)
+        if response.full_text_annotation:
+            extracted_text = response.full_text_annotation.text
+        else:
+            extracted_text = ""
+
+        latency_ms = int((time.time() - start_time) * 1000)
+
+        logger.info(
+            "google_vision_ocr_success",
+            extra={
+                "chars_extracted": len(extracted_text),
+                "latency_ms": latency_ms,
+            }
+        )
+
+        return extracted_text, latency_ms
+
+    except Exception as exc:
+        logger.exception("google_vision_ocr_failed")
+        # Fallback to empty string on error
+        return "", 0
+
+
+def google_document_ai_invoice_parser(image_bytes: bytes, settings: Settings) -> tuple[str, int]:
+    """
+    Use Google Document AI Invoice Parser - PREMIUM OCR for invoices.
+
+    This is purpose-built for invoice extraction with native understanding of:
+    - Supplier information
+    - Invoice numbers, dates
+    - Line items (description, quantity, unit price, amount)
+    - Totals and tax
+
+    Returns structured markdown that's easy for LLM to parse.
+
+    Supports three authentication methods:
+    1. Individual env vars (deployment): project_id, private_key, client_email
+    2. JSON file path (local dev)
+    3. Application Default Credentials (gcloud CLI)
+
+    Returns: (structured_markdown, latency_ms)
+    """
+    try:
+        from google.cloud import documentai_v1 as documentai
+        from google.oauth2 import service_account
+        import os
+
+        start_time = time.time()
+
+        # Get processor location and ID from settings
+        location = getattr(settings, 'google_cloud_location', 'us')
+
+        # Get credentials
+        project_id = getattr(settings, 'google_cloud_project_id', None)
+        private_key = getattr(settings, 'google_cloud_private_key', None)
+        client_email = getattr(settings, 'google_cloud_client_email', None)
+
+        # Set regional endpoint for non-US locations
+        client_options = None
+        if location and location != 'us':
+            api_endpoint = f"{location}-documentai.googleapis.com"
+            from google.api_core.client_options import ClientOptions
+            client_options = ClientOptions(api_endpoint=api_endpoint)
+            logger.info(f"document_ai_using_regional_endpoint location={location} endpoint={api_endpoint}")
+
+        if project_id and private_key and client_email:
+            credentials_info = {
+                "type": "service_account",
+                "project_id": project_id,
+                "private_key": private_key.replace('\\n', '\n'),
+                "client_email": client_email,
+                "token_uri": "https://oauth2.googleapis.com/token",
+            }
+            credentials = service_account.Credentials.from_service_account_info(credentials_info)
+            client = documentai.DocumentProcessorServiceClient(
+                credentials=credentials,
+                client_options=client_options
+            )
+            logger.info("document_ai_using_env_vars")
+        elif hasattr(settings, 'google_cloud_credentials_path') and settings.google_cloud_credentials_path:
+            os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = settings.google_cloud_credentials_path
+            client = documentai.DocumentProcessorServiceClient(client_options=client_options)
+            logger.info("document_ai_using_json_file")
+        else:
+            client = documentai.DocumentProcessorServiceClient(client_options=client_options)
+            logger.info("document_ai_using_default_credentials")
+        processor_id = getattr(settings, 'google_document_ai_processor_id', None)
+
+        if not processor_id:
+            raise Exception("APP_GOOGLE_DOCUMENT_AI_PROCESSOR_ID not set")
+
+        # Build processor name
+        name = client.processor_path(project_id, location, processor_id)
+
+        # Process document
+        raw_document = documentai.RawDocument(
+            content=image_bytes,
+            mime_type="image/jpeg"
+        )
+
+        request = documentai.ProcessRequest(
+            name=name,
+            raw_document=raw_document
+        )
+
+        result = client.process_document(request=request)
+        document = result.document
+
+        # Convert to structured markdown
+        markdown = _convert_document_ai_to_markdown(document)
+
+        latency_ms = int((time.time() - start_time) * 1000)
+
+        logger.info(
+            "document_ai_invoice_parser_success",
+            extra={
+                "chars_extracted": len(markdown),
+                "latency_ms": latency_ms,
+            }
+        )
+
+        return markdown, latency_ms
+
+    except Exception as exc:
+        logger.exception("document_ai_invoice_parser_failed")
+        return "", 0
+
+
+def _convert_document_ai_to_markdown(document) -> str:
+    """Convert Document AI output to structured markdown."""
+    lines = []
+    lines.append("# Invoice")
+    lines.append("")
+
+    # Extract entities
+    supplier = None
+    invoice_id = None
+    invoice_date = None
+    currency = None
+    line_items = []
+    subtotal = None
+    tax = None
+    total = None
+
+    for entity in document.entities:
+        entity_type = entity.type_
+        entity_text = entity.mention_text.strip() if entity.mention_text else ""
+
+        if entity_type == "supplier_name":
+            supplier = entity_text
+        elif entity_type == "invoice_id":
+            invoice_id = entity_text
+        elif entity_type == "invoice_date":
+            invoice_date = entity_text
+        elif entity_type == "currency":
+            currency = entity_text
+        elif entity_type == "net_amount":
+            subtotal = entity_text
+        elif entity_type == "total_tax_amount":
+            tax = entity_text
+        elif entity_type == "total_amount":
+            total = entity_text
+        elif entity_type == "line_item":
+            # Parse line item properties
+            item = {"description": "", "quantity": "", "unit_price": "", "amount": ""}
+            for prop in entity.properties:
+                prop_type = prop.type_
+                prop_text = prop.mention_text.strip() if prop.mention_text else ""
+                if prop_type == "line_item/description":
+                    item["description"] = prop_text
+                elif prop_type == "line_item/quantity":
+                    item["quantity"] = prop_text
+                elif prop_type == "line_item/unit_price":
+                    item["unit_price"] = prop_text
+                elif prop_type == "line_item/amount":
+                    item["amount"] = prop_text
+            line_items.append(item)
+
+    # Build markdown
+    if supplier:
+        lines.append(f"**Supplier:** {supplier}")
+    if invoice_id:
+        lines.append(f"**Invoice #:** {invoice_id}")
+    if invoice_date:
+        lines.append(f"**Date:** {invoice_date}")
+    if currency:
+        lines.append(f"**Currency:** {currency}")
+
+    lines.append("")
+    lines.append("## Line Items")
+    lines.append("")
+
+    if line_items:
+        lines.append("| Description | Quantity | Unit Price | Amount |")
+        lines.append("|-------------|----------|------------|--------|")
+        for item in line_items:
+            lines.append(f"| {item['description']} | {item['quantity']} | {item['unit_price']} | {item['amount']} |")
+
+    lines.append("")
+
+    if subtotal:
+        lines.append(f"**Subtotal:** {subtotal}")
+    if tax:
+        lines.append(f"**Tax:** {tax}")
+    if total:
+        lines.append(f"**Total:** {total}")
+
+    # Fallback to raw text if no structured data
+    if not line_items and not supplier:
+        return document.text
+
+    return "\n".join(lines)
+
+
 @dataclass
 class VisionCallResult:
     """Result from a vision model call with telemetry data."""
@@ -259,7 +718,7 @@ def _get_text_settings(settings: Settings) -> tuple[str, str, str]:
     Uses APP_OPENAI_* config (model, api_key, base_url). Model defaults to
     openai_response_model (if set) to keep extraction fast/cheap.
     """
-    model = (settings.openai_response_model or settings.openai_model).strip()
+    model = (getattr(settings, 'openai_response_model', None) or settings.openai_model).strip()
     api_key = settings.openai_api_key
     base_url = settings.openai_base_url
 
@@ -282,10 +741,7 @@ def ocr_page_to_markdown(
     """
     OCR a single page and return Markdown output.
 
-    Optimized prompt for pure OCR:
-    - Preserve tables, headers, footers
-    - Use Markdown formatting
-    - Don't summarize or interpret
+    Uses LLM vision (Gemini 2.0 Flash recommended for speed + accuracy).
 
     Args:
         page_image_bytes: Image bytes for the page
@@ -296,8 +752,32 @@ def ocr_page_to_markdown(
     Returns:
         VisionCallResult with Markdown content
     """
+    # Resize image if needed for better quality and faster upload
+    from PIL import Image
+    import io
+
+    image = Image.open(io.BytesIO(page_image_bytes))
+    original_size = (image.width, image.height)
+
+    # Resize if largest side exceeds 4000px
+    max_side = 4000
+    if max(image.width, image.height) > max_side:
+        ratio = max_side / max(image.width, image.height)
+        new_width = int(image.width * ratio)
+        new_height = int(image.height * ratio)
+        image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+        logger.info(f"Resized image for LLM vision: {original_size[0]}x{original_size[1]} → {new_width}x{new_height} (ratio: {ratio:.2f})")
+
+        # Convert back to bytes
+        output = io.BytesIO()
+        image.save(output, format=image.format or 'JPEG', quality=95)
+        page_image_bytes = output.getvalue()
+
+    # Use LLM vision for OCR
+    logger.info(f"Using LLM vision for OCR (page {page_num}/{total_pages})")
     prompt = (
         f"Extract all text from this page ({page_num}/{total_pages}). "
+        "This may contain handwritten text - carefully distinguish similar-looking characters (4 vs 9, 1 vs 7, 0 vs 6, 3 vs 8, 5 vs S). "
         "Preserve tables using Markdown table syntax. "
         "Keep all headers, footers, and page numbers. "
         "Use headings (##, ###) for section titles. "
@@ -376,6 +856,15 @@ Rules:
 4. All numeric fields must be numbers, not strings.
 5. For each line_item, set source_page={page_num} and include row_index/raw_row when possible.
 6. If the page has no relevant data, return {{"line_items": []}}.
+7. Parse combined quantity+unit strings (e.g., "9k", "2 tray", "4pkt", "300g", "1kg") into separate quantity (number) and unit (string) fields:
+   - "9k" → quantity: 9, unit: "kg"
+   - "2 tray" → quantity: 2, unit: "tray"
+   - "4pkt" → quantity: 4, unit: "pkt"
+   - "300g" → quantity: 300, unit: "g"
+   - "1kg" → quantity: 1, unit: "kg"
+8. IMPORTANT - Handwritten text validation: If the document appears handwritten, verify that quantity × unit_price ≈ line_total (within rounding).
+   If the math doesn't match, carefully re-examine the handwriting for common OCR errors (4 vs 9, 1 vs 7, 0 vs 6, 3 vs 8).
+   Choose values that make the calculation correct.
 
 Page content (Markdown):
 {markdown_text}
@@ -509,7 +998,7 @@ def process_image_with_vision(
     payload: dict[str, Any] = {
         "model": model,
         "messages": messages,
-        "temperature": 0.2,
+        "temperature": 0.0,  # 0 for maximum repeatability in OCR
     }
     _apply_reasoning_policy(payload, settings, base_url)
 
@@ -938,7 +1427,7 @@ def _process_pdf_single(
     payload: dict[str, Any] = {
         "model": model,
         "messages": messages,
-        "temperature": 0.2,
+        "temperature": 0.0,  # 0 for maximum repeatability in OCR
     }
     _apply_reasoning_policy(payload, settings, base_url)
 
@@ -1296,7 +1785,7 @@ def _extract_structured_from_text(
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            "temperature": 0.2,
+            "temperature": 0.0,  # 0 for maximum repeatability in OCR
         }
 
         # Keep extraction fast/cheap by applying low-effort reasoning controls on

@@ -25,7 +25,6 @@ from app.conversation import responses
 from app.conversation.processor import (
     ProcessResult,
     process_message_instant,
-    send_ack_message,
 )
 from app.core.config import Settings
 from app.db.models.file_processing_runs import FileProcessingRuns
@@ -289,12 +288,57 @@ def handle_update_v2(update: dict, db: Session, settings: Settings) -> None:
         return
 
     # Create session and message for telemetry
+    # If webhook already created session (for ACK), reuse it
+    # Also extract local_file_path if provided (for test endpoint)
+    local_file_path: str | None = None
     try:
-        session, tg_message = _create_session_and_message(
-            db=db,
-            parsed=parsed,
-            user=user,
-        )
+        session_id_str = update.get("_session_id") if isinstance(update, dict) else None
+        local_file_path = update.get("_local_file_path") if isinstance(update, dict) else None
+        if session_id_str:
+            # Reuse existing session from webhook ACK
+            import uuid
+            session_id = uuid.UUID(session_id_str)
+            session = db.get(TelegramSessions, session_id)
+            if session is None:
+                # Session doesn't exist, create new one
+                logger.warning(
+                    "handle_update_v2_session_not_found session_id=%s, creating new",
+                    session_id_str,
+                )
+                session, tg_message = _create_session_and_message(
+                    db=db,
+                    parsed=parsed,
+                    user=user,
+                )
+            else:
+                # Session exists, just create message
+                now = dt.datetime.now(dt.UTC)
+                tg_message = TelegramMessages(
+                    session_id=session.id,
+                    chat_id=parsed.chat_id,
+                    user_id=user.id,
+                    telegram_id=parsed.telegram_id,
+                    message_id=parsed.message_id,
+                    update_id=parsed.update_id,
+                    received_at=parsed.received_at,
+                    text=parsed.text,
+                    caption=parsed.caption,
+                    file_id=parsed.file_id,
+                    file_unique_id=parsed.file_unique_id,
+                    file_kind=parsed.file_kind,
+                    mime=parsed.mime,
+                    filename=parsed.filename,
+                    size=parsed.size,
+                )
+                db.add(tg_message)
+                db.flush()
+        else:
+            # No session_id from webhook, create new session
+            session, tg_message = _create_session_and_message(
+                db=db,
+                parsed=parsed,
+                user=user,
+            )
         db.commit()
     except IntegrityError:
         db.rollback()
@@ -314,20 +358,7 @@ def handle_update_v2(update: dict, db: Session, settings: Settings) -> None:
         before_received_at=parsed.received_at,
     )
 
-    # Send instant ACK (non-blocking, best effort)
-    # Skip ACK for very short interactions to reduce noise
-    message_text = (parsed.text or parsed.caption or "").strip()
-    if len(message_text) > 10 or has_file:
-        send_ack_message(
-            chat_id=parsed.chat_id,
-            settings=settings,
-            has_file=has_file,
-            file_kind=parsed.file_kind,
-            message_text=message_text,
-            db=db,
-            session_id=session.id,
-        )
-        db.commit()
+    # ACK is sent by webhook before enqueueing - no need to send here
 
     if command == "/status":
         context = load_context(db, user)
@@ -407,6 +438,7 @@ def handle_update_v2(update: dict, db: Session, settings: Settings) -> None:
             settings=settings,
             session_id=session.id,
             history=history,
+            local_file_path=local_file_path,
         )
     except Exception as exc:
         logger.exception(

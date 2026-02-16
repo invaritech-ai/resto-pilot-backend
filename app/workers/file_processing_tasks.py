@@ -39,6 +39,7 @@ from app.telegram.bot_api import (
     TelegramFileNetworkError,
     TelegramFileTooBigError,
     get_file_bytes,
+    get_file_bytes_unified,
     send_message,
 )
 from app.workers.celery_app import celery_app
@@ -441,8 +442,13 @@ def process_invoice_file_task(
     chat_id: int,
     user_id: str,
     session_id: str | None = None,
+    local_file_path: str | None = None,
 ) -> None:
-    """Process an invoice file: enqueue coordinator and notify user on completion."""
+    """Process an invoice file: enqueue coordinator and notify user on completion.
+
+    Supports both Telegram files (via file_id) and local files (via local_file_path).
+    This ensures identical behavior for test and production.
+    """
     task_id = _get_task_id()
     logger.info(
         "celery_task_started name=process_invoice_file_task task_id=%s restaurant_id=%s file_id=%s",
@@ -452,7 +458,7 @@ def process_invoice_file_task(
     )
 
     settings = get_settings()
-    restaurant_uuid = _parse_uuid(restaurant_id)
+    restaurant_uuid = _parse_uuid(restaurant_id) if restaurant_id else None
     user_uuid = _parse_uuid(user_id)
     session_uuid = _parse_uuid(session_id) if session_id else None
     db_session: Session | None = None
@@ -516,7 +522,11 @@ def process_invoice_file_task(
             db.add(staging)
             db.commit()
 
-            file_bytes = get_file_bytes(file_id=file_id, settings=settings)
+            file_bytes = get_file_bytes_unified(
+                file_id=file_id,
+                settings=settings,
+                local_file_path=local_file_path,
+            )
 
             _enqueue_coordinator_task(
                 db=db,
@@ -662,8 +672,13 @@ def process_price_list_file_task(
     chat_id: int,
     user_id: str,
     session_id: str | None = None,
+    local_file_path: str | None = None,
 ) -> None:
-    """Process a price list file: enqueue coordinator and notify user on completion."""
+    """Process a price list file: enqueue coordinator and notify user on completion.
+
+    Supports both Telegram files (via file_id) and local files (via local_file_path).
+    This ensures identical behavior for test and production.
+    """
     task_id = _get_task_id()
     logger.info(
         "celery_task_started name=process_price_list_file_task task_id=%s restaurant_id=%s file_id=%s",
@@ -673,7 +688,7 @@ def process_price_list_file_task(
     )
 
     settings = get_settings()
-    restaurant_uuid = _parse_uuid(restaurant_id)
+    restaurant_uuid = _parse_uuid(restaurant_id) if restaurant_id else None
     user_uuid = _parse_uuid(user_id)
     session_uuid = _parse_uuid(session_id) if session_id else None
     db_session: Session | None = None
@@ -737,7 +752,11 @@ def process_price_list_file_task(
             db.add(staging)
             db.commit()
 
-            file_bytes = get_file_bytes(file_id=file_id, settings=settings)
+            file_bytes = get_file_bytes_unified(
+                file_id=file_id,
+                settings=settings,
+                local_file_path=local_file_path,
+            )
 
             _enqueue_coordinator_task(
                 db=db,
@@ -882,8 +901,13 @@ def process_inventory_photo_task(
     chat_id: int,
     user_id: str,
     session_id: str | None = None,
+    local_file_path: str | None = None,
 ) -> None:
-    """Process an inventory photo: enqueue coordinator and notify user on completion."""
+    """Process an inventory photo: enqueue coordinator and notify user on completion.
+
+    Supports both Telegram files (via file_id) and local files (via local_file_path).
+    This ensures identical behavior for test and production.
+    """
     task_id = _get_task_id()
     logger.info(
         "celery_task_started name=process_inventory_photo_task task_id=%s restaurant_id=%s file_id=%s",
@@ -893,7 +917,7 @@ def process_inventory_photo_task(
     )
 
     settings = get_settings()
-    restaurant_uuid = _parse_uuid(restaurant_id)
+    restaurant_uuid = _parse_uuid(restaurant_id) if restaurant_id else None
     user_uuid = _parse_uuid(user_id)
     session_uuid = _parse_uuid(session_id) if session_id else None
     db_session: Session | None = None
@@ -955,7 +979,11 @@ def process_inventory_photo_task(
             db.add(staging)
             db.commit()
 
-            file_bytes = get_file_bytes(file_id=file_id, settings=settings)
+            file_bytes = get_file_bytes_unified(
+                file_id=file_id,
+                settings=settings,
+                local_file_path=local_file_path,
+            )
 
             _enqueue_coordinator_task(
                 db=db,
@@ -1439,6 +1467,8 @@ def process_page_job_task(
                 ocr_latency_ms,
                 len(markdown_text),
             )
+            # DEBUG: Log OCR output to see what Google Vision returns
+            logger.info(f"OCR OUTPUT:\n{markdown_text}\n--- END OCR OUTPUT ---")
         except Exception as exc:
             with worker_db_session() as db:
                 job = db.scalar(
@@ -1546,6 +1576,8 @@ def process_page_job_task(
             extraction_latency_ms,
             len(extraction_text),
         )
+        # DEBUG: Log extraction output to see what LLM returns
+        logger.info(f"EXTRACTION OUTPUT:\n{extraction_text}\n--- END EXTRACTION OUTPUT ---")
     except Exception as exc:
         with worker_db_session() as db:
             job = db.scalar(
@@ -1785,6 +1817,115 @@ def finalize_run_task(run_id: str) -> None:
         db.commit()
 
         if run.source == "telegram" and run.chat_id:
+            # ALWAYS show extracted items first, regardless of status
+            if run.processing_type == "invoice":
+                line_items = merged_data.get("line_items", []) if isinstance(merged_data, dict) else []
+                total_items = len(line_items)
+                lines = ["📄 **Invoice Extracted**\n"]
+                lines.append(f"**Supplier:** {supplier_name or 'N/A'}")
+                lines.append(f"**Invoice #:** {merged_data.get('invoice_number', 'N/A')}")
+                lines.append(f"**Date:** {merged_data.get('invoice_date', 'N/A')}")
+                due_date = merged_data.get("due_date") if isinstance(merged_data, dict) else None
+                if due_date:
+                    lines.append(f"**Due Date:** {due_date}")
+                lines.append(f"**Currency:** {currency or 'N/A'}")
+                lines.append(f"**Total:** {currency or ''} {merged_data.get('total', 'N/A')}")
+                lines.append(f"**Line Items:** {total_items}")
+
+                if total_items > 0:
+                    lines.append(f"\n**Line Items (all {total_items}):**")
+                    for i, item in enumerate(line_items, 1):
+                        desc = item.get("description_raw", item.get("description", "N/A"))
+                        qty = item.get("quantity", "N/A")
+                        unit = item.get("unit", "")
+                        total = item.get("line_total", "N/A")
+                        lines.append(f"  {i}. {desc} - {qty} {unit} = {currency or ''} {total}")
+
+                # Add footer instructions only if status is pending_review
+                if status == "pending_review":
+                    lines.append("\n---")
+                    lines.append("✅ Say **/confirm** to save this invoice")
+                    lines.append("✏️ Tell me if anything needs correcting")
+
+                _send_message_with_telemetry(
+                    db=db,
+                    chat_id=run.chat_id,
+                    text="\n".join(lines),
+                    settings=settings,
+                    session_uuid=run.session_id,
+                )
+
+            elif run.processing_type == "price_list":
+                items = merged_data.get("items", []) if isinstance(merged_data, dict) else []
+                total_items = len(items)
+                lines = ["📋 **Price List Extracted**\n"]
+                lines.append(f"**Supplier:** {supplier_name or 'N/A'}")
+                lines.append(f"**Currency:** {currency or 'N/A'}")
+                lines.append(f"**Items:** {total_items}")
+
+                if total_items > 0:
+                    lines.append(f"\n**Items (all {total_items}):**")
+                    for i, item in enumerate(items, 1):
+                        name = item.get("supplier_name_raw", item.get("name", "N/A"))
+                        price = item.get("price", "N/A")
+                        item_currency = item.get("currency", currency or "N/A")
+                        unit_basis = item.get("unit_basis", "")
+                        pack_size = item.get("pack_size_text", "")
+                        min_order_qty = item.get("min_order_qty")
+
+                        item_line = f"  {i}. {name}"
+                        if pack_size:
+                            item_line += f" (pack_size_text: {pack_size})"
+                        if unit_basis:
+                            item_line += f" (unit_basis: {unit_basis})"
+                        if min_order_qty is not None:
+                            item_line += f" (min_order_qty: {min_order_qty})"
+                        item_line += f" - {price} {item_currency}"
+                        lines.append(item_line)
+
+                # Add footer instructions only if status is pending_review
+                if status == "pending_review":
+                    lines.append("\n---")
+                    lines.append("✅ Say **/confirm** to save this price list")
+                    lines.append("✏️ Tell me if anything needs correcting")
+
+                _send_message_with_telemetry(
+                    db=db,
+                    chat_id=run.chat_id,
+                    text="\n".join(lines),
+                    settings=settings,
+                    session_uuid=run.session_id,
+                )
+
+            elif run.processing_type == "inventory":
+                items = merged_data.get("items", []) if isinstance(merged_data, dict) else []
+                total_items = len(items)
+                lines = ["📸 **Inventory Extracted**\n"]
+                lines.append(f"**Items Detected:** {total_items}")
+
+                if total_items > 0:
+                    lines.append(f"\n**Items (all {total_items}):**")
+                    for i, item in enumerate(items, 1):
+                        product_name = item.get("product_name", "N/A")
+                        quantity = item.get("quantity", "N/A")
+                        unit = item.get("unit", "")
+                        lines.append(f"  {i}. {product_name} - {quantity} {unit}")
+
+                # Add footer instructions only if status is pending_review
+                if status == "pending_review":
+                    lines.append("\n---")
+                    lines.append("✅ Say **/confirm** to save inventory counts")
+                    lines.append("✏️ Tell me if anything needs correcting")
+
+                _send_message_with_telemetry(
+                    db=db,
+                    chat_id=run.chat_id,
+                    text="\n".join(lines),
+                    settings=settings,
+                    session_uuid=run.session_id,
+                )
+
+            # NOW handle missing fields AFTER showing extraction
             if status == "awaiting_supplier":
                 _set_pending_file_processing_action(
                     db=db,
@@ -1821,7 +1962,7 @@ def finalize_run_task(run_id: str) -> None:
                     db=db,
                     chat_id=run.chat_id,
                     text=(
-                        "What currency is this document in? (e.g., USD, EUR)"
+                        "What currency is this document in? (e.g., USD, EUR, HK$)"
                     ),
                     settings=settings,
                     session_uuid=run.session_id,
@@ -1844,118 +1985,7 @@ def finalize_run_task(run_id: str) -> None:
                 )
                 db.commit()
 
-                if run.processing_type == "invoice":
-                    line_items = merged_data.get("line_items", []) if isinstance(merged_data, dict) else []
-                    total_items = len(line_items)
-                    lines = ["📄 **Invoice Extracted**\n"]
-                    lines.append(f"**Supplier:** {supplier_name or 'N/A'}")
-                    lines.append(f"**Invoice #:** {merged_data.get('invoice_number', 'N/A')}")
-                    lines.append(f"**Date:** {merged_data.get('invoice_date', 'N/A')}")
-                    due_date = merged_data.get("due_date") if isinstance(merged_data, dict) else None
-                    if due_date:
-                        lines.append(f"**Due Date:** {due_date}")
-                    lines.append(f"**Currency:** {currency or 'N/A'}")
-                    lines.append(f"**Total:** {currency or ''} {merged_data.get('total', 'N/A')}")
-                    lines.append(f"**Line Items:** {total_items}")
-
-                    sample_size = min(10, total_items)
-                    if sample_size > 0:
-                        lines.append(f"\n**Line Items ({sample_size} of {total_items}):**")
-                        for i, item in enumerate(line_items[:sample_size], 1):
-                            desc = item.get("description_raw", item.get("description", "N/A"))
-                            qty = item.get("quantity", "N/A")
-                            unit = item.get("unit", "")
-                            total = item.get("line_total", "N/A")
-                            lines.append(f"  {i}. {desc} - {qty} {unit} = {currency or ''} {total}")
-                        if total_items > sample_size:
-                            lines.append(f"  ... and {total_items - sample_size} more items")
-
-                    lines.append("\n---")
-                    lines.append("✅ Say **/confirm** to save this invoice")
-                    lines.append("❓ Ask to see all line items if needed")
-                    lines.append("✏️ Tell me if anything needs correcting")
-
-                    _send_message_with_telemetry(
-                        db=db,
-                        chat_id=run.chat_id,
-                        text="\n".join(lines),
-                        settings=settings,
-                        session_uuid=run.session_id,
-                    )
-
-                elif run.processing_type == "price_list":
-                    items = merged_data.get("items", []) if isinstance(merged_data, dict) else []
-                    total_items = len(items)
-                    lines = ["📋 **Price List Extracted**\n"]
-                    lines.append(f"**Supplier:** {supplier_name or 'N/A'}")
-                    lines.append(f"**Currency:** {currency or 'N/A'}")
-                    lines.append(f"**Items:** {total_items}")
-
-                    sample_size = min(10, total_items)
-                    if sample_size > 0:
-                        lines.append(f"\n**Items ({sample_size} of {total_items}):**")
-                        for i, item in enumerate(items[:sample_size], 1):
-                            name = item.get("supplier_name_raw", item.get("name", "N/A"))
-                            price = item.get("price", "N/A")
-                            item_currency = item.get("currency", currency or "N/A")
-                            unit_basis = item.get("unit_basis", "")
-                            pack_size = item.get("pack_size_text", "")
-                            min_order_qty = item.get("min_order_qty")
-
-                            item_line = f"  {i}. {name}"
-                            if pack_size:
-                                item_line += f" (pack_size_text: {pack_size})"
-                            if unit_basis:
-                                item_line += f" (unit_basis: {unit_basis})"
-                            if min_order_qty is not None:
-                                item_line += f" (min_order_qty: {min_order_qty})"
-                            item_line += f" - {price} {item_currency}"
-                            lines.append(item_line)
-                        if total_items > sample_size:
-                            lines.append(f"  ... and {total_items - sample_size} more items")
-
-                    lines.append("\n---")
-                    lines.append("✅ Say **/confirm** to save this price list")
-                    lines.append("❓ Ask to see all items if needed")
-                    lines.append("✏️ Tell me if anything needs correcting")
-
-                    _send_message_with_telemetry(
-                        db=db,
-                        chat_id=run.chat_id,
-                        text="\n".join(lines),
-                        settings=settings,
-                        session_uuid=run.session_id,
-                    )
-
-                elif run.processing_type == "inventory":
-                    items = merged_data.get("items", []) if isinstance(merged_data, dict) else []
-                    total_items = len(items)
-                    lines = ["📸 **Inventory Extracted**\n"]
-                    lines.append(f"**Items Detected:** {total_items}")
-
-                    sample_size = min(10, total_items)
-                    if sample_size > 0:
-                        lines.append(f"\n**Items ({sample_size} of {total_items}):**")
-                        for i, item in enumerate(items[:sample_size], 1):
-                            product_name = item.get("product_name", "N/A")
-                            quantity = item.get("quantity", "N/A")
-                            unit = item.get("unit", "")
-                            lines.append(f"  {i}. {product_name} - {quantity} {unit}")
-                        if total_items > sample_size:
-                            lines.append(f"  ... and {total_items - sample_size} more items")
-
-                    lines.append("\n---")
-                    lines.append("✅ Say **/confirm** to save inventory counts")
-                    lines.append("❓ Ask to see all items if needed")
-                    lines.append("✏️ Tell me if anything needs correcting")
-
-                    _send_message_with_telemetry(
-                        db=db,
-                        chat_id=run.chat_id,
-                        text="\n".join(lines),
-                        settings=settings,
-                        session_uuid=run.session_id,
-                    )
+                # All extraction displays already shown above
 
         if run.source == "telegram":
             event_name = None

@@ -13,8 +13,8 @@ from app.db.base import Base
 class Documents(Base):
     __tablename__: ClassVar[str] = "documents"  # type: ignore[override]
 
-    restaurant_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("restaurants.id", ondelete="CASCADE"), nullable=False
+    restaurant_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("restaurants.id", ondelete="CASCADE"), nullable=True
     )
     supplier_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("suppliers.id", ondelete="SET NULL"), nullable=True

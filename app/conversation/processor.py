@@ -20,18 +20,15 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from app.ai.intent_classifier import Intent
-from app.ai.model_config import get_ack_model, get_presenter_model
+from app.ai.model_config import get_presenter_model
 from app.ai.openai_client import (
     OpenAIError,
     create_chat_completion_text_allow_empty_with_http_info,
 )
 from app.ai.openrouter_generation import extract_openrouter_generation_id
 from app.ai.openrouter_usage import extract_openrouter_usage
-from app.ai.tool_resolver import resolve_with_tools
 from app.conversation import responses
 from app.conversation.context import load_context, update_context_from_result, UserContext
-from app.conversation.item_search_router import try_handle_item_search_fast_path
 from app.core.config import Settings
 from app.db.models.processing_events import ProcessingEvents
 from app.db.models.telegram_messages import TelegramMessages
@@ -42,11 +39,6 @@ from app.telegram.bot_api import send_message
 from app.workers.telemetry import record_llm_call, record_outgoing_message
 
 logger = logging.getLogger(__name__)
-
-_ITEM_SEARCH_ACK_SKIP_RE = re.compile(
-    r"^\s*(search|find|lookup|look\s+up|show\s+me)\b|^\s*order\b",
-    flags=re.IGNORECASE,
-)
 
 _FOLLOWUP_RE = re.compile(
     r"^\s*(?:how\s+about|what\s+about|howbout|how\s+abt|what\s+abt|any)\s+(?P<q>.+?)\s*[\?\!\.]*\s*$",
@@ -394,6 +386,7 @@ def _enqueue_file_processing(
     chat_id: int,
     user_id: uuid.UUID,
     session_id: uuid.UUID,
+    local_file_path: str | None = None,
 ) -> str:
     from app.workers.tasks import (
         process_price_list_file_task,
@@ -409,6 +402,7 @@ def _enqueue_file_processing(
         "chat_id": chat_id,
         "user_id": str(user_id),
         "session_id": str(session_id),
+        "local_file_path": local_file_path,
     }
 
     if file_type == "price_list":
@@ -433,6 +427,7 @@ def process_message_instant(
     settings: Settings,
     session_id: uuid.UUID | None = None,
     history: list[dict[str, str]] | None = None,
+    local_file_path: str | None = None,
 ) -> ProcessResult:
     """
     Process user message instantly and return response metadata.
@@ -451,10 +446,10 @@ def process_message_instant(
     Returns:
         ProcessResult with response text and associated LLM call ID (if any)
     """
+    # Use real chat_id for file processing (console mode breaks visibility)
     chat_id = user.chat_id
     message_text = _get_message_text(messages)
     has_file, file_kind, file_id = _has_file(messages)
-    deterministic_enabled = bool(getattr(settings, "deterministic_execution", False))
 
     # Create session for telemetry if not provided
     if session_id is None:
@@ -476,7 +471,7 @@ def process_message_instant(
             event="pipeline_selected_v1",
             payload_json=json.dumps(
                 {
-                    "deterministic_execution": deterministic_enabled,
+                    "deterministic_execution": True,
                     "has_file": bool(has_file),
                 }
             ),
@@ -681,6 +676,7 @@ def process_message_instant(
             settings=settings,
             session_id=session_id,
             chat_id=chat_id,
+            local_file_path=local_file_path,
         )
 
         response_llm_call_id = None
@@ -700,7 +696,7 @@ def process_message_instant(
                 at=dt.datetime.now(dt.UTC),
                 event="file_upload_processed_v2",
                 payload_json=json.dumps({
-                    "intent": upload_intent.value,
+                    "intent": upload_intent,
                     "success": True,
                 }),
                 error=None,
@@ -714,304 +710,83 @@ def process_message_instant(
 
     # Deterministic execution mode: Planner -> (Clarify OR call one deterministic tool) -> Presenter.
     # Runs on the worker via handle_update_v2, so the API is never blocked.
-    if deterministic_enabled:
-        from app.ai.deterministic.execution import execute_deterministic_tool
-        from app.ai.deterministic.planner import plan_next_action
-        from app.ai.deterministic.schemas import PlannerCallTool, PlannerClarify
-        from app.ai.deterministic.tool_catalog import tool_catalog_as_planner_json
-        from app.ai.deterministic.validation import validate_planner_decision
+    from app.ai.deterministic.execution import execute_deterministic_tool
+    from app.ai.deterministic.planner import plan_next_action
+    from app.ai.deterministic.schemas import PlannerCallTool, PlannerClarify
+    from app.ai.deterministic.tool_catalog import tool_catalog_as_planner_json
+    from app.ai.deterministic.validation import validate_planner_decision
 
-        # Deterministic follow-up: "how about X?" after an item search list.
-        follow_q = _extract_followup_query(message_text or "")
-        last_list = context.last_list if hasattr(context, "last_list") else None
-        if (
-            follow_q
-            and isinstance(last_list, dict)
-            and last_list.get("tool") == "supplier_items_search"
-            and _last_list_is_fresh(settings, last_list)
-        ):
-            scope = last_list.get("scope") if isinstance(last_list.get("scope"), dict) else {}
-            supplier_name = scope.get("supplier_name") if isinstance(scope.get("supplier_name"), str) else None
-            restaurant_name = scope.get("restaurant_name") if isinstance(scope.get("restaurant_name"), str) else None
+    # Deterministic follow-up: "how about X?" after an item search list.
+    follow_q = _extract_followup_query(message_text or "")
+    last_list = context.last_list if hasattr(context, "last_list") else None
+    if (
+        follow_q
+        and isinstance(last_list, dict)
+        and last_list.get("tool") == "supplier_items_search"
+        and _last_list_is_fresh(settings, last_list)
+    ):
+        scope = last_list.get("scope") if isinstance(last_list.get("scope"), dict) else {}
+        supplier_name = scope.get("supplier_name") if isinstance(scope.get("supplier_name"), str) else None
+        restaurant_name = scope.get("restaurant_name") if isinstance(scope.get("restaurant_name"), str) else None
 
-            # Unambiguous: reuse last scope, run directly (no planner needed).
-            args: dict[str, Any] = {"item_query": follow_q}
-            if restaurant_name:
-                args["restaurant_query"] = restaurant_name
-            if supplier_name:
-                args["supplier_query"] = supplier_name
+        # Unambiguous: reuse last scope, run directly (no planner needed).
+        args: dict[str, Any] = {"item_query": follow_q}
+        if restaurant_name:
+            args["restaurant_query"] = restaurant_name
+        if supplier_name:
+            args["supplier_query"] = supplier_name
 
-            tool_response = execute_deterministic_tool(
-                db=db,
-                user=user,
-                tool="supplier_items_search",
-                args=args,
-                context=context.to_dict(),
-            )
-
-            try:
-                parsed = json.loads(tool_response)
-                if isinstance(parsed, dict) and isinstance(parsed.get("context_update"), dict):
-                    context = update_context_from_result(
-                        db=db,
-                        user=user,
-                        context=context,
-                        context_update=parsed["context_update"],
-                    )
-                    parsed = dict(parsed)
-                    parsed.pop("context_update", None)
-                    tool_response = json.dumps(parsed, indent=2)
-            except Exception:
-                pass
-
-            # Refresh last_list for subsequent follow-ups.
-            try:
-                parsed = json.loads(tool_response)
-                if isinstance(parsed, dict):
-                    scope2: dict[str, Any] = {}
-                    if restaurant_name:
-                        scope2["restaurant_name"] = restaurant_name
-                    if supplier_name:
-                        scope2["supplier_name"] = supplier_name
-                    context = update_context_from_result(
-                        db=db,
-                        user=user,
-                        context=context,
-                        context_update={
-                            "last_list": {
-                                "tool": "supplier_items_search",
-                                "args": args,
-                                "created_at": dt.datetime.now(dt.UTC).isoformat(),
-                                "scope": scope2,
-                                "cursor": parsed.get("cursor") if isinstance(parsed.get("cursor"), str) else None,
-                                "has_more": bool(parsed.get("has_more")) if "has_more" in parsed else None,
-                            }
-                        },
-                    )
-                    db.commit()
-            except Exception:
-                pass
-
-            formatted_text, response_llm_call_id = _format_tool_response_with_llm(
-                db=db,
-                settings=settings,
-                session_id=session_id,
-                chat_id=chat_id,
-                message_text=message_text,
-                tool_response=tool_response,
-            )
-            if formatted_text:
-                final_text = formatted_text
-            else:
-                from app.ai.deterministic.presenter import present_tool_result
-                final_text = present_tool_result(tool="supplier_items_search", tool_response_json=tool_response)
-
-            db.add(
-                ProcessingEvents(
-                    session_id=session_id,
-                    at=dt.datetime.now(dt.UTC),
-                    event="deterministic_followup_item_search_v1",
-                    payload_json=json.dumps(
-                        {"item_query": follow_q, "scope": scope},
-                        ensure_ascii=False,
-                    ),
-                    error=None,
-                )
-            )
-            db.commit()
-            return ProcessResult(response_text=final_text, response_llm_call_id=response_llm_call_id)
-
-        tool_catalog = tool_catalog_as_planner_json()
-        decision, telemetry = plan_next_action(
-            settings=settings,
-            message_text=message_text or "",
-            recent_turns=history,
-            context=context.to_dict(),
-            available_tools=tool_catalog,
-        )
-        validation = validate_planner_decision(
-            decision=decision,
-            tool_catalog=tool_catalog,
-            no_ids=True,
-        )
-
-        planner_llm_call_id: uuid.UUID | None = None
-        if telemetry is not None:
-            planner_llm_call_id = record_llm_call(
-                db=db,
-                session_id=session_id,
-                chat_id=chat_id,
-                purpose="planner",
-                model=telemetry.model,
-                openrouter_generation_id=telemetry.generation_id,
-                usage=telemetry.usage,
-                latency_ms=telemetry.latency_ms,
-            )
-            db.add(
-                ProcessingEvents(
-                    session_id=session_id,
-                    at=dt.datetime.now(dt.UTC),
-                    event="planner_decision_v1",
-                    payload_json=json.dumps(
-                        {
-                            "decision": decision.model_dump(),
-                            "validated_decision": validation.decision.model_dump(),
-                            "validation_errors": validation.errors,
-                            "llm_call_id": str(planner_llm_call_id),
-                        },
-                        ensure_ascii=False,
-                    ),
-                    error=None,
-                )
-            )
-            db.commit()
-
-        validated = validation.decision
-        if isinstance(validated, PlannerClarify):
-            lines: list[str] = []
-            question = validated.question.strip() if isinstance(validated.question, str) else ""
-            lines.append(question or "Please clarify what you want to do.")
-            if validated.choices:
-                for choice in validated.choices:
-                    label = str(choice.label).strip()
-                    text = str(choice.text).strip()
-                    if label and text:
-                        if label.endswith(")"):
-                            lines.append(f"{label} {text}")
-                        else:
-                            lines.append(f"{label}) {text}")
-            final_text = "\n".join([ln for ln in lines if ln.strip()]).strip()
-
-            # Optional ClarifierLLM (phrasing only). If it fails, fall back to deterministic text above.
-            clarifier_llm_call_id: uuid.UUID | None = None
-            if bool(getattr(settings, "clarification_model", "").strip()):
-                try:
-                    from app.ai.deterministic.clarifier import clarify_text
-
-                    llm_text, clarifier_telemetry = clarify_text(
-                        settings=settings,
-                        clarify_kind=validated.clarify_kind,
-                        question=question or "Please clarify what you want to do.",
-                        choices=[
-                            {"label": str(c.label), "text": str(c.text)}
-                            for c in (validated.choices or [])
-                            if c.label and c.text
-                        ]
-                        if validated.choices
-                        else None,
-                        user_message=message_text or "",
-                        recent_turns=history,
-                        context=context.to_dict(),
-                        available_tools=tool_catalog,
-                    )
-                    if clarifier_telemetry is not None:
-                        clarifier_llm_call_id = record_llm_call(
-                            db=db,
-                            session_id=session_id,
-                            chat_id=chat_id,
-                            purpose="clarifier",
-                            model=str(clarifier_telemetry.get("model") or ""),
-                            openrouter_generation_id=clarifier_telemetry.get("generation_id"),
-                            usage=clarifier_telemetry.get("usage") or {},
-                            latency_ms=clarifier_telemetry.get("latency_ms"),
-                        )
-                        db.commit()
-                    if isinstance(llm_text, str) and llm_text.strip():
-                        final_text = llm_text.strip()
-                except Exception:
-                    logger.exception("deterministic_clarifier_failed")
-
-            user.last_interaction_at = dt.datetime.now(dt.UTC)
-            db.add(
-                ProcessingEvents(
-                    session_id=session_id,
-                    at=dt.datetime.now(dt.UTC),
-                    event="deterministic_clarify_v1",
-                    payload_json=json.dumps(
-                        {
-                            "clarify_kind": validated.clarify_kind,
-                            "llm_call_id": str(planner_llm_call_id) if planner_llm_call_id else None,
-                            "clarifier_llm_call_id": str(clarifier_llm_call_id) if clarifier_llm_call_id else None,
-                        },
-                        ensure_ascii=False,
-                    ),
-                    error=None,
-                )
-            )
-            db.commit()
-            return ProcessResult(response_text=final_text)
-
-        assert isinstance(validated, PlannerCallTool)
         tool_response = execute_deterministic_tool(
             db=db,
             user=user,
-            tool=validated.tool,
-            args=validated.args or {},
+            tool="supplier_items_search",
+            args=args,
             context=context.to_dict(),
         )
 
-        # Apply context updates if the tool returned one.
-        context_update: dict[str, Any] | None = None
+        try:
+            parsed = json.loads(tool_response)
+            if isinstance(parsed, dict) and isinstance(parsed.get("context_update"), dict):
+                context = update_context_from_result(
+                    db=db,
+                    user=user,
+                    context=context,
+                    context_update=parsed["context_update"],
+                )
+                parsed = dict(parsed)
+                parsed.pop("context_update", None)
+                tool_response = json.dumps(parsed, indent=2)
+        except Exception:
+            pass
+
+        # Refresh last_list for subsequent follow-ups.
         try:
             parsed = json.loads(tool_response)
             if isinstance(parsed, dict):
-                if isinstance(parsed.get("context_update"), dict):
-                    context_update = parsed["context_update"]
-                # Never expose internal context updates (often contain UUIDs) to the Presenter/user.
-                if "context_update" in parsed:
-                    parsed = dict(parsed)
-                    parsed.pop("context_update", None)
-                    tool_response = json.dumps(parsed, indent=2)
+                scope2: dict[str, Any] = {}
+                if restaurant_name:
+                    scope2["restaurant_name"] = restaurant_name
+                if supplier_name:
+                    scope2["supplier_name"] = supplier_name
+                context = update_context_from_result(
+                    db=db,
+                    user=user,
+                    context=context,
+                    context_update={
+                        "last_list": {
+                            "tool": "supplier_items_search",
+                            "args": args,
+                            "created_at": dt.datetime.now(dt.UTC).isoformat(),
+                            "scope": scope2,
+                            "cursor": parsed.get("cursor") if isinstance(parsed.get("cursor"), str) else None,
+                            "has_more": bool(parsed.get("has_more")) if "has_more" in parsed else None,
+                        }
+                    },
+                )
+                db.commit()
         except Exception:
-            context_update = None
+            pass
 
-        # Cache last list context for follow-ups ("how about X?") and numbered selection.
-        if validated.tool in {"supplier_items_search", "restaurants_list", "staff_list", "suppliers_list", "invite_codes_list"}:
-            try:
-                parsed = json.loads(tool_response)
-                if isinstance(parsed, dict):
-                    scope: dict[str, Any] = {}
-                    if isinstance(parsed.get("restaurant_name"), str) and parsed["restaurant_name"].strip():
-                        scope["restaurant_name"] = parsed["restaurant_name"].strip()
-                    supplier_name = parsed.get("supplier_name")
-                    if isinstance(supplier_name, str) and supplier_name.strip():
-                        scope["supplier_name"] = supplier_name.strip()
-                    if validated.tool == "supplier_items_search" and "supplier_name" not in scope:
-                        items = parsed.get("items")
-                        if isinstance(items, list):
-                            suppliers = {
-                                it.get("supplier", "").strip()
-                                for it in items
-                                if isinstance(it, dict) and isinstance(it.get("supplier"), str) and it.get("supplier").strip()
-                            }
-                            if len(suppliers) == 1:
-                                scope["supplier_name"] = next(iter(suppliers))
-
-                    last_list = {
-                        "tool": validated.tool,
-                        "args": validated.args,
-                        "created_at": dt.datetime.now(dt.UTC).isoformat(),
-                        "scope": scope,
-                    }
-                    if "cursor" in parsed and isinstance(parsed.get("cursor"), str):
-                        last_list["cursor"] = parsed.get("cursor")
-                    if "has_more" in parsed:
-                        last_list["has_more"] = bool(parsed.get("has_more"))
-                    if context_update is None:
-                        context_update = {}
-                    context_update["last_list"] = last_list
-            except Exception:
-                pass
-
-        if context_update:
-            context = update_context_from_result(
-                db=db,
-                user=user,
-                context=context,
-                context_update=context_update,
-            )
-
-        # Presenter: use PresenterLLM (model selectable). If it fails, fall back to deterministic presenter.
         formatted_text, response_llm_call_id = _format_tool_response_with_llm(
             db=db,
             settings=settings,
@@ -1024,24 +799,15 @@ def process_message_instant(
             final_text = formatted_text
         else:
             from app.ai.deterministic.presenter import present_tool_result
-            final_text = present_tool_result(tool=validated.tool, tool_response_json=tool_response)
+            final_text = present_tool_result(tool="supplier_items_search", tool_response_json=tool_response)
 
-        user.last_interaction_at = dt.datetime.now(dt.UTC)
         db.add(
             ProcessingEvents(
                 session_id=session_id,
                 at=dt.datetime.now(dt.UTC),
-                event="deterministic_tool_execution_v1",
+                event="deterministic_followup_item_search_v1",
                 payload_json=json.dumps(
-                    {
-                        "tool": validated.tool,
-                        "args": validated.args,
-                        "planner_llm_call_id": str(planner_llm_call_id) if planner_llm_call_id else None,
-                        "response_llm_call_id": str(response_llm_call_id) if response_llm_call_id else None,
-                        "validation_errors": validation.errors,
-                        "has_context_update": bool(context_update),
-                        "presenter": "llm_with_deterministic_fallback_v1",
-                    },
+                    {"item_query": follow_q, "scope": scope},
                     ensure_ascii=False,
                 ),
                 error=None,
@@ -1050,148 +816,234 @@ def process_message_instant(
         db.commit()
         return ProcessResult(response_text=final_text, response_llm_call_id=response_llm_call_id)
 
-    # Shadow mode: run deterministic PlannerLLM (no tool execution) and record telemetry.
-    # This is used to tune prompts locally/in staging without affecting behavior.
-    if bool(getattr(settings, "deterministic_shadow_mode", False)):
-        try:
-            from app.ai.deterministic.planner import plan_next_action
-            from app.ai.deterministic.tool_catalog import tool_catalog_as_planner_json
-            from app.ai.deterministic.validation import validate_planner_decision
-
-            decision, telemetry = plan_next_action(
-                settings=settings,
-                message_text=message_text or "",
-                recent_turns=history,
-                context=context.to_dict(),
-                available_tools=tool_catalog_as_planner_json(),
-            )
-            validation = validate_planner_decision(
-                decision=decision,
-                tool_catalog=tool_catalog_as_planner_json(),
-                no_ids=True,
-            )
-            if telemetry is not None:
-                llm_call_id = record_llm_call(
-                    db=db,
-                    session_id=session_id,
-                    chat_id=chat_id,
-                    purpose="planner_shadow",
-                    model=telemetry.model,
-                    openrouter_generation_id=telemetry.generation_id,
-                    usage=telemetry.usage,
-                    latency_ms=telemetry.latency_ms,
-                )
-                db.add(
-                    ProcessingEvents(
-                        session_id=session_id,
-                        at=dt.datetime.now(dt.UTC),
-                        event="planner_shadow_decision_v1",
-                        payload_json=json.dumps(
-                            {
-                                "decision": decision.model_dump(),
-                                "validated_decision": validation.decision.model_dump(),
-                                "validation_errors": validation.errors,
-                                "llm_call_id": str(llm_call_id),
-                            },
-                            ensure_ascii=False,
-                        ),
-                        error=None,
-                    )
-                )
-        except Exception:
-            logger.exception("planner_shadow_failed")
-
-    # Item search fast-path (minimize LLM calls + deterministic formatting)
-    fast = try_handle_item_search_fast_path(
-        db=db,
-        user_id=user.id,
-        context=context,
-        message_text=message_text or "",
+    tool_catalog = tool_catalog_as_planner_json()
+    decision, telemetry = plan_next_action(
         settings=settings,
-        session_id=session_id,
-        chat_id=chat_id,
+        message_text=message_text or "",
+        recent_turns=history,
+        context=context.to_dict(),
+        available_tools=tool_catalog,
     )
-    if fast is not None:
-        response_text, context_update = fast
-        if context_update:
-            context = update_context_from_result(
-                db=db,
-                user=user,
-                context=context,
-                context_update=context_update,
-            )
-        user.last_interaction_at = dt.datetime.now(dt.UTC)
-        db.commit()
-        return ProcessResult(response_text=response_text)
-
-    tool_result = resolve_with_tools(
-        db=db,
-        user=user,
-        message_text=message_text or "",
-        history=history,
-        active_restaurant_id=context.active_restaurant_id,
-        active_supplier_id=context.active_supplier_id,
-        pending_action=context.pending_action,
-        settings=settings,
-        chat_id=chat_id,
-        session_id=session_id,
+    validation = validate_planner_decision(
+        decision=decision,
+        tool_catalog=tool_catalog,
+        no_ids=True,
     )
 
-    response_llm_call_id = None
-    for call in tool_result.llm_calls:
-        response_llm_call_id = record_llm_call(
+    planner_llm_call_id: uuid.UUID | None = None
+    if telemetry is not None:
+        planner_llm_call_id = record_llm_call(
             db=db,
             session_id=session_id,
             chat_id=chat_id,
-            purpose="tool_resolution",
-            model=call.model,
-            openrouter_generation_id=call.generation_id,
-            usage=call.usage,
-            latency_ms=call.latency_ms,
+            purpose="planner",
+            model=telemetry.model,
+            openrouter_generation_id=telemetry.generation_id,
+            usage=telemetry.usage,
+            latency_ms=telemetry.latency_ms,
         )
-    if tool_result.llm_calls:
+        db.add(
+            ProcessingEvents(
+                session_id=session_id,
+                at=dt.datetime.now(dt.UTC),
+                event="planner_decision_v1",
+                payload_json=json.dumps(
+                    {
+                        "decision": decision.model_dump(),
+                        "validated_decision": validation.decision.model_dump(),
+                        "validation_errors": validation.errors,
+                        "llm_call_id": str(planner_llm_call_id),
+                    },
+                    ensure_ascii=False,
+                ),
+                error=None,
+            )
+        )
         db.commit()
 
-    if tool_result.context_update:
+    validated = validation.decision
+    if isinstance(validated, PlannerClarify):
+        lines: list[str] = []
+        question = validated.question.strip() if isinstance(validated.question, str) else ""
+        lines.append(question or "Please clarify what you want to do.")
+        if validated.choices:
+            for choice in validated.choices:
+                label = str(choice.label).strip()
+                text = str(choice.text).strip()
+                if label and text:
+                    if label.endswith(")"):
+                        lines.append(f"{label} {text}")
+                    else:
+                        lines.append(f"{label}) {text}")
+        final_text = "\n".join([ln for ln in lines if ln.strip()]).strip()
+
+        # Optional ClarifierLLM (phrasing only). If it fails, fall back to deterministic text above.
+        clarifier_llm_call_id: uuid.UUID | None = None
+        if bool(getattr(settings, "clarification_model", "").strip()):
+            try:
+                from app.ai.deterministic.clarifier import clarify_text
+
+                llm_text, clarifier_telemetry = clarify_text(
+                    settings=settings,
+                    clarify_kind=validated.clarify_kind,
+                    question=question or "Please clarify what you want to do.",
+                    choices=[
+                        {"label": str(c.label), "text": str(c.text)}
+                        for c in (validated.choices or [])
+                        if c.label and c.text
+                    ]
+                    if validated.choices
+                    else None,
+                    user_message=message_text or "",
+                    recent_turns=history,
+                    context=context.to_dict(),
+                    available_tools=tool_catalog,
+                )
+                if clarifier_telemetry is not None:
+                    clarifier_llm_call_id = record_llm_call(
+                        db=db,
+                        session_id=session_id,
+                        chat_id=chat_id,
+                        purpose="clarifier",
+                        model=str(clarifier_telemetry.get("model") or ""),
+                        openrouter_generation_id=clarifier_telemetry.get("generation_id"),
+                        usage=clarifier_telemetry.get("usage") or {},
+                        latency_ms=clarifier_telemetry.get("latency_ms"),
+                    )
+                    db.commit()
+                if isinstance(llm_text, str) and llm_text.strip():
+                    final_text = llm_text.strip()
+            except Exception:
+                logger.exception("deterministic_clarifier_failed")
+
+        user.last_interaction_at = dt.datetime.now(dt.UTC)
+        db.add(
+            ProcessingEvents(
+                session_id=session_id,
+                at=dt.datetime.now(dt.UTC),
+                event="deterministic_clarify_v1",
+                payload_json=json.dumps(
+                    {
+                        "clarify_kind": validated.clarify_kind,
+                        "llm_call_id": str(planner_llm_call_id) if planner_llm_call_id else None,
+                        "clarifier_llm_call_id": str(clarifier_llm_call_id) if clarifier_llm_call_id else None,
+                    },
+                    ensure_ascii=False,
+                ),
+                error=None,
+            )
+        )
+        db.commit()
+        return ProcessResult(response_text=final_text)
+
+    assert isinstance(validated, PlannerCallTool)
+    tool_response = execute_deterministic_tool(
+        db=db,
+        user=user,
+        tool=validated.tool,
+        args=validated.args or {},
+        context=context.to_dict(),
+    )
+
+    # Apply context updates if the tool returned one.
+    context_update: dict[str, Any] | None = None
+    try:
+        parsed = json.loads(tool_response)
+        if isinstance(parsed, dict):
+            if isinstance(parsed.get("context_update"), dict):
+                context_update = parsed["context_update"]
+            # Never expose internal context updates (often contain UUIDs) to the Presenter/user.
+            if "context_update" in parsed:
+                parsed = dict(parsed)
+                parsed.pop("context_update", None)
+                tool_response = json.dumps(parsed, indent=2)
+    except Exception:
+        context_update = None
+
+    # Cache last list context for follow-ups ("how about X?") and numbered selection.
+    if validated.tool in {"supplier_items_search", "restaurants_list", "staff_list", "suppliers_list", "invite_codes_list"}:
+        try:
+            parsed = json.loads(tool_response)
+            if isinstance(parsed, dict):
+                scope: dict[str, Any] = {}
+                if isinstance(parsed.get("restaurant_name"), str) and parsed["restaurant_name"].strip():
+                    scope["restaurant_name"] = parsed["restaurant_name"].strip()
+                supplier_name = parsed.get("supplier_name")
+                if isinstance(supplier_name, str) and supplier_name.strip():
+                    scope["supplier_name"] = supplier_name.strip()
+                if validated.tool == "supplier_items_search" and "supplier_name" not in scope:
+                    items = parsed.get("items")
+                    if isinstance(items, list):
+                        suppliers = {
+                            it.get("supplier", "").strip()
+                            for it in items
+                            if isinstance(it, dict) and isinstance(it.get("supplier"), str) and it.get("supplier").strip()
+                        }
+                        if len(suppliers) == 1:
+                            scope["supplier_name"] = next(iter(suppliers))
+
+                last_list = {
+                    "tool": validated.tool,
+                    "args": validated.args,
+                    "created_at": dt.datetime.now(dt.UTC).isoformat(),
+                    "scope": scope,
+                }
+                if "cursor" in parsed and isinstance(parsed.get("cursor"), str):
+                    last_list["cursor"] = parsed.get("cursor")
+                if "has_more" in parsed:
+                    last_list["has_more"] = bool(parsed.get("has_more"))
+                if context_update is None:
+                    context_update = {}
+                context_update["last_list"] = last_list
+        except Exception:
+            pass
+
+    if context_update:
         context = update_context_from_result(
             db=db,
             user=user,
             context=context,
-            context_update=tool_result.context_update,
+            context_update=context_update,
         )
 
+    # Presenter: use PresenterLLM (model selectable). If it fails, fall back to deterministic presenter.
     formatted_text, response_llm_call_id = _format_tool_response_with_llm(
         db=db,
         settings=settings,
         session_id=session_id,
         chat_id=chat_id,
         message_text=message_text,
-        tool_response=tool_result.response_text,
+        tool_response=tool_response,
     )
-    final_text = formatted_text or tool_result.response_text
+    if formatted_text:
+        final_text = formatted_text
+    else:
+        from app.ai.deterministic.presenter import present_tool_result
+        final_text = present_tool_result(tool=validated.tool, tool_response_json=tool_response)
 
-    # Update user's last interaction time
     user.last_interaction_at = dt.datetime.now(dt.UTC)
     db.add(
         ProcessingEvents(
             session_id=session_id,
             at=dt.datetime.now(dt.UTC),
-            event="tool_response_generated_v1",
-            payload_json=json.dumps({
-                "tool_calls": tool_result.tool_calls,
-                "llm_calls": len(tool_result.llm_calls),
-                "tool_names": getattr(tool_result, "tool_names", []),
-                "exit_reason": getattr(tool_result, "exit_reason", None),
-            }),
+            event="deterministic_tool_execution_v1",
+            payload_json=json.dumps(
+                {
+                    "tool": validated.tool,
+                    "args": validated.args,
+                    "planner_llm_call_id": str(planner_llm_call_id) if planner_llm_call_id else None,
+                    "response_llm_call_id": str(response_llm_call_id) if response_llm_call_id else None,
+                    "validation_errors": validation.errors,
+                    "has_context_update": bool(context_update),
+                    "presenter": "llm_with_deterministic_fallback_v1",
+                },
+                ensure_ascii=False,
+            ),
             error=None,
         )
     )
     db.commit()
-
-    return ProcessResult(
-        response_text=final_text,
-        response_llm_call_id=response_llm_call_id,
-    )
+    return ProcessResult(response_text=final_text, response_llm_call_id=response_llm_call_id)
 
 
 def _handle_pending_file_upload(
@@ -1217,8 +1069,11 @@ def _handle_pending_file_upload(
         if not file_type:
             return responses.FILE_DETECTION_UNSURE, {"pending_action": pending_action}
 
+    # Price lists don't require restaurant, invoices do
+    require_restaurant = (file_type == "invoice")
+
     restaurant_id = pending_action.get("restaurant_id")
-    if not restaurant_id:
+    if require_restaurant and not restaurant_id:
         restaurants = _get_user_restaurants(db, user.id)
         if not restaurants:
             return responses.ERROR_NO_OUTLETS, {"clear_pending_action": True}
@@ -1232,19 +1087,20 @@ def _handle_pending_file_upload(
             )
 
     supplier_id = pending_action.get("supplier_id") or context.active_supplier_id
+    local_file_path = pending_action.get("local_file_path")
     response_text = _enqueue_file_processing(
         file_type=file_type,
-        restaurant_id=str(restaurant_id),
+        restaurant_id=str(restaurant_id) if restaurant_id else None,
         file_id=str(file_id),
         supplier_id=str(supplier_id) if supplier_id else None,
         chat_id=chat_id,
         user_id=user.id,
         session_id=session_id,
+        local_file_path=str(local_file_path) if local_file_path else None,
     )
-    context_update = {
-        "clear_pending_action": True,
-        "active_restaurant_id": str(restaurant_id),
-    }
+    context_update = {"clear_pending_action": True}
+    if restaurant_id:
+        context_update["active_restaurant_id"] = str(restaurant_id)
     if supplier_id:
         context_update["active_supplier_id"] = str(supplier_id)
     return response_text, context_update
@@ -1480,7 +1336,8 @@ def _handle_file_upload(
     settings: Settings,
     session_id: uuid.UUID,
     chat_id: int,
-) -> tuple[str, Intent, dict[str, Any]]:
+    local_file_path: str | None = None,
+) -> tuple[str, str, dict[str, Any]]:
     """
     Handle file upload with type detection.
 
@@ -1491,20 +1348,23 @@ def _handle_file_upload(
     """
     # Determine file type from caption/context
     file_type = _detect_file_type_from_text(message_text)
-    intent_guess = (
-        Intent.UPLOAD_PRICE_LIST if file_type == "price_list" else Intent.UPLOAD_INVOICE
-    )
+    intent_guess = "upload_price_list" if file_type == "price_list" else "upload_invoice"
 
-    # Get restaurant ID
+    # Get restaurant ID (only required for invoices, not price lists)
     restaurants = _get_user_restaurants(db, user.id)
-    if not restaurants:
-        return responses.ERROR_NO_OUTLETS, intent_guess
+
+    # Price lists are outlet-independent, invoices require outlet selection
+    require_restaurant = (file_type == "invoice") if file_type else True
+
+    if require_restaurant and not restaurants:
+        return responses.ERROR_NO_OUTLETS, intent_guess, {}
 
     restaurant_id = None
-    if len(restaurants) == 1:
-        restaurant_id = restaurants[0]["id"]
-    else:
-        restaurant_id = _match_restaurant_from_message(message_text, restaurants)
+    if restaurants:
+        if len(restaurants) == 1:
+            restaurant_id = restaurants[0]["id"]
+        else:
+            restaurant_id = _match_restaurant_from_message(message_text, restaurants)
 
     # Get supplier_id from context if available
     supplier_id = context.active_supplier_id
@@ -1519,11 +1379,13 @@ def _handle_file_upload(
                     "file_kind": file_kind,
                     "restaurant_id": restaurant_id,
                     "supplier_id": supplier_id,
+                    "local_file_path": local_file_path,
                 }
             },
         )
 
-    if not restaurant_id:
+    # Only prompt for outlet if required (invoices) and missing
+    if require_restaurant and not restaurant_id:
         return (
             responses.outlet_select_prompt(restaurants),
             intent_guess,
@@ -1535,18 +1397,20 @@ def _handle_file_upload(
                     "restaurant_id": restaurant_id,
                     "supplier_id": supplier_id,
                     "file_type": file_type,
+                    "local_file_path": local_file_path,
                 }
             },
         )
 
     response_text = _enqueue_file_processing(
         file_type=file_type,
-        restaurant_id=str(restaurant_id),
+        restaurant_id=str(restaurant_id) if restaurant_id else None,
         file_id=file_id,
         supplier_id=supplier_id,
         chat_id=chat_id,
         user_id=user.id,
         session_id=session_id,
+        local_file_path=local_file_path,
     )
     return response_text, intent_guess, {}
 

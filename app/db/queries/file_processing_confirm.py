@@ -11,6 +11,7 @@ from app.db.models.documents import Documents
 from app.db.models.file_processing_runs import FileProcessingRuns
 from app.db.models.file_processing_staging import FileProcessingStaging
 from app.db.models.inventory_batches import InventoryBatches
+from app.db.models.inventory_movements import InventoryMovements
 from app.db.models.invoice_line_items import InvoiceLineItems
 from app.db.models.invoices import Invoices
 from app.db.models.products import Products
@@ -98,6 +99,40 @@ def _ensure_document_for_staging(*, db: Session, staging: FileProcessingStaging)
         run.document_id = doc.id
 
     return doc
+
+
+def _find_or_create_product(
+    *,
+    db: Session,
+    description: str,
+    restaurant_id: uuid.UUID,
+) -> Products:
+    """
+    Find existing product by fuzzy name match or create a new one.
+    Uses simple normalization (lowercase, strip).
+    """
+    normalized_desc = description.lower().strip()
+
+    # Try to find existing product with similar name
+    products = db.scalars(
+        select(Products).where(Products.restaurant_id == restaurant_id)
+    ).all()
+
+    for product in products:
+        if product.name.lower().strip() == normalized_desc:
+            return product
+
+    # Create new product if no match found
+    new_product = Products(
+        restaurant_id=restaurant_id,
+        name=description.strip().title(),  # Title case for display
+        description=None,
+        category=None,
+        unit="unit",  # Default unit
+    )
+    db.add(new_product)
+    db.flush()
+    return new_product
 
 
 def _ensure_restaurant_supplier_link(
@@ -388,29 +423,74 @@ def confirm_file_processing_staging(
             db.flush()
 
             line_items_created = 0
+            inventory_batches_created = 0
+
             for item in extracted_data.get("line_items", []) or []:
                 if not isinstance(item, dict):
                     continue
-                db.add(
-                    InvoiceLineItems(
-                        invoice_id=invoice.id,
-                        supplier_id=supplier.id,
-                        description_raw=_clean_str(item.get("description_raw") or item.get("description"))
-                        or "",
-                        quantity=_parse_float(item.get("quantity")) or 0.0,
-                        unit=_clean_str(item.get("unit")) or "",
-                        unit_price=_parse_float(item.get("unit_price")) or 0.0,
-                        line_total=_parse_float(item.get("line_total")) or 0.0,
-                        currency=currency,
-                        tax_amount=_parse_float(item.get("tax_amount")) or 0.0,
-                    )
+
+                description_raw = _clean_str(item.get("description_raw") or item.get("description")) or ""
+                quantity = _parse_float(item.get("quantity")) or 0.0
+                unit = _clean_str(item.get("unit")) or ""
+                unit_price = _parse_float(item.get("unit_price")) or 0.0
+                line_total = _parse_float(item.get("line_total")) or 0.0
+                tax_amount = _parse_float(item.get("tax_amount")) or 0.0
+
+                line_item = InvoiceLineItems(
+                    invoice_id=invoice.id,
+                    supplier_id=supplier.id,
+                    description_raw=description_raw,
+                    quantity=quantity,
+                    unit=unit,
+                    unit_price=unit_price,
+                    line_total=line_total,
+                    currency=currency,
+                    tax_amount=tax_amount,
                 )
+                db.add(line_item)
+                db.flush()
                 line_items_created += 1
+
+                # Create inventory batch and movement for this line item
+                if description_raw and quantity > 0:
+                    # Find or create product
+                    product = _find_or_create_product(
+                        db=db,
+                        description=description_raw,
+                        restaurant_id=staging.restaurant_id,
+                    )
+
+                    # Create inventory batch
+                    batch = InventoryBatches(
+                        restaurant_id=staging.restaurant_id,
+                        product_id=product.id,
+                        supplier_id=supplier.id,
+                        invoice_line_item_id=line_item.id,
+                        quantity=quantity,
+                        unit=unit or "unit",
+                        unit_cost=unit_price,
+                        received_date=invoice_date,
+                        status="available",
+                    )
+                    db.add(batch)
+                    db.flush()
+
+                    # Create inventory movement (receive)
+                    movement = InventoryMovements(
+                        restaurant_id=staging.restaurant_id,
+                        inventory_batch_id=batch.id,
+                        movement_type="receive",
+                        quantity=quantity,
+                        reason=f"Invoice {invoice.invoice_number or 'N/A'} received",
+                    )
+                    db.add(movement)
+                    inventory_batches_created += 1
 
             summary = {
                 "invoice_id": str(invoice.id),
                 "invoice_number": invoice.invoice_number,
                 "line_items_created": line_items_created,
+                "inventory_batches_created": inventory_batches_created,
                 "total": float(invoice.total),
                 "currency": invoice.currency,
             }
