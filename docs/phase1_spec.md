@@ -1,7 +1,7 @@
 # Phase 1 Technical Specification
 ## Supplier & Price List Management
 
-**Revision 2** — corrected: integer money storage, global supplier registry.
+**Revision 3** — corrected: integer money storage, global supplier registry, patch flow, auth on staging, pg_trgm declaration, user confirmation gates, /link command.
 
 ---
 
@@ -31,7 +31,17 @@ ALTER TABLE restaurants
 
 ---
 
-### 2b. New: `suppliers` — Global Registry
+### 2b. Migration Prerequisites
+Before any table or index creation:
+
+```sql
+-- Must run first — required for all GIN trigram indexes
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+```
+
+---
+
+### 2c. New: `suppliers` — Global Registry
 Suppliers are a global entity. One `ABC Wholesalers` record exists once in the system,
 linkable to many restaurants/outlets via `restaurant_suppliers`.
 
@@ -56,7 +66,7 @@ CREATE INDEX idx_suppliers_name_trgm ON suppliers USING GIN(name_lower gin_trgm_
 
 ---
 
-### 2c. New: `restaurant_suppliers` — Link Table
+### 2d. New: `restaurant_suppliers` — Link Table
 Connects a restaurant to the global suppliers it works with.
 
 ```sql
@@ -77,7 +87,7 @@ CREATE INDEX idx_restaurant_suppliers_restaurant ON restaurant_suppliers(restaur
 
 ---
 
-### 2d. New: `supplier_price_lists`
+### 2e. New: `supplier_price_lists`
 Header record for each confirmed upload. Scoped to the restaurant that uploaded it.
 
 ```sql
@@ -95,7 +105,7 @@ CREATE INDEX idx_price_lists_restaurant_supplier ON supplier_price_lists(restaur
 
 ---
 
-### 2e. New: `supplier_prices` — Append-only, Integer Storage
+### 2f. New: `supplier_prices` — Append-only, Integer Storage
 One row per item per upload. Full history preserved. **No floats.**
 
 Prices and quantities are stored as integers in minor units with an explicit exponent.
@@ -130,8 +140,10 @@ CREATE INDEX idx_supplier_prices_name_trgm ON supplier_prices USING GIN(item_nam
 
 ---
 
-### 2f. New: `file_processing_staging`
+### 2g. New: `file_processing_staging`
 Working state for an upload in progress. Mutated until user confirms.
+
+**Single canonical failure state: `'error'`** — no sub-states. Detail goes in `error_message`.
 
 ```sql
 CREATE TYPE staging_status AS ENUM ('processing', 'pending_review', 'confirmed', 'cancelled', 'error');
@@ -139,6 +151,8 @@ CREATE TYPE staging_status AS ENUM ('processing', 'pending_review', 'confirmed',
 CREATE TABLE file_processing_staging (
     id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     restaurant_id        UUID NOT NULL REFERENCES restaurants(id) ON DELETE CASCADE,
+    uploaded_by          UUID NOT NULL REFERENCES users(id),               -- mandatory auth anchor
+    session_id           UUID REFERENCES telegram_sessions(id) ON DELETE SET NULL, -- nullable; session may expire
     supplier_id          UUID REFERENCES suppliers(id) ON DELETE SET NULL, -- nullable until resolved
     file_id              TEXT NOT NULL,   -- Telegram file_id for re-download
     file_unique_id       TEXT NOT NULL,
@@ -151,7 +165,10 @@ CREATE TABLE file_processing_staging (
 );
 
 CREATE INDEX idx_staging_restaurant_status ON file_processing_staging(restaurant_id, status);
+CREATE INDEX idx_staging_uploaded_by       ON file_processing_staging(uploaded_by);
 ```
+
+**Auth rule:** Only `uploaded_by` user or restaurant `is_owner` member may confirm, edit, or cancel a staging record. Enforce in every button handler before touching staging.
 
 **`extracted_data_json` shape — integer prices throughout:**
 ```json
@@ -183,7 +200,7 @@ unit_qty_display = unit_qty_minor / 10^unit_qty_exp → "1.000 kg"
 
 ---
 
-### 2g. New: `handshake_requests`
+### 2h. New: `handshake_requests`
 Pending clarification questions to the user.
 
 ```sql
@@ -205,7 +222,7 @@ CREATE INDEX idx_handshake_user    ON handshake_requests(user_id, resolved_at);
 
 ---
 
-### 2h. Transient Context: `users.context` (JSONB)
+### 2i. Transient Context: `users.context` (JSONB)
 Already exists. Schema for Phase 1:
 
 ```json
@@ -283,7 +300,8 @@ Priority 6 — LLM Fallback
 | Command | Handler | Description |
 |---------|---------|-------------|
 | `/list suppliers` | `cmd_list_suppliers` | Paginated list of this restaurant's linked suppliers |
-| `/add supplier` | `cmd_add_supplier` | Search global registry + create/link |
+| `/add supplier` | `cmd_add_supplier` | Search global registry + create new if not found |
+| `/link supplier` | `cmd_link_supplier` | Search global registry + link existing supplier to restaurant |
 | `/uploads` | `cmd_list_uploads` | Show pending staging records |
 | `/switch` | `cmd_switch_restaurant` | Change active restaurant |
 
@@ -325,16 +343,37 @@ Priority 6 — LLM Fallback
 
 ### 4a. Supplier Management
 
+#### Global Registry Confirmation Gates
+Two gates prevent near-duplicate accumulation. Both require explicit user confirmation.
+
+**Gate 1 — Before any new global record is written:**
+Search entire global `suppliers` by trigram similarity > 0.75. If any match exists:
+> "Did you mean **{existing name}**? [Yes, that's them / No, create new]"
+Only write a new global record if user explicitly says No.
+
+**Gate 2 — Before linking:**
+If the match is already linked to this restaurant:
+> "You're already connected to {name}."
+Stop — no duplicate link created.
+
+---
+
 #### `cmd_add_supplier(db, user, restaurant_id, args)`
-Suppliers are global. Creation always checks the global registry first.
+Intent: create a new supplier that doesn't exist in the global registry yet.
 
 1. If `args` is empty: ask for supplier name.
-2. Normalize name to lowercase. Search global `suppliers` via trigram similarity > 0.85.
-3. **If global match found:**
-   - Check if already linked via `restaurant_suppliers` — if yes: "You're already connected to {name}."
-   - If not linked: show match, offer `[ ✅ Link to my restaurant ]` (`set_sup` variant) or `[ ➕ Create new ]`.
-4. **If no global match:** Create new supplier in global registry + create `restaurant_suppliers` link in one transaction.
-5. Reply "✅ Supplier added: {name}"
+2. Normalize to lowercase. Apply Gate 1 (global search, similarity > 0.75).
+3. If no match (or user confirms "No, create new"): create supplier in global registry + create `restaurant_suppliers` link in one transaction.
+4. Reply "✅ Supplier added: {name}"
+
+#### `cmd_link_supplier(db, user, restaurant_id, args)`
+Intent: link an existing global supplier to this restaurant without uploading a price list.
+
+1. If `args` is empty: ask for supplier name.
+2. Normalize to lowercase. Search global registry by trigram similarity > 0.75.
+3. Show matches as numbered list with `[ ✅ Link ]` buttons (`set_sup:{staging=none}:{supplier_hex}`).
+4. Apply Gate 2: if already linked, say so and stop.
+5. On link confirmation: create `restaurant_suppliers` row. Reply "✅ Linked: {name}"
 
 #### `cmd_list_suppliers(db, user, restaurant_id, page=0)`
 - Query via join: `restaurant_suppliers ↔ suppliers` where `restaurant_id` and `rs.is_active=true`.
@@ -345,6 +384,7 @@ Suppliers are global. Creation always checks the global registry first.
 
 #### `btn_set_supplier(db, staging_id, supplier_id)`
 - Verify supplier is linked to the staging record's `restaurant_id` via `restaurant_suppliers`.
+- If not linked: create the link (user already approved via handshake or button).
 - Update `file_processing_staging.supplier_id`.
 - Re-render upload review.
 
@@ -357,7 +397,7 @@ Suppliers are global. Creation always checks the global registry first.
 2. Check for existing `pending_review` staging records for this restaurant.
    - If found: show list with `rev_u` buttons + "Start New" option.
    - If none: proceed.
-3. Create `file_processing_staging` record with `status='processing'`.
+3. Create `file_processing_staging` record with `status='processing'`, `uploaded_by=user.id`, `session_id` from current session.
 4. Enqueue `ocr_task(staging_id, file_id, mime)`.
 5. Reply: "📄 Got it. Parsing your price list..."
 
@@ -415,12 +455,18 @@ Items: {count}
 
 #### `handle_staging_text_edit(db, user, staging_id, edit_idx, text)`
 Called when text is received while `active_staging_id` is set and no other pattern matched.
-1. Convert current item to display form → send to Correction Patch LLM (Contract C).
-2. LLM returns patch with **decimal** values.
-3. **Conversion boundary:** Convert patch values to integer minor units before applying.
-4. Validate: only `replace` on allowed fields, value types correct, index in bounds.
-5. Apply patch to `extracted_data_json`.
-6. Save staging record. Re-render upload review.
+
+**Patch applies to display schema (decimals), not storage schema (integers).**
+
+1. Load item at `extracted_data_json.items[edit_idx]`. Convert to display form (integers → decimals).
+2. Send display-form item + user correction to Correction Patch LLM (Contract C).
+3. LLM returns patch in decimal form.
+4. Validate patch: only `replace` on allowed fields, values are positive numbers, index in bounds.
+5. Apply patch to the **display-form item** (not to staging JSON directly).
+6. Validate the full patched display-form item.
+7. **Convert the entire patched display-form item back to integer format** (decimals → minor units).
+8. Write the integer item back to `extracted_data_json.items[edit_idx]`.
+9. Save staging record. Re-render upload review.
 
 #### `btn_delete_upload(db, staging_id)` — `del_u` handler
 1. Set `staging.status='cancelled'`. Clear `user.context.active_staging_id`.
@@ -600,12 +646,17 @@ Return only valid JSON. Do not explain.
 ]
 ```
 
-**Validation rules (applied before conversion and patch execution):**
+**Validation rules (applied to patch before applying to display-form item):**
 - Only `replace` operation allowed. Reject `add`, `remove`, `move`, `copy`.
 - Path must match `/items/{n}/{field}` where `field` ∈ `{item_name, unit, unit_qty, price, currency, sku}`.
 - `price` and `unit_qty` values must be positive numbers.
 - Index `n` must be within bounds of `items` array.
-- After validation: convert `price` and `unit_qty` values to `price_minor/price_exp` and `unit_qty_minor/unit_qty_exp` before writing.
+
+**Apply order (canonical — patch always operates in display space):**
+1. Apply validated patch to display-form item.
+2. Validate resulting display-form item (all required fields present, types correct).
+3. Convert entire display-form item to integer format via `money.py`.
+4. Write integer item back to staging JSON.
 
 ---
 
@@ -692,13 +743,13 @@ app/
 
 ## 7. Build Order
 
-1. **DB models + migration** — 6 new tables + restaurant location columns.
+1. **DB models + migration** — `CREATE EXTENSION pg_trgm` first, then 6 new tables + restaurant location columns.
 2. **`services/money.py`** — `to_minor(decimal, exp)`, `to_display(minor, exp)`, `infer_exp(currency)`. Everything touching prices depends on this.
 3. **`services/context_service.py`** — `get_context()`, `set_context()`, `clear_context()`.
 4. **`services/supplier_service.py`** — create (global), link to restaurant, list, fuzzy match.
 5. **`telegram/router.py`** — skeleton dispatching to stubs.
 6. **`telegram/handlers/reset.py`** — gets end-to-end routing working.
-7. **`telegram/handlers/commands.py`** — `/list suppliers`, `/add supplier`, `/uploads`, `/switch`.
+7. **`telegram/handlers/commands.py`** — `/list suppliers`, `/add supplier`, `/link supplier`, `/uploads`, `/switch`.
 8. **`telegram/keyboards.py` + `telegram/renderer.py`** — shared formatting used by all handlers.
 9. **`telegram/handlers/buttons.py`** — `rev_u`, `del_u`, `set_sup`, `new_sup`, `list_p`.
 10. **`services/staging_service.py`** + **`telegram/handlers/files.py`** — upload flow with stubbed OCR.
@@ -713,15 +764,17 @@ app/
 
 | Scenario | Handling |
 |----------|----------|
-| OCR/parse fails | `staging.status='error'`, message: "Couldn't parse that file. Try a clearer photo or PDF." |
-| LLM output fails schema validation | Log, treat as `unknown` or `error`, never write bad data |
-| Decimal→integer conversion fails | Treat as parse error, do not write to staging |
+| OCR/parse fails | `staging.status='error'`, `error_message` set, message: "Couldn't parse that file. Try a clearer photo or PDF." |
+| LLM output fails schema validation | Log, set `staging.status='error'`, never write bad data |
+| Decimal→integer conversion fails | Set `staging.status='error'`, do not write to staging |
 | Button references deleted ID | Answer callback with alert: "This item no longer exists." |
+| User attempts action on another user's staging | Reject: "You don't have permission to edit this upload." |
 | Confirm without supplier set | Block: "Please identify the supplier first." with button list |
-| Supplier not linked to restaurant | Block confirm, create link first (via handshake or explicit action) |
-| Patch out of bounds / wrong type | Reject patch, reply: "I couldn't apply that edit. Please try again." |
+| Supplier not linked to restaurant | Create link automatically if user approved via handshake or `btn_set_supplier`. |
+| Patch out of bounds / wrong type | Reject, reply: "I couldn't apply that edit. Please try again." |
 | No active restaurant | Prompt `/switch` before any restaurant-scoped action |
-| Duplicate supplier (similarity > 0.85) | Prompt: "Did you mean {existing}? [Link / Create new]" |
+| Near-duplicate supplier (similarity > 0.75) | Gate 1: "Did you mean {existing}? [Yes / No, create new]" — always user-confirmed |
+| Supplier already linked | Gate 2: "You're already connected to {name}." — stop, no duplicate link |
 
 ---
 

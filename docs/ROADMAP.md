@@ -36,6 +36,21 @@ entirely through chat — no app install, no dashboard login required.
 
 ---
 
+## Phase 1.5 — Product Catalog
+**Goal:** Normalize raw item names from price lists into a canonical product catalog. Enables cross-supplier price comparison and clean order line items.
+
+- `products` table: canonical name, unit, category, per-restaurant
+- Link `supplier_prices` rows to `product_id` (optional at ingest, resolved later)
+- `/list products` — browse catalog
+- Fuzzy match at ingest: suggest canonical product for each new item name
+- Cross-supplier query: "cheapest tomato across my suppliers"
+
+**Data:**
+- `products` — id, restaurant_id, name, name_lower, unit, category, is_active
+- Amend `supplier_prices` — add nullable `product_id FK → products`
+
+---
+
 ## Phase 2 — Purchase Orders
 **Goal:** A restaurant can place and track orders to suppliers.
 
