@@ -60,8 +60,7 @@ def create_profile_tools(
             parts.append("Name: Not set")
 
         if user.phone:
-            verified = " (verified)" if user.is_phone_verified else " (not verified)"
-            parts.append(f"Phone: {user.phone}{verified}")
+            parts.append(f"Phone: {user.phone}")
         else:
             parts.append("Phone: Not set")
 
@@ -90,7 +89,6 @@ def create_profile_tools(
 
         if phone is not None:
             user.phone = phone.strip() if phone else None
-            user.is_phone_verified = False  # Reset verification on phone change
             updates.append(f"Phone: {user.phone or 'cleared'}")
 
         if username is not None:

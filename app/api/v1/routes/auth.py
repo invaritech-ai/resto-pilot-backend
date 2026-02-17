@@ -98,8 +98,8 @@ def me(
     restaurants = [
         RestaurantMembershipRead(
             restaurant=RestaurantRead.model_validate(restaurant),
-            role=membership.role,
-            status=membership.status,
+            is_owner=membership.is_owner,
+            is_active=membership.is_active,
         )
         for restaurant, membership in rows
     ]

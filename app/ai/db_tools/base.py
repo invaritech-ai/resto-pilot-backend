@@ -33,8 +33,8 @@ def is_restaurant_owner(
         select(RestaurantUser).where(
             RestaurantUser.restaurant_id == restaurant_id,
             RestaurantUser.user_id == user_id,
-            RestaurantUser.role == "owner",
-            RestaurantUser.status == "active",
+            RestaurantUser.is_owner.is_(True),
+            RestaurantUser.is_active.is_(True),
         )
     )
     return membership is not None
@@ -48,7 +48,7 @@ def has_restaurant_access(
         select(RestaurantUser).where(
             RestaurantUser.restaurant_id == restaurant_id,
             RestaurantUser.user_id == user_id,
-            RestaurantUser.status != "removed",
+            RestaurantUser.is_active.is_(True),
         )
     )
     return membership is not None

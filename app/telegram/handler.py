@@ -1,13 +1,8 @@
 """
-Simplified handler for Telegram updates - Intent-driven static bot.
+Telegram update handler.
 
-This is the new handler that replaces the batched/agent-based approach
-with instant processing via intent classification.
-
-Key changes from handler.py:
-- No batching - all messages processed immediately
-- Intent classification instead of agent loop
-- Simpler flow: ACK -> Classify -> Execute -> Respond
+Minimal stub - full bot processing will be rebuilt in Phase 5.
+Infrastructure (session creation, message logging, history loading) is preserved.
 """
 
 from __future__ import annotations
@@ -21,15 +16,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.conversation import responses
-from app.conversation.processor import (
-    ProcessResult,
-    process_message_instant,
-)
 from app.core.config import Settings
-from app.db.models.file_processing_runs import FileProcessingRuns
-from app.db.models.file_processing_staging import FileProcessingStaging
-from app.db.models.processing_events import ProcessingEvents
 from app.db.models.telegram_messages import TelegramMessages
 from app.db.models.telegram_outgoing_messages import TelegramOutgoingMessages
 from app.db.models.telegram_session import TelegramSessions
@@ -46,15 +33,11 @@ logger = logging.getLogger(__name__)
 
 
 def _extract_command_from_update(update: dict) -> tuple[str | None, str | None]:
-    """Extract command and arguments from update."""
     message = update.get("message") or update.get("edited_message")
     if not isinstance(message, dict):
         return None, None
-
     text = message.get("text") if isinstance(message.get("text"), str) else None
-    caption = (
-        message.get("caption") if isinstance(message.get("caption"), str) else None
-    )
+    caption = message.get("caption") if isinstance(message.get("caption"), str) else None
     return extract_command(text, caption)
 
 
@@ -76,9 +59,7 @@ def _load_recent_history(
 ) -> list[dict[str, str]]:
     incoming_query = select(TelegramMessages).where(TelegramMessages.chat_id == chat_id)
     if before_received_at is not None:
-        incoming_query = incoming_query.where(
-            TelegramMessages.received_at < before_received_at
-        )
+        incoming_query = incoming_query.where(TelegramMessages.received_at < before_received_at)
     incoming = db.scalars(
         incoming_query.order_by(TelegramMessages.received_at.desc()).limit(limit)
     ).all()
@@ -113,15 +94,12 @@ def _create_session_and_message(
     parsed: Any,
     user: User,
 ) -> tuple[TelegramSessions, TelegramMessages]:
-    """Create a session and message record for telemetry."""
     now = dt.datetime.now(dt.UTC)
     session = TelegramSessions(
         chat_id=parsed.chat_id,
         started_at=now,
         last_activity_at=now,
-        flush_at=now,
         status="closed",
-        hint_command=None,
         closed_at=now,
         ack_sent_at=None,
     )
@@ -153,166 +131,77 @@ def _create_session_and_message(
 
 def handle_update_v2(update: dict, db: Session, settings: Settings) -> None:
     """
-    Process a Telegram update with instant intent-driven processing.
+    Process a Telegram update.
 
-    Flow:
-    1. Parse update and get/create user
-    2. Handle /start specially (onboarding)
-    3. Send instant ACK
-    4. Classify intent and execute
-    5. Send response
-    6. Record telemetry
-
-    Args:
-        update: The Telegram update dictionary from the webhook
-        db: Database session for persistence operations
-        settings: Application settings
+    TODO (Phase 5): Implement full bot processing with execution.py + db_tools.
+    Currently: handles /start, logs all other messages.
     """
     update_id = update.get("update_id") if isinstance(update, dict) else None
-    message = (
-        (update.get("message") or update.get("edited_message") or {})
-        if isinstance(update, dict)
-        else {}
-    )
-    chat_id = (
-        (message.get("chat") or {}).get("id") if isinstance(message, dict) else None
-    )
+    message = (update.get("message") or update.get("edited_message") or {}) if isinstance(update, dict) else {}
+    chat_id = (message.get("chat") or {}).get("id") if isinstance(message, dict) else None
+    logger.info("handle_update_v2_received update_id=%s chat_id=%s", update_id, chat_id)
 
-    logger.info(
-        "handle_update_v2_received update_id=%s chat_id=%s",
-        update_id,
-        chat_id,
-    )
-
-    # Parse the update
     parsed = parse_update(update) if isinstance(update, dict) else None
     if parsed is None:
-        logger.warning(
-            "handle_update_v2_parse_failed update_id=%s",
-            update_id,
-        )
         return
 
-    # Extract command
-    command, args = _extract_command_from_update(update)
-
-    # Get or create user
+    command, _args = _extract_command_from_update(update)
     user_info = message.get("from") or {}
     telegram_id = user_info.get("id")
-
     if not isinstance(telegram_id, int):
-        logger.warning(
-            "handle_update_v2_no_telegram_id update_id=%s",
-            update_id,
-        )
         return
 
     user = db.scalar(select(User).where(User.telegram_id == telegram_id))
 
-    # Handle unregistered users
-    if user is None and command != "/start":
-        try:
-            send_message(
-                chat_id=parsed.chat_id,
-                text=responses.ERROR_NOT_REGISTERED,
-                settings=settings,
-            )
-        except Exception as exc:
-            logger.exception(
-                "handle_update_v2_unregistered_reply_failed",
-                extra={"error": repr(exc), "chat_id": parsed.chat_id},
-            )
-        return
-
-    # Handle /start command (onboarding) - use existing processor
+    # Handle /start
     if command == "/start":
-        # Process /start (creates user if needed, handles invite codes)
         response = process_start_command(update=update, session=db, settings=settings)
-
-        # Get the user after processing (may have been created)
         start_user = db.scalar(select(User).where(User.telegram_id == telegram_id))
-
-        # Create session and record incoming message for telemetry
         if start_user is not None:
             try:
-                start_session, _start_message = _create_session_and_message(
-                    db=db,
-                    parsed=parsed,
-                    user=start_user,
-                )
+                start_session, _ = _create_session_and_message(db=db, parsed=parsed, user=start_user)
                 db.commit()
             except IntegrityError:
                 db.rollback()
                 start_session = None
         else:
             start_session = None
-
-        # Send response and record outgoing
-        if response:
+        if response and isinstance(response, dict):
             response_text = response.get("text", "")
-            response_chat_id = response.get("chat_id", parsed.chat_id)
             try:
                 telegram_message_id = send_message(
-                    chat_id=response_chat_id,
+                    chat_id=response.get("chat_id", parsed.chat_id),
                     text=response_text,
                     settings=settings,
                 )
-
-                # Record outgoing message for telemetry
                 if start_session is not None:
                     record_outgoing_message(
                         db=db,
                         session_id=start_session.id,
-                        chat_id=response_chat_id,
+                        chat_id=parsed.chat_id,
                         kind="start_reply",
                         text=response_text,
                         telegram_message_id=telegram_message_id,
                         llm_call_id=None,
                     )
                     db.commit()
-
             except Exception as exc:
-                logger.exception(
-                    "handle_update_v2_start_reply_failed",
-                    extra={"error": repr(exc), "chat_id": parsed.chat_id},
-                )
+                logger.exception("handle_update_v2_start_reply_failed", extra={"error": repr(exc)})
         return
 
-    # At this point, user must exist
     if user is None:
-        logger.error(
-            "handle_update_v2_user_not_found update_id=%s telegram_id=%s",
-            update_id,
-            telegram_id,
-        )
+        logger.warning("handle_update_v2_unregistered update_id=%s", update_id)
         return
 
-    # Create session and message for telemetry
-    # If webhook already created session (for ACK), reuse it
-    # Also extract local_file_path if provided (for test endpoint)
-    local_file_path: str | None = None
+    # Log the message (full processing TODO in Phase 5)
     try:
         session_id_str = update.get("_session_id") if isinstance(update, dict) else None
-        local_file_path = update.get("_local_file_path") if isinstance(update, dict) else None
         if session_id_str:
-            # Reuse existing session from webhook ACK
-            import uuid
             session_id = uuid.UUID(session_id_str)
             session = db.get(TelegramSessions, session_id)
             if session is None:
-                # Session doesn't exist, create new one
-                logger.warning(
-                    "handle_update_v2_session_not_found session_id=%s, creating new",
-                    session_id_str,
-                )
-                session, tg_message = _create_session_and_message(
-                    db=db,
-                    parsed=parsed,
-                    user=user,
-                )
+                session, _ = _create_session_and_message(db=db, parsed=parsed, user=user)
             else:
-                # Session exists, just create message
-                now = dt.datetime.now(dt.UTC)
                 tg_message = TelegramMessages(
                     session_id=session.id,
                     chat_id=parsed.chat_id,
@@ -333,161 +222,12 @@ def handle_update_v2(update: dict, db: Session, settings: Settings) -> None:
                 db.add(tg_message)
                 db.flush()
         else:
-            # No session_id from webhook, create new session
-            session, tg_message = _create_session_and_message(
-                db=db,
-                parsed=parsed,
-                user=user,
-            )
+            session, _ = _create_session_and_message(db=db, parsed=parsed, user=user)
         db.commit()
     except IntegrityError:
         db.rollback()
-        logger.warning(
-            "handle_update_v2_duplicate_message update_id=%s",
-            update_id,
-        )
-        return
-
-    # Check if message has a file
-    has_file = bool(parsed.file_id)
-
-    history = _load_recent_history(
-        db=db,
-        chat_id=parsed.chat_id,
-        limit=20,
-        before_received_at=parsed.received_at,
-    )
-
-    # ACK is sent by webhook before enqueueing - no need to send here
-
-    if command == "/status":
-        context = load_context(db, user)
-        query = select(FileProcessingRuns).where(FileProcessingRuns.user_id == user.id)
-        if context.active_restaurant_id:
-            try:
-                restaurant_uuid = uuid.UUID(context.active_restaurant_id)
-                query = query.where(FileProcessingRuns.restaurant_id == restaurant_uuid)
-            except ValueError:
-                pass
-        run = db.scalar(
-            query.order_by(FileProcessingRuns.created_at.desc()).limit(1)
-        )
-
-        if run is None:
-            response_text = "No recent file processing found."
-        else:
-            staging = db.scalar(
-                select(FileProcessingStaging)
-                .where(FileProcessingStaging.run_id == run.id)
-                .limit(1)
-            )
-            status = staging.status if staging else run.status
-            status_line = status or "unknown"
-            if status == "processing":
-                status_line = "⏳ Processing"
-            elif status in ("failed", "cancelled"):
-                status_line = "❌ Failed"
-            elif status in ("awaiting_supplier", "awaiting_currency", "pending_review"):
-                status_line = "⚠️ Needs input"
-            elif status in ("confirmed", "completed"):
-                status_line = "✅ Completed"
-
-            lines = [f"Status: {status_line}"]
-            lines.append(f"Type: {run.processing_type}")
-            if run.pages_total is not None:
-                lines.append(f"Pages: {run.pages_processed}/{run.pages_total}")
-            elif run.pages_processed:
-                lines.append(f"Pages processed: {run.pages_processed}")
-            if run.error_message and status in ("failed", "cancelled"):
-                lines.append(f"Error: {run.error_message}")
-            response_text = "\n".join(lines)
-
-        try:
-            telegram_message_id = send_message(
-                chat_id=parsed.chat_id,
-                text=response_text,
-                settings=settings,
-            )
-            record_outgoing_message(
-                db=db,
-                session_id=session.id,
-                chat_id=parsed.chat_id,
-                kind="reply",
-                text=response_text,
-                telegram_message_id=telegram_message_id,
-                llm_call_id=None,
-            )
-            db.commit()
-        except Exception as exc:
-            logger.exception(
-                "handle_update_v2_status_reply_failed",
-                extra={
-                    "error": repr(exc),
-                    "chat_id": parsed.chat_id,
-                    "session_id": str(session.id),
-                },
-            )
-        return
-
-    # Process the message
-    try:
-        process_result = process_message_instant(
-            db=db,
-            user=user,
-            messages=[tg_message],
-            settings=settings,
-            session_id=session.id,
-            history=history,
-            local_file_path=local_file_path,
-        )
-    except Exception as exc:
-        logger.exception(
-            "handle_update_v2_processing_failed",
-            extra={
-                "error": repr(exc),
-                "chat_id": parsed.chat_id,
-                "session_id": str(session.id),
-            },
-        )
-        process_result = ProcessResult(response_text=responses.ERROR_GENERIC)
-
-    # Send response
-    try:
-        telegram_message_id = send_message(
-            chat_id=parsed.chat_id,
-            text=process_result.response_text,
-            settings=settings,
-        )
-
-        # Record outgoing message
-        record_outgoing_message(
-            db=db,
-            session_id=session.id,
-            chat_id=parsed.chat_id,
-            kind="reply",
-            text=process_result.response_text,
-            telegram_message_id=telegram_message_id,
-            llm_call_id=process_result.response_llm_call_id,
-        )
-        db.commit()
-
-        logger.info(
-            "handle_update_v2_response_sent update_id=%s chat_id=%s session_id=%s",
-            update_id,
-            parsed.chat_id,
-            str(session.id),
-        )
-
-    except Exception as exc:
-        logger.exception(
-            "handle_update_v2_response_send_failed",
-            extra={
-                "error": repr(exc),
-                "chat_id": parsed.chat_id,
-                "session_id": str(session.id),
-            },
-        )
+        logger.warning("handle_update_v2_duplicate update_id=%s", update_id)
 
 
-# Alias for backwards compatibility with tests
+# Alias for backwards compatibility
 handle_update = handle_update_v2

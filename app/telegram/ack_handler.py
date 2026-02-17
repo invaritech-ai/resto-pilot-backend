@@ -80,9 +80,7 @@ def send_instant_ack(
         chat_id=chat_id,
         started_at=now,
         last_activity_at=now,
-        flush_at=now,
         status="closed",
-        hint_command=None,
         closed_at=now,
         ack_sent_at=None,
     )

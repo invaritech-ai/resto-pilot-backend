@@ -16,10 +16,16 @@ from app.db.models.invoice_line_items import InvoiceLineItems
 from app.db.models.invoices import Invoices
 from app.db.models.products import Products
 from app.db.models.restaurant_suppliers import RestaurantSuppliers
-from app.db.models.supplier_item_products import SupplierItemProducts
 from app.db.models.supplier_items import SupplierItems
 from app.db.models.supplier_prices import SupplierPrices
-from app.db.models.suppliers import Suppliers, normalize_supplier_name
+from app.db.models.suppliers import Suppliers
+
+
+def _normalize_name(name: str | None) -> str:
+    import re
+    if not name:
+        return ""
+    return re.sub(r"\s+", " ", name.strip().lower())
 
 
 class FileProcessingConfirmError(Exception):
@@ -171,8 +177,6 @@ def _upsert_supplier(
     supplier_name: str,
     owner_user_id: uuid.UUID,
     contact_name: str | None,
-    contact_email: str | None,
-    contact_phone: str | None,
     currency: str | None,
     preferred_supplier_id: uuid.UUID | None,
 ) -> Suppliers:
@@ -183,10 +187,10 @@ def _upsert_supplier(
             raise FileProcessingConfirmError("Supplier does not belong to this user.")
 
     if not supplier:
-        normalized = normalize_supplier_name(supplier_name)
+        normalized = _normalize_name(supplier_name)
         supplier = db.scalar(
             select(Suppliers).where(
-                Suppliers.name_normalized == normalized,
+                Suppliers.name.ilike(normalized),
                 Suppliers.is_active,
                 (Suppliers.user_id == owner_user_id) | (Suppliers.user_id.is_(None)),
             )
@@ -196,10 +200,7 @@ def _upsert_supplier(
         supplier = Suppliers(
             user_id=owner_user_id,
             name=supplier_name,
-            name_normalized=normalize_supplier_name(supplier_name),
             contact_name=contact_name,
-            contact_email=contact_email,
-            contact_phone=contact_phone,
             currency=currency,
             is_active=True,
         )
@@ -211,13 +212,8 @@ def _upsert_supplier(
         supplier.user_id = owner_user_id
 
     supplier.name = supplier_name
-    supplier.name_normalized = supplier.name_normalized or normalize_supplier_name(supplier_name)
     if contact_name:
         supplier.contact_name = contact_name
-    if contact_email:
-        supplier.contact_email = contact_email
-    if contact_phone:
-        supplier.contact_phone = contact_phone
     if currency:
         supplier.currency = currency
 
@@ -317,32 +313,8 @@ def _upsert_supplier_item_product_link(
     restaurant_id: uuid.UUID | None,
     product_id_value: Any,
 ) -> None:
-    if restaurant_id is None:
-        return
-    if not product_id_value:
-        return
-    try:
-        product_uuid = uuid.UUID(str(product_id_value))
-    except ValueError:
-        return
-
-    link = db.scalar(
-        select(SupplierItemProducts).where(
-            SupplierItemProducts.supplier_item_id == supplier_item_id,
-            SupplierItemProducts.restaurant_id == restaurant_id,
-        )
-    )
-    if link:
-        link.product_id = product_uuid
-        return
-
-    db.add(
-        SupplierItemProducts(
-            supplier_item_id=supplier_item_id,
-            restaurant_id=restaurant_id,
-            product_id=product_uuid,
-        )
-    )
+    # supplier_item_products table removed in Phase 0 cleanup - no-op for now
+    pass
 
 
 def confirm_file_processing_staging(
@@ -387,8 +359,6 @@ def confirm_file_processing_staging(
                 supplier_name=supplier_name,
                 owner_user_id=owner_user_id,
                 contact_name=None,
-                contact_email=None,
-                contact_phone=None,
                 currency=currency,
                 preferred_supplier_id=staging.supplier_id,
             )
@@ -512,8 +482,6 @@ def confirm_file_processing_staging(
                 supplier_name=supplier_name,
                 owner_user_id=owner_user_id,
                 contact_name=_clean_str(extracted_data.get("contact_name")),
-                contact_email=_clean_str(extracted_data.get("contact_email")),
-                contact_phone=_clean_str(extracted_data.get("contact_phone")),
                 currency=currency,
                 preferred_supplier_id=staging.supplier_id,
             )
@@ -636,8 +604,6 @@ def confirm_file_processing_staging(
                             supplier_name=supplier_name,
                             owner_user_id=owner_user_id,
                             contact_name=None,
-                            contact_email=None,
-                            contact_phone=None,
                             currency=None,
                             preferred_supplier_id=None,
                         )

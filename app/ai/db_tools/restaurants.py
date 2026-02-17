@@ -46,7 +46,7 @@ def create_restaurant_tools(
                     "id": str(restaurant.id),
                     "name": restaurant.name,
                     "code": restaurant.restaurant_code,
-                    "your_role": membership.role,
+                    "your_role": ("owner" if membership.is_owner else "staff"),
                 }
             )
 
@@ -76,7 +76,7 @@ def create_restaurant_tools(
                         "id": str(restaurant.id),
                         "name": restaurant.name,
                         "code": restaurant.restaurant_code,
-                        "your_role": membership.role,
+                        "your_role": ("owner" if membership.is_owner else "staff"),
                     }
                 )
 
@@ -145,7 +145,7 @@ def create_restaurant_tools(
             select(RestaurantUser).where(
                 RestaurantUser.restaurant_id == restaurant_id,
                 RestaurantUser.user_id == user_id,
-                RestaurantUser.status != "removed",
+                RestaurantUser.is_active.is_(True),
             )
         )
 
@@ -154,7 +154,7 @@ def create_restaurant_tools(
                 "id": str(restaurant.id),
                 "name": restaurant.name,
                 "code": restaurant.restaurant_code,
-                "your_role": membership.role if membership else "none",
+                "your_role": ("owner" if membership.is_owner else "staff") if membership else "none",
                 "created_at": format_date(restaurant.created_at),
             },
             indent=2,

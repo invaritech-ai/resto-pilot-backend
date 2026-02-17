@@ -62,12 +62,12 @@ def load_context(db: Session, user: User) -> UserContext:
         user: User model instance
 
     Returns:
-        UserContext populated from user.state_data or empty context
+        UserContext populated from user.context or empty context
     """
-    state_data = user.state_data
-    if not isinstance(state_data, dict):
+    context = user.context
+    if not isinstance(context, dict):
         return UserContext()
-    return UserContext.from_dict(state_data)
+    return UserContext.from_dict(context)
 
 
 def save_context(
@@ -83,7 +83,7 @@ def save_context(
         user: User model instance
         context: UserContext to save
     """
-    user.state_data = context.to_dict()
+    user.context = context.to_dict()
     db.add(user)
     # Don't commit - let caller manage transaction
 
@@ -96,7 +96,7 @@ def clear_context(db: Session, user: User) -> None:
         db: Database session
         user: User model instance
     """
-    user.state_data = None
+    user.context = None
     db.add(user)
     # Don't commit - let caller manage transaction
 

@@ -4,7 +4,7 @@ import datetime as dt
 import uuid
 from typing import ClassVar
 
-from sqlalchemy import DateTime, Enum, ForeignKey, Numeric, String, func
+from sqlalchemy import DateTime, ForeignKey, Numeric, String, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -30,15 +30,6 @@ class InventoryBatches(Base):
     unit_cost: Mapped[float] = mapped_column(Numeric, nullable=False)
     received_date: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
-    )
-    expiry_date: Mapped[dt.datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
-    location_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("inventory_locations.id", ondelete="SET NULL"), nullable=True
-    )
-    status: Mapped[str] = mapped_column(
-        Enum("available", "consumed", "expired", name="batch_status"), nullable=False
     )
 
     created_at: Mapped[dt.datetime] = mapped_column(

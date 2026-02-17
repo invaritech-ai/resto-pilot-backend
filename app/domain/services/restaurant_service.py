@@ -43,9 +43,8 @@ class RestaurantService:
             membership = RestaurantUser(
                 restaurant_id=restaurant.id,
                 user_id=owner_user_id,
-                role="owner",
-                invited_by=None,
-                status="active",
+                is_owner=True,
+                is_active=True,
             )
             self.session.add(membership)
             try:
@@ -63,18 +62,13 @@ class RestaurantService:
         *,
         restaurant_id: uuid.UUID,
         user_id: uuid.UUID,
-        role: str,
-        invited_by: uuid.UUID | None,
+        is_owner: bool = False,
     ) -> RestaurantUser:
-        if role not in {"owner", "staff"}:
-            raise ValueError("Invalid role")
-
         membership = RestaurantUser(
             restaurant_id=restaurant_id,
             user_id=user_id,
-            role=role,
-            invited_by=invited_by,
-            status="active",
+            is_owner=is_owner,
+            is_active=True,
         )
         self.session.add(membership)
         self.session.commit()
@@ -88,7 +82,7 @@ class RestaurantService:
             select(RestaurantUser.id).where(
                 RestaurantUser.restaurant_id == restaurant_id,
                 RestaurantUser.user_id == user_id,
-                RestaurantUser.status != "removed",
+                RestaurantUser.is_active.is_(True),
             )
         )
         return existing_id is not None
@@ -99,7 +93,7 @@ class RestaurantService:
             .join(RestaurantUser, RestaurantUser.restaurant_id == Restaurant.id)
             .where(
                 RestaurantUser.user_id == user_id,
-                RestaurantUser.status != "removed",
+                RestaurantUser.is_active.is_(True),
             )
             .order_by(Restaurant.created_at.desc())
         ).all()
@@ -111,7 +105,7 @@ class RestaurantService:
             .join(RestaurantUser, RestaurantUser.user_id == User.id)
             .where(
                 RestaurantUser.restaurant_id == restaurant_id,
-                RestaurantUser.status != "removed",
+                RestaurantUser.is_active.is_(True),
             )
             .order_by(RestaurantUser.joined_at.asc())
         ).all()

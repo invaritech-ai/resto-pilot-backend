@@ -45,7 +45,7 @@ def associate_supplier_to_restaurant(
         select(RestaurantUser.id).where(
             RestaurantUser.restaurant_id == restaurant_uuid,
             RestaurantUser.user_id == user_uuid,
-            RestaurantUser.status != "removed",
+            RestaurantUser.is_active.is_(True),
         )
     )
     if not is_member:

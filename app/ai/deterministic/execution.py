@@ -10,16 +10,13 @@ from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.conversation import responses
-from app.db.models.invite_codes import InviteCodes
 from app.db.models.restaurant import Restaurant
 from app.db.models.restaurant_suppliers import RestaurantSuppliers
 from app.db.models.restaurant_user import RestaurantUser
 from app.db.models.supplier_items import SupplierItems
-from app.db.models.supplier_prices import SupplierPrices
 from app.db.models.suppliers import Suppliers
 from app.db.models.user import User
 from app.domain.services.entity_resolver import Candidate, normalize_name, resolve_name
-from app.domain.services.invite_service import InviteCodeService
 from app.domain.services.restaurant_service import RestaurantService
 
 logger = logging.getLogger(__name__)
@@ -40,8 +37,8 @@ def _is_owner(*, db: Session, user: User, restaurant_id: uuid.UUID) -> bool:
             select(RestaurantUser.id).where(
                 RestaurantUser.restaurant_id == restaurant_id,
                 RestaurantUser.user_id == user.id,
-                RestaurantUser.role == "owner",
-                RestaurantUser.status == "active",
+                RestaurantUser.is_owner.is_(True),
+                RestaurantUser.is_active.is_(True),
             )
         )
     )
@@ -53,7 +50,7 @@ def _has_access(*, db: Session, user: User, restaurant_id: uuid.UUID) -> bool:
             select(RestaurantUser.id).where(
                 RestaurantUser.restaurant_id == restaurant_id,
                 RestaurantUser.user_id == user.id,
-                RestaurantUser.status == "active",
+                RestaurantUser.is_active.is_(True),
             )
         )
     )
@@ -117,7 +114,7 @@ def _visible_supplier_candidates(*, db: Session, user: User) -> list[Candidate]:
             and_(
                 RestaurantUser.restaurant_id == RestaurantSuppliers.restaurant_id,
                 RestaurantUser.user_id == user.id,
-                RestaurantUser.status == "active",
+                RestaurantUser.is_active.is_(True),
             ),
         )
         .where(RestaurantSuppliers.status == "active")
@@ -285,7 +282,7 @@ def execute_deterministic_tool(
         if tool == "restaurants_list":
             rows = RestaurantService(db).list_for_user(user_id=user.id)
             payload = [
-                {"name": restaurant.name, "your_role": membership.role}
+                {"name": restaurant.name, "your_role": ("owner" if membership.is_owner else "staff")}
                 for restaurant, membership in rows
             ]
             return json.dumps({"restaurants": payload}, indent=2)
@@ -416,8 +413,7 @@ def execute_deterministic_tool(
                     {
                         "name": s.name,
                         "currency": (link.default_currency or s.currency),
-                        "language": s.language,
-                        "lead_time_days": (link.lead_time_days or s.lead_time_days),
+                        "lead_time_days": link.lead_time_days,
                     }
                     for s, link in rows
                 ]
@@ -431,7 +427,7 @@ def execute_deterministic_tool(
                     and_(
                         RestaurantUser.restaurant_id == RestaurantSuppliers.restaurant_id,
                         RestaurantUser.user_id == user.id,
-                        RestaurantUser.status == "active",
+                        RestaurantUser.is_active.is_(True),
                     ),
                 )
                 .where(RestaurantSuppliers.status == "active", Suppliers.is_active == True)

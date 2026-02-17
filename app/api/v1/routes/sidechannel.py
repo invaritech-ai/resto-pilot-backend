@@ -48,7 +48,7 @@ class SideChannelMessageRequest(BaseModel):
     )
     context_override: dict[str, Any] | None = Field(
         default=None,
-        description="Optional context overrides merged into users.state_data-derived context for planner_only.",
+        description="Optional context overrides merged into users.context for planner_only.",
     )
     recent_turns_limit: int = Field(
         20,
