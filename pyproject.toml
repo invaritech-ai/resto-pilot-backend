@@ -34,6 +34,13 @@ dependencies = [
     "tabulate>=0.9.0",
 ]
 
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-anyio>=0.0.0",
+    "httpx>=0.28.0",
+]
+
 [tool.setuptools.packages.find]
 include = ["app*"]
 exclude = ["tests*", "alembic*"]
