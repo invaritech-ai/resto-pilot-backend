@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from app.domain.services.entity_resolver import Candidate, resolve_name
+from app.services.entity_resolver import Candidate, resolve_name
 
 
 def test_resolve_name_exact_match() -> None:
