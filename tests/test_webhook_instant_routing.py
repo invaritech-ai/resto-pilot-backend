@@ -60,7 +60,7 @@ def test_webhook_routes_start_to_instant(monkeypatch: pytest.MonkeyPatch) -> Non
     app.dependency_overrides[get_db_dep] = _get_db_override
     client = TestClient(app)
 
-    from app.workers import tasks as worker_tasks
+    from app.workers import telegram_tasks as worker_tasks
 
     enqueued: dict[str, object] = {}
 
@@ -108,7 +108,7 @@ def test_webhook_routes_instant_stateful(monkeypatch: pytest.MonkeyPatch) -> Non
         db.add(User(telegram_id=1, chat_id=10, state="COLLECT_PHONE"))
         db.commit()
 
-    from app.workers import tasks as worker_tasks
+    from app.workers import telegram_tasks as worker_tasks
 
     enqueued: dict[str, object] = {}
 
@@ -152,7 +152,7 @@ def test_webhook_routes_unregistered_user_to_instant(monkeypatch: pytest.MonkeyP
     app.dependency_overrides[get_db_dep] = _get_db_override
     client = TestClient(app)
 
-    from app.workers import tasks as worker_tasks
+    from app.workers import telegram_tasks as worker_tasks
 
     enqueued: dict[str, object] = {}
 
@@ -169,4 +169,3 @@ def test_webhook_routes_unregistered_user_to_instant(monkeypatch: pytest.MonkeyP
     )
     assert resp.status_code == 200
     assert enqueued.get("called") is True
-

@@ -71,7 +71,7 @@ def test_phone_intake_e2e_via_webhook_batching_enabled(monkeypatch: pytest.Monke
 
     monkeypatch.setattr("app.api.v1.routes.telegram.ingest_update", _fail_ingest_update)
 
-    from app.workers import tasks as worker_tasks
+    from app.workers import telegram_tasks as worker_tasks
 
     def _fake_handle_telegram_update_delay(update: dict):
         with Session(engine) as db:

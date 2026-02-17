@@ -21,13 +21,13 @@ from app.db.models.telegram_messages import TelegramMessages
 from app.db.models.telegram_outgoing_messages import TelegramOutgoingMessages
 from app.db.models.telegram_session import TelegramSessions
 from app.db.models.user import User
-from app.domain.services.user_service import UserService
+from app.services.user_service import UserService
 from app.schemas.user import TelegramUserCreate
 from app.telegram.bot_api import send_message
 from app.telegram.commands import extract_command
 from app.telegram.ingest import parse_update
 from app.telegram.processor import process_update as process_start_command
-from app.workers.telemetry import record_outgoing_message
+from app.services.telemetry import record_outgoing_message
 
 logger = logging.getLogger(__name__)
 

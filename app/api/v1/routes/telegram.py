@@ -17,7 +17,7 @@ from app.api.deps import get_settings_dep, get_db_dep
 from app.core.config import Settings
 from app.telegram.ack_handler import send_instant_ack
 from app.workers.celery_types import CeleryDelayable
-from app.workers.tasks import handle_telegram_update
+from app.workers.telegram_tasks import handle_telegram_update
 
 router = APIRouter()
 logger = logging.getLogger(__name__)

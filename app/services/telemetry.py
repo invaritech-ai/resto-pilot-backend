@@ -6,14 +6,16 @@ from __future__ import annotations
 
 import datetime as dt
 import decimal
+import logging
 import uuid
-from typing import Any, Mapping, cast
+from typing import Any, Mapping
 
 from sqlalchemy.orm import Session
 
 from app.db.models.llm_calls import LLMCalls
 from app.db.models.telegram_outgoing_messages import TelegramOutgoingMessages
-from app.workers.celery_types import CeleryApplyAsync
+
+logger = logging.getLogger(__name__)
 
 
 def record_llm_call(
@@ -75,13 +77,12 @@ def schedule_openrouter_cost_backfill(
     *, llm_call_id: uuid.UUID, delay_seconds: int = 120
 ) -> str | None:
     """Schedule a task to backfill LLM call costs from OpenRouter."""
-    from app.workers.tasks import backfill_llm_call_costs  # imported lazily
-
-    async_result = cast(CeleryApplyAsync, backfill_llm_call_costs).apply_async(
-        kwargs={"llm_call_id": str(llm_call_id)},
-        countdown=float(max(0, int(delay_seconds))),
+    logger.info(
+        "openrouter_cost_backfill_skipped llm_call_id=%s delay_seconds=%s",
+        llm_call_id,
+        delay_seconds,
     )
-    return getattr(async_result, "id", None)
+    return None
 
 
 def record_outgoing_message(

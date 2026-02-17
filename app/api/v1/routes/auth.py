@@ -1,5 +1,6 @@
 import time
 import uuid
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -15,10 +16,8 @@ from app.api.security import (
 )
 from app.core.config import Settings
 from app.db.models.user import User
-from app.domain.services.restaurant_service import RestaurantService
-from app.domain.services.user_service import UserService
-from app.schemas.me import MeRead
-from app.schemas.restaurant import RestaurantMembershipRead, RestaurantRead
+from app.services.restaurant_service import RestaurantService
+from app.services.user_service import UserService
 from app.schemas.user import TelegramUserCreate, UserRead
 
 router = APIRouter()
@@ -45,10 +44,9 @@ def telegram_webapp_auth(
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing Telegram user")
 
     telegram_id: int = user["id"]
-    chat_id = telegram_id
     user_payload = TelegramUserCreate(
         telegram_id=telegram_id,
-        chat_id=chat_id,
+        chat_id=telegram_id,
         first_name=user.get("first_name"),
         last_name=user.get("last_name"),
         username=user.get("username"),
@@ -89,18 +87,21 @@ def get_current_user(
     return user
 
 
-@router.get("/me", response_model=MeRead)
+@router.get("/me")
 def me(
     db: Session = Depends(get_db_dep),
     current_user: User = Depends(get_current_user),
-) -> MeRead:
+) -> dict[str, Any]:
     rows = RestaurantService(db).list_for_user(user_id=current_user.id)
-    restaurants = [
-        RestaurantMembershipRead(
-            restaurant=RestaurantRead.model_validate(restaurant),
-            is_owner=membership.is_owner,
-            is_active=membership.is_active,
-        )
-        for restaurant, membership in rows
-    ]
-    return MeRead(user=UserRead.model_validate(current_user), restaurants=restaurants)
+    return {
+        "user": UserRead.model_validate(current_user),
+        "restaurants": [
+            {
+                "id": str(restaurant.id),
+                "name": restaurant.name,
+                "is_owner": membership.is_owner,
+                "is_active": membership.is_active,
+            }
+            for restaurant, membership in rows
+        ],
+    }

@@ -8,7 +8,7 @@ from app.api.deps import get_db_dep
 from app.api.v1.routes.auth import get_current_user
 from app.db.models.restaurant_user import RestaurantUser
 from app.db.models.user import User
-from app.domain.services.restaurant_service import RestaurantService
+from app.services.restaurant_service import RestaurantService
 from app.schemas.restaurant import (
     RestaurantCreate,
     RestaurantMemberRead,

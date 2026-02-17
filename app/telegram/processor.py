@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
-from app.domain.services.user_service import UserService
+from app.services.user_service import UserService
 from app.schemas.user import TelegramUserCreate
 
 

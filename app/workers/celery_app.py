@@ -5,7 +5,6 @@ import os
 import ssl
 
 from celery import Celery
-from celery.schedules import crontab
 
 from app.core.config import get_settings
 
@@ -21,9 +20,6 @@ celery_app = Celery(
     broker=settings.celery_broker_url or None,
     backend=settings.celery_result_backend or None,
     include=[
-        "app.workers.tasks",  # Re-export module (for backward compatibility)
-        "app.workers.file_processing_tasks",
-        "app.workers.llm_tasks",
         "app.workers.telegram_tasks",
     ],
 )
@@ -39,13 +35,6 @@ celery_app.conf.update(
     task_acks_late=True,
     task_reject_on_worker_lost=True,
 )
-
-celery_app.conf.beat_schedule = {
-    "cleanup-file-processing": {
-        "task": "cleanup_file_processing_task",
-        "schedule": crontab(hour=3, minute=0),
-    }
-}
 
 logger.info(
     "celery_app_initialized broker_url=%s result_backend_configured=%s",
