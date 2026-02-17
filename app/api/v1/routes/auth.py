@@ -44,21 +44,25 @@ def telegram_webapp_auth(
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing Telegram user")
 
     telegram_id: int = user["id"]
-    user_payload = TelegramUserCreate(
+    db_user, _ = UserService(db).get_or_create(
         telegram_id=telegram_id,
         chat_id=telegram_id,
-        first_name=user.get("first_name"),
-        last_name=user.get("last_name"),
         username=user.get("username"),
     )
-    created = UserService(db).get_or_create(user_payload)
+    # Set full_name from Telegram webapp data if not yet collected via onboarding
+    if db_user.full_name is None:
+        parts = [p for p in [user.get("first_name"), user.get("last_name")] if p]
+        if parts:
+            db_user.full_name = " ".join(parts).strip()
+            db.add(db_user)
+    db.commit()
 
     exp = int(time.time()) + settings.auth_token_ttl_seconds
     token = encode_access_token(
-        payload=AccessTokenPayload(user_id=str(created.id), telegram_id=created.telegram_id, exp=exp),
+        payload=AccessTokenPayload(user_id=str(db_user.id), telegram_id=db_user.telegram_id, exp=exp),
         settings=settings,
     )
-    return {"access_token": token, "token_type": "bearer", "user": UserRead.model_validate(created)}
+    return {"access_token": token, "token_type": "bearer", "user": UserRead.model_validate(db_user)}
 
 
 def get_current_user(
