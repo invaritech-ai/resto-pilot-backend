@@ -1,12 +1,14 @@
 # Phase 1 Technical Specification
 ## Supplier & Price List Management
 
+**Revision 2** — corrected: integer money storage, global supplier registry.
+
 ---
 
 ## 1. Scope
 
 Phase 1 delivers two things via Telegram chat:
-1. **Supplier management** — create, list, view suppliers per restaurant.
+1. **Supplier management** — create, list, view suppliers; link them to restaurants.
 2. **Price list ingestion** — upload a PDF or photo, review parsed items via inline buttons, edit via text, confirm to write to DB.
 
 No web UI. Every interaction is Telegram-native.
@@ -23,73 +25,116 @@ ALTER TABLE restaurants
   ADD COLUMN address   TEXT,
   ADD COLUMN city      TEXT,
   ADD COLUMN country   CHAR(2),       -- ISO 3166-1 alpha-2
-  ADD COLUMN latitude  NUMERIC(10,7), -- nullable
+  ADD COLUMN latitude  NUMERIC(10,7), -- nullable; no PostGIS dependency yet
   ADD COLUMN longitude NUMERIC(10,7); -- nullable
 ```
 
-### 2b. New: `suppliers`
+---
+
+### 2b. New: `suppliers` — Global Registry
+Suppliers are a global entity. One `ABC Wholesalers` record exists once in the system,
+linkable to many restaurants/outlets via `restaurant_suppliers`.
 
 ```sql
 CREATE TABLE suppliers (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    restaurant_id   UUID NOT NULL REFERENCES restaurants(id) ON DELETE CASCADE,
     name            TEXT NOT NULL,
-    name_lower      TEXT NOT NULL,   -- always lowercased; used for trigram/fuzzy search
+    name_lower      TEXT NOT NULL,    -- always lowercased; used for trigram/fuzzy search
     contact_name    TEXT,
     phone           TEXT,
-    currency        CHAR(3),         -- e.g. "SGD", "USD"
+    email           TEXT,
+    default_currency CHAR(3),         -- e.g. "SGD", "USD" — hint for price list parsing
     notes           TEXT,
     is_active       BOOLEAN NOT NULL DEFAULT TRUE,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_suppliers_restaurant_name ON suppliers(restaurant_id, name_lower);
+CREATE INDEX idx_suppliers_name_lower ON suppliers(name_lower);
 CREATE INDEX idx_suppliers_name_trgm ON suppliers USING GIN(name_lower gin_trgm_ops);
 ```
 
-### 2c. New: `supplier_price_lists`
-Header record for each confirmed upload.
+---
+
+### 2c. New: `restaurant_suppliers` — Link Table
+Connects a restaurant to the global suppliers it works with.
+
+```sql
+CREATE TABLE restaurant_suppliers (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    restaurant_id   UUID NOT NULL REFERENCES restaurants(id) ON DELETE CASCADE,
+    supplier_id     UUID NOT NULL REFERENCES suppliers(id) ON DELETE CASCADE,
+    is_active       BOOLEAN NOT NULL DEFAULT TRUE,
+    notes           TEXT,             -- restaurant-specific notes about this supplier
+    added_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    added_by        UUID REFERENCES users(id) ON DELETE SET NULL,
+
+    UNIQUE(restaurant_id, supplier_id)
+);
+
+CREATE INDEX idx_restaurant_suppliers_restaurant ON restaurant_suppliers(restaurant_id, is_active);
+```
+
+---
+
+### 2d. New: `supplier_price_lists`
+Header record for each confirmed upload. Scoped to the restaurant that uploaded it.
 
 ```sql
 CREATE TABLE supplier_price_lists (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     restaurant_id   UUID NOT NULL REFERENCES restaurants(id) ON DELETE CASCADE,
     supplier_id     UUID NOT NULL REFERENCES suppliers(id) ON DELETE CASCADE,
-    effective_date  DATE,            -- nullable; supplier may not state it
+    effective_date  DATE,             -- nullable; supplier may not state it
     notes           TEXT,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+CREATE INDEX idx_price_lists_restaurant_supplier ON supplier_price_lists(restaurant_id, supplier_id);
 ```
 
-### 2d. New: `supplier_prices`
-Append-only. One row per item per upload. Full history preserved.
+---
+
+### 2e. New: `supplier_prices` — Append-only, Integer Storage
+One row per item per upload. Full history preserved. **No floats.**
+
+Prices and quantities are stored as integers in minor units with an explicit exponent.
+
+| Field | Example | Meaning |
+|-------|---------|---------|
+| `price_minor = 250` | `price_exp = 2` | 2.50 (divide by 10²) |
+| `price_minor = 500` | `price_exp = 0` | 500 (JPY, no decimal) |
+| `unit_qty_minor = 1500` | `unit_qty_exp = 3` | 1.500 kg (divide by 10³) |
 
 ```sql
 CREATE TABLE supplier_prices (
-    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    price_list_id   UUID NOT NULL REFERENCES supplier_price_lists(id) ON DELETE CASCADE,
-    supplier_id     UUID NOT NULL REFERENCES suppliers(id) ON DELETE CASCADE,
-    item_name       TEXT NOT NULL,         -- raw name as written by supplier
-    item_name_lower TEXT NOT NULL,         -- lowercased for search
-    unit            TEXT,                  -- "kg", "case", "each", "ltr"
-    unit_qty        NUMERIC(10,3),         -- e.g. 10.0 if "case of 10kg"
-    price           NUMERIC(12,4) NOT NULL,
-    currency        CHAR(3),
-    sku             TEXT,                  -- supplier's own code, nullable
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    price_list_id    UUID NOT NULL REFERENCES supplier_price_lists(id) ON DELETE CASCADE,
+    supplier_id      UUID NOT NULL REFERENCES suppliers(id) ON DELETE CASCADE,
+    item_name        TEXT NOT NULL,         -- raw name as written by supplier
+    item_name_lower  TEXT NOT NULL,         -- lowercased for search
+    unit             TEXT,                  -- "kg", "case", "each", "ltr"
+    unit_qty_minor   BIGINT,                -- quantity in minor units (nullable)
+    unit_qty_exp     SMALLINT,              -- exponent: divide unit_qty_minor by 10^exp
+    price_minor      BIGINT NOT NULL,       -- price in minor units
+    price_exp        SMALLINT NOT NULL,     -- exponent: divide price_minor by 10^exp
+    currency         CHAR(3),
+    sku              TEXT,                  -- supplier's own code, nullable
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_supplier_prices_list ON supplier_prices(price_list_id);
+CREATE INDEX idx_supplier_prices_list     ON supplier_prices(price_list_id);
 CREATE INDEX idx_supplier_prices_supplier ON supplier_prices(supplier_id, item_name_lower);
 CREATE INDEX idx_supplier_prices_name_trgm ON supplier_prices USING GIN(item_name_lower gin_trgm_ops);
 ```
 
-### 2e. New: `file_processing_staging`
+---
+
+### 2f. New: `file_processing_staging`
 Working state for an upload in progress. Mutated until user confirms.
 
 ```sql
-CREATE TYPE staging_status AS ENUM ('processing', 'pending_review', 'confirmed', 'cancelled');
+CREATE TYPE staging_status AS ENUM ('processing', 'pending_review', 'confirmed', 'cancelled', 'error');
 
 CREATE TABLE file_processing_staging (
     id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -99,7 +144,7 @@ CREATE TABLE file_processing_staging (
     file_unique_id       TEXT NOT NULL,
     mime                 TEXT,
     status               staging_status NOT NULL DEFAULT 'processing',
-    extracted_data_json  JSONB,           -- working copy; patched during review
+    extracted_data_json  JSONB,           -- working copy; patched during review (integer prices)
     error_message        TEXT,
     created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -108,25 +153,37 @@ CREATE TABLE file_processing_staging (
 CREATE INDEX idx_staging_restaurant_status ON file_processing_staging(restaurant_id, status);
 ```
 
-**`extracted_data_json` shape:**
+**`extracted_data_json` shape — integer prices throughout:**
 ```json
 {
   "supplier_name": "ABC Wholesalers",
   "effective_date": "2025-01-15",
   "currency": "SGD",
+  "currency_exp": 2,
   "items": [
     {
-      "item_name": "tomato",
+      "item_name": "Tomato",
+      "item_name_lower": "tomato",
       "sku": "TOM-001",
       "unit": "kg",
-      "unit_qty": 1,
-      "price": 2.50
+      "unit_qty_minor": 1000,
+      "unit_qty_exp": 3,
+      "price_minor": 250,
+      "price_exp": 2
     }
   ]
 }
 ```
 
-### 2f. New: `handshake_requests`
+**Display helper** (used by `renderer.py` — never stored):
+```
+price_display = price_minor / 10^price_exp   → "2.50"
+unit_qty_display = unit_qty_minor / 10^unit_qty_exp → "1.000 kg"
+```
+
+---
+
+### 2g. New: `handshake_requests`
 Pending clarification questions to the user.
 
 ```sql
@@ -143,10 +200,12 @@ CREATE TABLE handshake_requests (
 );
 
 CREATE INDEX idx_handshake_staging ON handshake_requests(staging_id, resolved_at);
-CREATE INDEX idx_handshake_user ON handshake_requests(user_id, resolved_at);
+CREATE INDEX idx_handshake_user    ON handshake_requests(user_id, resolved_at);
 ```
 
-### 2g. Transient Context: `users.context` (JSONB)
+---
+
+### 2h. Transient Context: `users.context` (JSONB)
 Already exists. Schema for Phase 1:
 
 ```json
@@ -199,7 +258,7 @@ Priority 6 — LLM Fallback
 
 ### Priority 2: Button Callback
 
-**Wire format:** `action:id:param` (Telegram 64-byte limit)
+**Wire format:** `action:id:param` (Telegram 64-byte limit; UUID as 32-char hex, no dashes)
 
 | Action | Format | Handler |
 |--------|--------|---------|
@@ -207,14 +266,15 @@ Priority 6 — LLM Fallback
 | `conf_u` | `conf_u:{staging_hex}` | Confirm upload → write to DB |
 | `del_u` | `del_u:{staging_hex}` | Cancel upload |
 | `ed_row` | `ed_row:{staging_hex}:{idx}` | Prompt edit for item at index |
-| `list_p` | `list_p:{type}:{page}` | Paginate a list |
+| `list_p` | `list_p:{type}:{page}` | Paginate a list (type = "suppliers", "uploads") |
 | `res_h` | `res_h:{handshake_hex}:{answer}` | Resolve handshake question |
-| `set_sup` | `set_sup:{supplier_hex}` | Set active supplier on staging |
+| `set_sup` | `set_sup:{staging_hex}:{supplier_hex}` | Link supplier to staging record |
+| `new_sup` | `new_sup:{staging_hex}` | Create new supplier from staging's parsed name |
 
 **Rules:**
 - All button handlers are **strictly deterministic**. No LLM calls.
 - If a referenced ID no longer exists → answer callback with alert: `"This item no longer exists."`
-- After state-changing actions (`conf_u`, `del_u`), **edit the original message** to show final state. Prevents double-tap.
+- After state-changing actions (`conf_u`, `del_u`), **edit the original message** to reflect final state. Prevents double-tap.
 
 ---
 
@@ -222,8 +282,8 @@ Priority 6 — LLM Fallback
 
 | Command | Handler | Description |
 |---------|---------|-------------|
-| `/list suppliers` | `cmd_list_suppliers` | Paginated supplier list |
-| `/add supplier` | `cmd_add_supplier` | Start supplier creation |
+| `/list suppliers` | `cmd_list_suppliers` | Paginated list of this restaurant's linked suppliers |
+| `/add supplier` | `cmd_add_supplier` | Search global registry + create/link |
 | `/uploads` | `cmd_list_uploads` | Show pending staging records |
 | `/switch` | `cmd_switch_restaurant` | Change active restaurant |
 
@@ -236,7 +296,7 @@ Priority 6 — LLM Fallback
 **Flow:**
 1. Query `file_processing_staging` for `restaurant_id + status='pending_review'`.
 2. If any exist: reply with list of pending uploads + offer to review or start new.
-3. If none: download file → enqueue `ocr_task` → reply "Processing your file..."
+3. If none: create staging record → enqueue `ocr_task` → reply "Processing your file..."
 
 ---
 
@@ -244,8 +304,8 @@ Priority 6 — LLM Fallback
 
 | Pattern | Example | Action |
 |---------|---------|--------|
-| `^#\d+$` | `#2` | Select item `numbered_items[2-1]` from context |
-| `^\d+(\.\d+)?\s*(kg|g|ltr|ml|case|each|pcs)` | `5.5 kg` | Quantity+unit input for active flow |
+| `^#\d+$` | `#2` | Select `numbered_items[2-1]` from context |
+| `^\d+(\.\d+)?\s*(kg\|g\|ltr\|ml\|case\|each\|pcs)` | `5.5 kg` | Quantity+unit input for active flow |
 
 ---
 
@@ -254,10 +314,10 @@ Priority 6 — LLM Fallback
 **Only reached if no deterministic match.**
 
 1. Build context: `user.context` + last 10 messages + open handshake requests + pending staging.
-2. Call LLM Intent Classifier (see Section 5).
+2. Call LLM Intent Classifier (see Section 5, Contract A).
 3. Validate output against schema.
 4. Route to appropriate handler based on `intent`.
-5. If intent is `unknown` or confidence < 0.6: reply with disambiguation prompt.
+5. If `unknown` or confidence < 0.6: reply with disambiguation prompt.
 
 ---
 
@@ -266,19 +326,25 @@ Priority 6 — LLM Fallback
 ### 4a. Supplier Management
 
 #### `cmd_add_supplier(db, user, restaurant_id, args)`
-- If `args` contains a name: create immediately, confirm.
-- If no args: reply asking for supplier name, set `user.context.pending_action = "add_supplier"`.
-- On name received: normalize to lowercase, check for duplicate via trigram similarity > 0.85.
-  - If duplicate found: show match, ask "Is this the same supplier? [Yes / No, create new]"
-  - If new: create supplier, reply "✅ Supplier added: {name}"
+Suppliers are global. Creation always checks the global registry first.
+
+1. If `args` is empty: ask for supplier name.
+2. Normalize name to lowercase. Search global `suppliers` via trigram similarity > 0.85.
+3. **If global match found:**
+   - Check if already linked via `restaurant_suppliers` — if yes: "You're already connected to {name}."
+   - If not linked: show match, offer `[ ✅ Link to my restaurant ]` (`set_sup` variant) or `[ ➕ Create new ]`.
+4. **If no global match:** Create new supplier in global registry + create `restaurant_suppliers` link in one transaction.
+5. Reply "✅ Supplier added: {name}"
 
 #### `cmd_list_suppliers(db, user, restaurant_id, page=0)`
-- Query `suppliers` where `restaurant_id` and `is_active=true`, order by `name_lower`.
-- Show 10 per page with numbered list (store UUIDs in `user.context.numbered_items`).
+- Query via join: `restaurant_suppliers ↔ suppliers` where `restaurant_id` and `rs.is_active=true`.
+- Show 10 per page, ordered by `name_lower`.
+- Store UUIDs in `user.context.numbered_items`.
 - Buttons: `[ Next → ]` (`list_p:suppliers:{page+1}`), `[ ← Prev ]` if page > 0.
 - Set `user.context.last_list_type = "suppliers"`, `last_list_offset = page * 10`.
 
 #### `btn_set_supplier(db, staging_id, supplier_id)`
+- Verify supplier is linked to the staging record's `restaurant_id` via `restaurant_suppliers`.
 - Update `file_processing_staging.supplier_id`.
 - Re-render upload review.
 
@@ -288,9 +354,9 @@ Priority 6 — LLM Fallback
 
 #### `handle_file_upload(db, user, restaurant_id, update)`
 1. Extract `file_id`, `file_unique_id`, `mime` from update.
-2. Check for existing `pending_review` staging records.
-   - If found: show list of pending uploads with `rev_u` buttons + "Start New" option.
-   - If none: proceed to step 3.
+2. Check for existing `pending_review` staging records for this restaurant.
+   - If found: show list with `rev_u` buttons + "Start New" option.
+   - If none: proceed.
 3. Create `file_processing_staging` record with `status='processing'`.
 4. Enqueue `ocr_task(staging_id, file_id, mime)`.
 5. Reply: "📄 Got it. Parsing your price list..."
@@ -299,17 +365,22 @@ Priority 6 — LLM Fallback
 1. Download file bytes from Telegram.
 2. Extract text:
    - PDF: attempt `pdfplumber` text extraction first.
-   - Image or failed PDF: call Vision LLM (see Section 5, Contract B).
-3. Call Price List Parser LLM (see Section 5, Contract B) with extracted text.
-4. Validate output schema.
-5. Update staging: `extracted_data_json = parsed_result`, `status = 'pending_review'`.
-6. If supplier name in result: run fuzzy match against `suppliers`.
-   - Strong match (>0.85): auto-set `staging.supplier_id`.
-   - Weak match: create `handshake_request` of type `confirm_supplier`.
-   - No match: create `handshake_request` to ask user if they want to create a new supplier.
-7. Send message to user with upload review (call `render_upload_review`).
+   - Image or failed PDF: call Vision LLM.
+3. Call Price List Parser LLM (Contract B) → receives **decimal** output.
+4. **Conversion boundary:** Convert all decimal prices/quantities to integer minor units before writing to staging.
+   - `price 2.50 SGD` → `price_minor=250, price_exp=2, currency="SGD"`
+   - `unit_qty 1.5` → `unit_qty_minor=1500, unit_qty_exp=3`
+5. Validate converted structure. If invalid: set `staging.status='error'`, notify user.
+6. Write `extracted_data_json` (integer format), set `status='pending_review'`.
+7. Run fuzzy match on `supplier_name` against global `suppliers`:
+   - Strong match (>0.85) AND linked to restaurant: auto-set `staging.supplier_id`.
+   - Strong match but NOT linked: create `handshake_request` type `confirm_supplier` (offer to link).
+   - Weak/no match: create `handshake_request` to ask user (offer to create new or pick from list).
+8. Send upload review message.
 
 #### `render_upload_review(staging)` → Telegram message
+Prices displayed in human-readable form (convert from minor units for display only).
+
 ```
 📄 Price List: {supplier_name or "Unknown Supplier"}
 Date: {effective_date or "Not found"}
@@ -328,44 +399,44 @@ Items: {count}
 ```
 
 #### `btn_confirm_upload(db, staging_id)` — `conf_u` handler
-1. Load staging record. Validate `status = 'pending_review'`.
-2. Require `supplier_id` to be set — if not, prompt user to identify supplier first.
-3. Create `supplier_price_lists` record.
-4. Bulk insert `supplier_prices` rows from `extracted_data_json.items`.
-   - Store `item_name` raw + `item_name_lower = item_name.lower()`.
-5. Set `staging.status = 'confirmed'`.
-6. Clear `user.context.active_staging_id`.
+1. Load staging record. Validate `status='pending_review'`.
+2. Require `supplier_id` — if not set, block: "Please identify the supplier first."
+3. Verify `restaurant_suppliers` link exists between `staging.restaurant_id` and `staging.supplier_id`. Create link if missing (user already approved via handshake).
+4. Create `supplier_price_lists` record.
+5. Bulk insert `supplier_prices` rows from `extracted_data_json.items` — all values already in integer format.
+6. Set `staging.status='confirmed'`. Clear `user.context.active_staging_id`.
 7. Edit original message: "✅ Confirmed. {n} prices saved for {supplier_name}."
 
 #### `btn_edit_row(db, staging_id, idx)` — `ed_row` handler
 1. Load item at `extracted_data_json.items[idx-1]`.
-2. Set `user.context.active_staging_id`, store `edit_idx` in context.
-3. Reply: "Editing: {item_name} — current price {price} {currency}/{unit}\n\nSend the corrected line, e.g.:\n`tomato 2.80 sgd/kg`"
+2. Convert to display values for the prompt.
+3. Store `edit_idx` in `user.context`.
+4. Reply: "Editing: {item_name} — current price {display_price} {currency}/{unit}\n\nSend the corrected line:\n`tomato 2.80 sgd/kg`"
 
 #### `handle_staging_text_edit(db, user, staging_id, edit_idx, text)`
-Called when user sends text while `active_staging_id` is set and no other pattern matches.
-1. Call Correction Patch LLM (see Section 5, Contract C).
-2. Validate patch — only `replace` operations on `items[n].*`, no structural changes.
-3. Apply patch to `extracted_data_json`.
-4. Save staging record.
-5. Re-render upload review.
+Called when text is received while `active_staging_id` is set and no other pattern matched.
+1. Convert current item to display form → send to Correction Patch LLM (Contract C).
+2. LLM returns patch with **decimal** values.
+3. **Conversion boundary:** Convert patch values to integer minor units before applying.
+4. Validate: only `replace` on allowed fields, value types correct, index in bounds.
+5. Apply patch to `extracted_data_json`.
+6. Save staging record. Re-render upload review.
 
 #### `btn_delete_upload(db, staging_id)` — `del_u` handler
-1. Set `staging.status = 'cancelled'`.
-2. Clear `user.context.active_staging_id`.
-3. Edit original message: "❌ Upload cancelled."
+1. Set `staging.status='cancelled'`. Clear `user.context.active_staging_id`.
+2. Edit original message: "❌ Upload cancelled."
 
 ---
 
 ### 4c. Handshake Resolution
 
 #### `btn_resolve_handshake(db, handshake_id, answer)` — `res_h` handler
-1. Load handshake record. Load `context_data`.
+1. Load handshake record + `context_data`.
 2. Based on `type`:
-   - `confirm_supplier` + `yes`: set `staging.supplier_id = context_data.matched_supplier_id`.
-   - `confirm_supplier` + `no`: prompt user to type supplier name → create new supplier.
-   - `confirm_unit`: set `items[idx].unit = context_data.suggested_unit` if `yes`.
-   - `confirm_currency`: set `extracted_data_json.currency` if `yes`.
+   - `confirm_supplier` + `yes`: set `staging.supplier_id = context_data.matched_supplier_id`. Create `restaurant_suppliers` link if not exists.
+   - `confirm_supplier` + `no`: prompt user to type a name → run `cmd_add_supplier` flow.
+   - `confirm_unit` + `yes`: update `items[idx].unit` in staging JSON.
+   - `confirm_currency` + `yes`: update `extracted_data_json.currency` + recalculate `currency_exp`.
 3. Set `handshake.answer = answer`, `handshake.resolved_at = now()`.
 4. Re-render upload review.
 
@@ -374,15 +445,23 @@ Called when user sends text while `active_staging_id` is set and no other patter
 ### 4d. Restaurant Context
 
 #### `cmd_switch_restaurant(db, user)`
-- List restaurants user is active member of.
+- List all restaurants the user is an active member of.
 - Numbered list stored in `user.context.numbered_items`.
-- User replies `#1` → `active_restaurant_id` updated in `user.context`.
+- User replies `#1` → set `user.context.active_restaurant_id`.
 
-**Context guard:** Every handler that touches restaurant data must check `user.context.active_restaurant_id`. If not set and user has exactly one restaurant → auto-set. If multiple and none active → prompt `/switch`.
+**Context guard:** Every handler that touches restaurant-scoped data checks `user.context.active_restaurant_id`. If not set and user has one restaurant → auto-set. If multiple and none active → prompt `/switch`.
 
 ---
 
 ## 5. LLM Contracts
+
+### Conversion Boundary Rule
+LLMs always speak in human-readable decimals. Our code owns the conversion:
+- **Inbound (LLM → our code):** Convert decimals to integer minor units immediately after validation.
+- **Outbound (our code → LLM):** Convert integer minor units back to decimals before sending.
+- **Storage (DB + staging JSON):** Always integers. No floats anywhere at rest.
+
+---
 
 ### Contract A — Intent Classifier
 **Purpose:** Resolve free-form text to an intent when no deterministic route matches.
@@ -416,11 +495,11 @@ Return only valid JSON. Do not explain.
   "entities": {
     "supplier_name": "string or null",
     "item_name": "string or null",
-    "price": "number or null",
+    "price": "decimal string or null",
     "unit": "string or null",
     "currency": "string or null"
   },
-  "confidence": 0.0
+  "confidence": 0.85
 }
 ```
 
@@ -428,7 +507,7 @@ Return only valid JSON. Do not explain.
 - `intent` must be one of the defined enum values.
 - `confidence` must be a float 0.0–1.0.
 - If confidence < 0.6: treat as `unknown`, send disambiguation.
-- Any extra keys in output: reject, treat as `unknown`.
+- Any extra keys: reject, treat as `unknown`.
 
 ---
 
@@ -437,12 +516,15 @@ Return only valid JSON. Do not explain.
 **Model:** Mid-tier, good at structured extraction (e.g. `gpt-4o`).
 **Called by:** `ocr_task` Celery worker.
 
+**LLM output uses decimals.** Our code converts to integer minor units immediately after validation (see Conversion Boundary Rule).
+
 **System prompt skeleton:**
 ```
 You are a data extraction assistant for supplier price lists.
 Extract all products and prices from the provided text.
 Return only valid JSON matching the schema exactly. Do not explain.
 If a field cannot be found, set it to null.
+All prices and quantities must be positive decimal numbers.
 ```
 
 **Input:**
@@ -452,53 +534,58 @@ If a field cannot be found, set it to null.
 }
 ```
 
-**Output schema (strict):**
+**LLM Output schema (decimal — converted by our code before storage):**
 ```json
 {
-  "supplier_name": "string or null",
-  "effective_date": "YYYY-MM-DD or null",
-  "currency": "SGD or null",
+  "supplier_name": "ABC Wholesalers",
+  "effective_date": "2025-01-15",
+  "currency": "SGD",
   "items": [
     {
-      "item_name": "string",
-      "sku": "string or null",
-      "unit": "string or null",
-      "unit_qty": "number or null",
-      "price": "number"
+      "item_name": "Tomato",
+      "sku": "TOM-001",
+      "unit": "kg",
+      "unit_qty": 1.0,
+      "price": 2.50
     }
   ]
 }
 ```
 
-**Validation rules:**
+**Validation rules (before conversion):**
 - `items` must be a non-empty array.
-- Each item must have `item_name` (non-empty string) and `price` (positive number).
+- Each item: `item_name` is non-empty string, `price` is positive number.
 - `effective_date` must parse as ISO date or be null.
-- `currency` must be 3-character string or null.
-- If validation fails: set `staging.status = 'error'`, notify user.
+- `currency` must be 3-char string or null.
+- If validation fails: `staging.status = 'error'`, notify user.
 
 ---
 
 ### Contract C — Correction Patch Generator
-**Purpose:** Convert a user's freeform correction into a RFC 6902 JSONPatch.
+**Purpose:** Convert a user's freeform correction into an RFC 6902 JSONPatch.
 **Model:** Cheap, fast (e.g. `gpt-4o-mini`).
 **Called by:** `handle_staging_text_edit`.
+
+**The LLM receives display-form decimals and returns decimal patch values.**
+Our code converts the patch values to integer minor units before applying to staging JSON.
 
 **System prompt skeleton:**
 ```
 You are a JSON patch generator for a price list editor.
 Given the current item and the user's correction, return a JSONPatch array.
 Only generate 'replace' operations on existing fields.
+All price/quantity values must be positive decimal numbers.
 Return only valid JSON. Do not explain.
 ```
 
-**Input:**
+**Input (display form — converted from integers for the LLM):**
 ```json
 {
   "item_index": 2,
   "current_item": {
-    "item_name": "tomato",
+    "item_name": "Tomato",
     "unit": "kg",
+    "unit_qty": 1.0,
     "price": 2.50,
     "currency": "SGD"
   },
@@ -506,18 +593,19 @@ Return only valid JSON. Do not explain.
 }
 ```
 
-**Output schema (strict):**
+**LLM Output (decimal — our code converts to integers before applying):**
 ```json
 [
   {"op": "replace", "path": "/items/2/price", "value": 2.80}
 ]
 ```
 
-**Validation rules (applied before patch is executed):**
+**Validation rules (applied before conversion and patch execution):**
 - Only `replace` operation allowed. Reject `add`, `remove`, `move`, `copy`.
-- Path must match pattern `/items/{n}/{field}` where `n` is an integer and `field` is one of: `item_name`, `unit`, `unit_qty`, `price`, `currency`, `sku`.
-- Value types must match field: `price` and `unit_qty` must be positive numbers.
-- Reject any patch that changes `item_index` out of bounds.
+- Path must match `/items/{n}/{field}` where `field` ∈ `{item_name, unit, unit_qty, price, currency, sku}`.
+- `price` and `unit_qty` values must be positive numbers.
+- Index `n` must be within bounds of `items` array.
+- After validation: convert `price` and `unit_qty` values to `price_minor/price_exp` and `unit_qty_minor/unit_qty_exp` before writing.
 
 ---
 
@@ -540,32 +628,34 @@ app/
 │       ├── telegram_messages.py
 │       ├── telegram_outgoing_messages.py
 │       ├── llm_calls.py
-│       ├── suppliers.py               ← NEW
-│       ├── supplier_price_lists.py    ← NEW
-│       ├── supplier_prices.py         ← NEW
-│       ├── file_processing_staging.py ← NEW
-│       └── handshake_requests.py      ← NEW
+│       ├── suppliers.py                ← NEW (global registry)
+│       ├── restaurant_suppliers.py     ← NEW (link table)
+│       ├── supplier_price_lists.py     ← NEW
+│       ├── supplier_prices.py          ← NEW (BIGINT prices)
+│       ├── file_processing_staging.py  ← NEW
+│       └── handshake_requests.py       ← NEW
 │
 ├── services/
 │   ├── user_service.py
 │   ├── restaurant_service.py
-│   ├── supplier_service.py            ← NEW
-│   ├── staging_service.py             ← NEW  (state machine for uploads)
-│   ├── price_service.py               ← NEW  (confirm staging → write prices)
-│   ├── context_service.py             ← NEW  (read/write user.context JSONB)
+│   ├── supplier_service.py             ← NEW (create, list, fuzzy match, link)
+│   ├── staging_service.py              ← NEW (state machine for uploads)
+│   ├── price_service.py                ← NEW (confirm staging → write prices)
+│   ├── context_service.py              ← NEW (read/write user.context JSONB)
+│   ├── money.py                        ← NEW (decimal↔integer conversion helpers)
 │   ├── entity_resolver.py
 │   └── telemetry.py
 │
-├── llm/                               ← NEW (LLM contracts)
-│   ├── intent.py                      ← Contract A
-│   ├── parser.py                      ← Contract B
-│   └── patcher.py                     ← Contract C
+├── llm/                                ← NEW
+│   ├── intent.py                       ← Contract A
+│   ├── parser.py                       ← Contract B
+│   └── patcher.py                      ← Contract C
 │
 ├── schemas/
 │   ├── user.py
 │   ├── restaurant.py
-│   ├── supplier.py                    ← NEW
-│   └── staging.py                     ← NEW
+│   ├── supplier.py                     ← NEW
+│   └── staging.py                      ← NEW
 │
 ├── api/
 │   └── v1/routes/
@@ -574,16 +664,16 @@ app/
 │       └── telegram.py
 │
 ├── telegram/
-│   ├── router.py                      ← NEW (6-priority router)
-│   ├── handlers/                      ← NEW
-│   │   ├── reset.py                   ← Priority 1
-│   │   ├── buttons.py                 ← Priority 2
-│   │   ├── commands.py                ← Priority 3
-│   │   ├── files.py                   ← Priority 4
-│   │   ├── patterns.py                ← Priority 5
-│   │   └── llm_fallback.py            ← Priority 6
-│   ├── keyboards.py                   ← NEW (inline keyboard builders)
-│   ├── renderer.py                    ← NEW (message formatters)
+│   ├── router.py                       ← NEW (6-priority router)
+│   ├── handlers/                       ← NEW
+│   │   ├── reset.py                    ← Priority 1
+│   │   ├── buttons.py                  ← Priority 2
+│   │   ├── commands.py                 ← Priority 3
+│   │   ├── files.py                    ← Priority 4
+│   │   ├── patterns.py                 ← Priority 5
+│   │   └── llm_fallback.py             ← Priority 6
+│   ├── keyboards.py                    ← NEW (inline keyboard builders)
+│   ├── renderer.py                     ← NEW (message formatters; int→display)
 │   ├── bot_api.py
 │   ├── ack_handler.py
 │   ├── ingest.py
@@ -591,8 +681,8 @@ app/
 │
 └── workers/
     ├── celery_app.py
-    ├── telegram_tasks.py              ← calls router.py
-    ├── ocr_tasks.py                   ← NEW (download + parse + stage)
+    ├── telegram_tasks.py               ← calls router.py
+    ├── ocr_tasks.py                    ← NEW (download + parse + convert + stage)
     ├── celery_types.py
     ├── db.py
     └── utils.py
@@ -602,21 +692,20 @@ app/
 
 ## 7. Build Order
 
-Build in this sequence to avoid blocking dependencies:
-
-1. **DB models + migration** — all 5 new tables + restaurant location columns.
-2. **`context_service.py`** — `get_context()`, `set_context()`, `clear_context()` helpers. Everything else depends on this.
-3. **`supplier_service.py`** — create, list, fuzzy match.
-4. **`router.py`** — skeleton with all 6 priorities, each dispatching to a handler stub.
-5. **`handlers/reset.py`** — simplest handler, gets routing working end-to-end.
-6. **`handlers/commands.py`** — `/list suppliers`, `/add supplier`, `/uploads`, `/switch`.
-7. **`keyboards.py` + `renderer.py`** — shared formatting used by all handlers.
-8. **`handlers/buttons.py`** — `rev_u`, `del_u`, `set_sup`, `list_p`.
-9. **`staging_service.py`** + **`handlers/files.py`** — file upload flow without OCR (stub the parse step).
-10. **`llm/parser.py`** + **`workers/ocr_tasks.py`** — plug in real parsing.
-11. **`llm/patcher.py`** + **`handlers/buttons.py`** `ed_row` — edit flow.
-12. **`btn_confirm_upload`** + **`price_service.py`** — final write to `supplier_price_lists` + `supplier_prices`.
-13. **`handlers/llm_fallback.py`** + **`llm/intent.py`** — LLM router last (everything else must be solid first).
+1. **DB models + migration** — 6 new tables + restaurant location columns.
+2. **`services/money.py`** — `to_minor(decimal, exp)`, `to_display(minor, exp)`, `infer_exp(currency)`. Everything touching prices depends on this.
+3. **`services/context_service.py`** — `get_context()`, `set_context()`, `clear_context()`.
+4. **`services/supplier_service.py`** — create (global), link to restaurant, list, fuzzy match.
+5. **`telegram/router.py`** — skeleton dispatching to stubs.
+6. **`telegram/handlers/reset.py`** — gets end-to-end routing working.
+7. **`telegram/handlers/commands.py`** — `/list suppliers`, `/add supplier`, `/uploads`, `/switch`.
+8. **`telegram/keyboards.py` + `telegram/renderer.py`** — shared formatting used by all handlers.
+9. **`telegram/handlers/buttons.py`** — `rev_u`, `del_u`, `set_sup`, `new_sup`, `list_p`.
+10. **`services/staging_service.py`** + **`telegram/handlers/files.py`** — upload flow with stubbed OCR.
+11. **`llm/parser.py`** + **`workers/ocr_tasks.py`** — real parsing + decimal→integer conversion.
+12. **`llm/patcher.py`** + `ed_row` in buttons — edit flow with conversion on apply.
+13. **`services/price_service.py`** + `conf_u` — final write to `supplier_price_lists` + `supplier_prices`.
+14. **`telegram/handlers/llm_fallback.py`** + **`llm/intent.py`** — LLM router last.
 
 ---
 
@@ -624,13 +713,15 @@ Build in this sequence to avoid blocking dependencies:
 
 | Scenario | Handling |
 |----------|----------|
-| OCR/parse fails | `staging.status = 'error'`, message user with "Couldn't parse that file. Try a clearer photo or PDF." |
-| LLM output fails schema validation | Log, treat as `unknown` intent, send disambiguation |
-| Button references deleted ID | Answer callback_query with alert text, no crash |
+| OCR/parse fails | `staging.status='error'`, message: "Couldn't parse that file. Try a clearer photo or PDF." |
+| LLM output fails schema validation | Log, treat as `unknown` or `error`, never write bad data |
+| Decimal→integer conversion fails | Treat as parse error, do not write to staging |
+| Button references deleted ID | Answer callback with alert: "This item no longer exists." |
 | Confirm without supplier set | Block: "Please identify the supplier first." with button list |
-| Patch out of bounds | Reject patch, reply "I couldn't apply that edit. Please try again." |
+| Supplier not linked to restaurant | Block confirm, create link first (via handshake or explicit action) |
+| Patch out of bounds / wrong type | Reject patch, reply: "I couldn't apply that edit. Please try again." |
 | No active restaurant | Prompt `/switch` before any restaurant-scoped action |
-| Duplicate supplier name (similarity > 0.85) | Prompt: "Did you mean {existing}? [Yes / No, create new]" |
+| Duplicate supplier (similarity > 0.85) | Prompt: "Did you mean {existing}? [Link / Create new]" |
 
 ---
 
@@ -638,7 +729,7 @@ Build in this sequence to avoid blocking dependencies:
 
 - Purchase orders
 - Inventory tracking
-- Multi-outlet / brand grouping
+- Multi-outlet brand grouping
 - Analytics or reporting
-- Any API routes for supplier/price data (Telegram only)
-- Price comparison across suppliers
+- REST API routes for supplier/price data (Telegram only)
+- Cross-supplier price comparison
