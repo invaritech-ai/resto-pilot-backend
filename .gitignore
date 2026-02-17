@@ -14,3 +14,6 @@ wheels/
 
 
 ocr_*
+test_data
+pdf_ocr*
+pdf_table*
