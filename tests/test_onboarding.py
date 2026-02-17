@@ -79,6 +79,15 @@ class TestNeedsOnboarding:
         user = make_user(full_name="")
         assert needs_onboarding(user) is False
 
+    def test_true_when_step_still_in_context(self):
+        """Name saved but onboarding_step still set means step 3 is pending."""
+        user = make_user(full_name="Ali", context={"onboarding_step": "awaiting_restaurant"})
+        assert needs_onboarding(user) is True
+
+    def test_false_when_name_set_and_no_step(self):
+        user = make_user(full_name="Ali", context={})
+        assert needs_onboarding(user) is False
+
 
 # ---------------------------------------------------------------------------
 # Step 1: No name yet — ask for name

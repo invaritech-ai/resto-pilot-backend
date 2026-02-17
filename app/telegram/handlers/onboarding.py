@@ -20,7 +20,10 @@ from app.telegram.bot_api import send_message
 
 
 def needs_onboarding(user: User) -> bool:
-    return user.full_name is None
+    if user.full_name is None:
+        return True
+    ctx = user.context or {}
+    return "onboarding_step" in ctx
 
 
 def handle(
