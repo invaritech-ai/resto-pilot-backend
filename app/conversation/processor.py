@@ -877,44 +877,7 @@ def process_message_instant(
                         lines.append(f"{label}) {text}")
         final_text = "\n".join([ln for ln in lines if ln.strip()]).strip()
 
-        # Optional ClarifierLLM (phrasing only). If it fails, fall back to deterministic text above.
-        clarifier_llm_call_id: uuid.UUID | None = None
-        if bool(getattr(settings, "clarification_model", "").strip()):
-            try:
-                from app.ai.deterministic.clarifier import clarify_text
-
-                llm_text, clarifier_telemetry = clarify_text(
-                    settings=settings,
-                    clarify_kind=validated.clarify_kind,
-                    question=question or "Please clarify what you want to do.",
-                    choices=[
-                        {"label": str(c.label), "text": str(c.text)}
-                        for c in (validated.choices or [])
-                        if c.label and c.text
-                    ]
-                    if validated.choices
-                    else None,
-                    user_message=message_text or "",
-                    recent_turns=history,
-                    context=context.to_dict(),
-                    available_tools=tool_catalog,
-                )
-                if clarifier_telemetry is not None:
-                    clarifier_llm_call_id = record_llm_call(
-                        db=db,
-                        session_id=session_id,
-                        chat_id=chat_id,
-                        purpose="clarifier",
-                        model=str(clarifier_telemetry.get("model") or ""),
-                        openrouter_generation_id=clarifier_telemetry.get("generation_id"),
-                        usage=clarifier_telemetry.get("usage") or {},
-                        latency_ms=clarifier_telemetry.get("latency_ms"),
-                    )
-                    db.commit()
-                if isinstance(llm_text, str) and llm_text.strip():
-                    final_text = llm_text.strip()
-            except Exception:
-                logger.exception("deterministic_clarifier_failed")
+        # Use deterministic clarification text (no LLM)
 
         user.last_interaction_at = dt.datetime.now(dt.UTC)
         db.add(
@@ -926,7 +889,6 @@ def process_message_instant(
                     {
                         "clarify_kind": validated.clarify_kind,
                         "llm_call_id": str(planner_llm_call_id) if planner_llm_call_id else None,
-                        "clarifier_llm_call_id": str(clarifier_llm_call_id) if clarifier_llm_call_id else None,
                     },
                     ensure_ascii=False,
                 ),
