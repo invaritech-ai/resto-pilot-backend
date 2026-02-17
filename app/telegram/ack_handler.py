@@ -62,7 +62,7 @@ def send_instant_ack(
         or message.get("audio")
     )
 
-    if not (len(message_text) > 10 or has_file):
+    if not (message_text or has_file):
         return None
 
     now = dt.datetime.now(dt.UTC)
