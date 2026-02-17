@@ -11,14 +11,12 @@ class RestaurantRead(BaseModel):
     id: UUID
     name: str
     model_config = ConfigDict(from_attributes=True)
-    # class Config:
-    #     from_attributes = True
 
 
 class RestaurantMembershipRead(BaseModel):
     restaurant: RestaurantRead
-    role: str
-    status: str
+    is_owner: bool
+    is_active: bool
 
 
 class RestaurantMemberRead(BaseModel):
@@ -26,5 +24,5 @@ class RestaurantMemberRead(BaseModel):
     telegram_id: int
     full_name: str | None
     username: str | None
-    role: str
-    status: str
+    is_owner: bool
+    is_active: bool

@@ -1,0 +1,15 @@
+services:
+    api:
+        build: .
+        command: python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+        ports:
+            - "${API_HOST_PORT:-8000}:8000"
+        environment:
+            HOST: "0.0.0.0"
+            PORT: "8000"
+
+    worker:
+        build: .
+        command: python -m celery -A app.workers.celery_app.celery_app worker -l info --concurrency ${CELERY_CONCURRENCY:-4}
+        environment:
+            CELERY_CONCURRENCY: ${CELERY_CONCURRENCY:-4}
