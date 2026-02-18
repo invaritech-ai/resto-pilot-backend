@@ -246,6 +246,20 @@ def handle_telegram_update(update: dict) -> None:
 
                     def _handle_llm(update: dict, ctx: RouteContext) -> None:
                         """LLM fallback — intercepts item-edit text input if editing context is active."""
+                        # Check for active supplier-input flow before falling through.
+                        edit_ctx = ctx_svc.get_fields(ctx.user)
+                        if edit_ctx.get("supplier_input_staging_id") is not None:
+                            from app.telegram.handlers.buttons import handle_supplier_name_input
+
+                            handle_supplier_name_input(
+                                update,
+                                ctx.user,
+                                ctx.db,
+                                ctx_svc,
+                                settings,
+                            )
+                            return
+
                         # Check for active item-edit flow before falling through to LLM stub
                         edit_ctx = ctx_svc.get_fields(ctx.user)
                         if (

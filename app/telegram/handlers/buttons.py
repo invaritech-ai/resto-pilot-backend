@@ -21,6 +21,9 @@ Implemented actions:
   new_sup:{staging_hex}
       Create new supplier from extracted name → link → update review message
 
+  type_sup:{staging_hex}
+      Prompt for typed supplier name → resolve or create via next text input
+
   use_match:{staging_hex}:{idx}:{item_hex}
       Accept fuzzy match for item[idx] → update resolution hub
 
@@ -111,6 +114,7 @@ def handle(
         "del_u":     _handle_del_u,
         "set_sup":   _handle_set_sup,
         "new_sup":   _handle_new_sup,
+        "type_sup":  _handle_type_sup,
         "use_match": _handle_use_match,
         "mk_item":   _handle_mk_item,
         "skip_item": _handle_skip_item,
@@ -188,7 +192,7 @@ def _handle_doc_type(*, params, user, db, ctx_svc, settings, callback_id, chat_i
     # Dispatch Celery OCR task
     from app.workers.ocr_tasks import process_file_task
 
-    process_file_task.delay(staging_hex, doc_type, chat_id)
+    process_file_task.delay(staging_hex, doc_type, chat_id, message_id)
 
     label = "invoice" if doc_type == "invoice" else "price list"
     answer_callback_query(callback_id=callback_id, text="", settings=settings)
@@ -479,20 +483,14 @@ def _handle_set_sup(*, params, user, db, ctx_svc, settings, callback_id, chat_id
 
         extracted = staging.extracted_data_json or {}
         supplier_name = (extracted.get("supplier") or "").strip()
-        if not supplier_name:
-            answer_callback_query(
-                callback_id=callback_id,
-                text="Supplier options expired. Please retry.",
-                show_alert=True,
-                settings=settings,
-            )
-            return
 
         svc = SupplierService(db)
-        matches = svc.fuzzy_search_for_restaurant(
+        from app.workers.ocr_tasks import _supplier_candidates_for_name
+
+        matches = _supplier_candidates_for_name(
+            svc=svc,
             name=supplier_name,
             restaurant_id=staging.restaurant_id,
-            threshold=0.5,
         )
         if rank >= len(matches):
             answer_callback_query(
@@ -572,7 +570,23 @@ def _handle_new_sup(*, params, user, db, ctx_svc, settings, callback_id, chat_id
     extracted = staging.extracted_data_json or {}
     supplier_name = (extracted.get("supplier") or "").strip()
     if not supplier_name:
-        supplier_name = "New Supplier"
+        ctx_svc.set_fields(
+            user,
+            supplier_input_staging_id=str(staging_id),
+            supplier_input_mode="create",
+        )
+        db.commit()
+        send_message(
+            chat_id=chat_id,
+            text="Type the supplier name to create and link it to this upload.",
+            settings=settings,
+        )
+        answer_callback_query(
+            callback_id=callback_id,
+            text="Enter supplier name",
+            settings=settings,
+        )
+        return
 
     # Create supplier + link
     svc = SupplierService(db)
@@ -596,6 +610,47 @@ def _handle_new_sup(*, params, user, db, ctx_svc, settings, callback_id, chat_id
     answer_callback_query(
         callback_id=callback_id, text=f"Supplier created: {supplier.name}", settings=settings
     )
+
+
+def _handle_type_sup(*, params, user, db, ctx_svc, settings, callback_id, chat_id, message_id):
+    """Prompt user to type supplier name for this staging review."""
+    if not params:
+        answer_callback_query(callback_id=callback_id, text="Invalid.", settings=settings)
+        return
+
+    try:
+        staging_id = hex_to_uuid(params[0])
+    except ValueError:
+        answer_callback_query(callback_id=callback_id, text="Invalid ID.", settings=settings)
+        return
+
+    staging = db.get(FileProcessingStaging, staging_id)
+    if staging is None:
+        answer_callback_query(callback_id=callback_id, text="Upload not found.", settings=settings)
+        return
+
+    if staging.status != "pending_review":
+        answer_callback_query(
+            callback_id=callback_id,
+            text="This upload is no longer awaiting review.",
+            show_alert=True,
+            settings=settings,
+        )
+        return
+
+    ctx_svc.set_fields(
+        user,
+        supplier_input_staging_id=str(staging_id),
+        supplier_input_mode="resolve",
+    )
+    db.commit()
+
+    send_message(
+        chat_id=chat_id,
+        text="Type the supplier name. I'll match existing suppliers first, then let you create a new one.",
+        settings=settings,
+    )
+    answer_callback_query(callback_id=callback_id, text="Enter supplier name", settings=settings)
 
 
 # ---------------------------------------------------------------------------
@@ -1243,6 +1298,185 @@ def _edit_supplier_in_review(
         text=text,
         settings=settings,
         reply_markup=keyboard,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Supplier text-input handler
+# ---------------------------------------------------------------------------
+
+
+def _parse_message_id(value: object) -> int | None:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return None
+    return None
+
+
+def handle_supplier_name_input(
+    update: dict,
+    user: User,
+    db: Session,
+    ctx_svc: ContextService,
+    settings: Settings,
+) -> None:
+    """Handle free-text supplier input after `type_sup` / `new_sup` prompt."""
+    msg = update.get("message", {})
+    text = (msg.get("text", "") or "").strip()
+    chat_id = user.chat_id
+
+    fields = ctx_svc.get_fields(user)
+    staging_id_raw = fields.get("supplier_input_staging_id")
+    mode = str(fields.get("supplier_input_mode") or "resolve")
+
+    if not staging_id_raw:
+        return
+    if not text:
+        send_message(chat_id=chat_id, text="Please type a supplier name.", settings=settings)
+        return
+
+    try:
+        staging_id = _uuid_mod.UUID(str(staging_id_raw))
+    except ValueError:
+        ctx_svc.set_fields(
+            user,
+            supplier_input_staging_id=None,
+            supplier_input_mode=None,
+        )
+        db.commit()
+        return
+
+    staging = db.get(FileProcessingStaging, staging_id)
+    if staging is None or staging.status != "pending_review":
+        ctx_svc.set_fields(
+            user,
+            supplier_input_staging_id=None,
+            supplier_input_mode=None,
+        )
+        db.commit()
+        send_message(
+            chat_id=chat_id,
+            text="This upload is no longer awaiting review.",
+            settings=settings,
+        )
+        return
+
+    extracted = dict(staging.extracted_data_json or {})
+    extracted["supplier"] = text
+    staging.extracted_data_json = extracted
+
+    review_message_id = _parse_message_id(fields.get("review_message_id"))
+
+    if mode == "create":
+        svc = SupplierService(db)
+        supplier = svc.create(
+            name=text,
+            user_id=user.id,
+            restaurant_id=staging.restaurant_id,
+        )
+        staging.supplier_id = supplier.id
+        ctx_svc.set_fields(
+            user,
+            supplier_input_staging_id=None,
+            supplier_input_mode=None,
+        )
+        db.commit()
+
+        if review_message_id is not None:
+            _edit_supplier_in_review(
+                chat_id=chat_id,
+                message_id=review_message_id,
+                staging=staging,
+                supplier=supplier,
+                settings=settings,
+            )
+        send_message(
+            chat_id=chat_id,
+            text=f"✅ Supplier created: {supplier.name}",
+            settings=settings,
+        )
+        return
+
+    from app.workers.ocr_tasks import _build_review_keyboard, _build_review_text, _resolve_supplier
+
+    supplier, sup_buttons = _resolve_supplier(
+        name=text,
+        restaurant_id=staging.restaurant_id,
+        staging_id=staging.id,
+        db=db,
+    )
+    if supplier is not None:
+        staging.supplier_id = supplier.id
+        ctx_svc.set_fields(
+            user,
+            supplier_input_staging_id=None,
+            supplier_input_mode=None,
+        )
+        db.commit()
+
+        if review_message_id is not None:
+            _edit_supplier_in_review(
+                chat_id=chat_id,
+                message_id=review_message_id,
+                staging=staging,
+                supplier=supplier,
+                settings=settings,
+            )
+        send_message(
+            chat_id=chat_id,
+            text=f"✅ Supplier set: {supplier.name}",
+            settings=settings,
+        )
+        return
+
+    ctx_svc.set_fields(
+        user,
+        supplier_input_staging_id=None,
+        supplier_input_mode=None,
+    )
+    db.commit()
+
+    review_text = _build_review_text(
+        staging,
+        extracted,
+        None,
+        staging.document_type or "invoice",
+        page=0,
+    )
+    review_keyboard = _build_review_keyboard(
+        staging,
+        extracted,
+        sup_buttons=sup_buttons,
+        page=0,
+    )
+
+    if review_message_id is not None:
+        edit_message_text(
+            chat_id=chat_id,
+            message_id=review_message_id,
+            text=review_text,
+            settings=settings,
+            reply_markup=review_keyboard,
+        )
+    else:
+        new_msg_id = send_message_with_keyboard(
+            chat_id=chat_id,
+            text=review_text,
+            reply_markup=review_keyboard,
+            settings=settings,
+        )
+        if new_msg_id:
+            ctx_svc.set_fields(user, review_message_id=new_msg_id)
+            db.commit()
+
+    send_message(
+        chat_id=chat_id,
+        text=f'Got it. I looked up "{text}" - pick a supplier or create a new one.',
+        settings=settings,
     )
 
 

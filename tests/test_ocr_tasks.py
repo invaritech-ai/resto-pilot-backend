@@ -328,7 +328,14 @@ class TestLlmTelemetry:
         mock_get_bytes.return_value = b"PDF bytes"
         mock_send.return_value = 42
 
-        def fake_extract(file_bytes, mime, document_type, settings, on_llm_call=None):
+        def fake_extract(
+            file_bytes,
+            mime,
+            document_type,
+            settings,
+            on_llm_call=None,
+            on_progress=None,
+        ):
             assert on_llm_call is not None
             on_llm_call(
                 {
@@ -617,6 +624,63 @@ class TestPriceListTask:
 
 
 # ---------------------------------------------------------------------------
+# PDF extraction: supplier header fallback
+# ---------------------------------------------------------------------------
+
+
+class _DummyPdfPage:
+    page_number = 1
+
+    def extract_text(self):
+        return "Invoice text body"
+
+
+class _DummyPdfDoc:
+    pages = [_DummyPdfPage()]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+class TestPdfSupplierHeaderFallback:
+    def test_uses_first_page_vision_when_supplier_missing(self):
+        from app.workers.ocr_tasks import _extract_pdf
+
+        settings = _make_settings()
+        initial_parse = {
+            "supplier": None,
+            "line_items": [{"name": "A"}, {"name": "B"}, {"name": "C"}, {"name": "D"}, {"name": "E"}],
+        }
+
+        fake_pdfplumber = MagicMock()
+        fake_pdfplumber.open.return_value = _DummyPdfDoc()
+        fake_camelot = MagicMock()
+        fake_camelot.read_pdf.return_value = []
+
+        with (
+            patch.dict(
+                "sys.modules",
+                {
+                    "pdfplumber": fake_pdfplumber,
+                    "camelot": fake_camelot,
+                },
+            ),
+            patch("app.workers.ocr_tasks.parse_invoice", return_value=initial_parse),
+            patch(
+                "app.workers.ocr_tasks._extract_pdf_header_vision",
+                return_value={"supplier": "Header Vision Co"},
+            ) as mock_header,
+        ):
+            result = _extract_pdf(b"%PDF-1.4", "invoice", settings)
+
+        mock_header.assert_called_once()
+        assert result.get("supplier") == "Header Vision Co"
+
+
+# ---------------------------------------------------------------------------
 # _resolve_supplier unit tests
 # ---------------------------------------------------------------------------
 
@@ -627,6 +691,7 @@ class TestResolveSupplier:
 
         db = MagicMock()
         with patch("app.workers.ocr_tasks.SupplierService") as MockSvc:
+            MockSvc.return_value.list_for_restaurant.return_value = []
             supplier, buttons = _resolve_supplier(
                 name=None,
                 restaurant_id=RESTAURANT_ID,
@@ -637,9 +702,10 @@ class TestResolveSupplier:
         assert supplier is None
         assert buttons is not None
         assert len(buttons) >= 1
-        # Should have "Add Supplier" button somewhere
+        # Should offer type + create even when no supplier name was extracted.
         all_texts = [b.get("text", "") for b in buttons]
-        assert any("Add" in t or "Supplier" in t for t in all_texts)
+        assert any("Type" in t for t in all_texts)
+        assert any("Add" in t or "Create" in t for t in all_texts)
 
     def test_high_score_returns_auto_match(self):
         from app.workers.ocr_tasks import _resolve_supplier

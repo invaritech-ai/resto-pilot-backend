@@ -89,6 +89,11 @@ def cb_new_supplier(staging_id: uuid.UUID) -> str:
     return f"new_sup:{uuid_to_hex(staging_id)}"
 
 
+def cb_type_supplier(staging_id: uuid.UUID) -> str:
+    """Type supplier name callback: type_sup:{staging_hex}"""
+    return _ensure_callback_limit(f"type_sup:{uuid_to_hex(staging_id)}")
+
+
 def cb_rev_page(staging_id: uuid.UUID, page: int) -> str:
     """Review page navigation: rev_p:{staging_hex}:{page}"""
     return _ensure_callback_limit(f"rev_p:{uuid_to_hex(staging_id)}:{page}")

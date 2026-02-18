@@ -1,12 +1,12 @@
 """
 Celery task: OCR + LLM extraction for uploaded files.
 
-process_file_task(staging_id_hex, document_type, chat_id):
+process_file_task(staging_id_hex, document_type, chat_id, progress_message_id=None):
   1. Download file from Telegram
   2. PDF → pdfplumber + camelot combined text → LLM parse
             < 5 items → pdf2image vision fallback
      Image → base64 → vision LLM parse
-  3. Supplier gate: ≥0.8 auto-match | 0.5–0.8 suggest | <0.5 new
+  3. Supplier gate: auto-match when confident; else choose existing/type/create
   4. staging.status = pending_review
   5. Send review message
   6. Store review_message_id in user context
@@ -19,7 +19,9 @@ import base64
 import io
 import logging
 import math
+import time
 import uuid
+from collections.abc import Callable
 
 from app.core.config import get_settings
 from app.db.models.file_processing_staging import FileProcessingStaging
@@ -33,6 +35,7 @@ from app.telegram.bot_api import (
     TelegramFileExpiredError,
     bind_current_session,
     bind_outgoing_db_logger,
+    edit_message_text,
     get_file_bytes,
     send_message,
     send_message_with_keyboard,
@@ -45,6 +48,7 @@ from app.telegram.keyboards import (
     cb_pick_currency,
     cb_rev_page,
     cb_set_supplier,
+    cb_type_supplier,
     make_button,
 )
 from app.workers.celery_app import celery_app
@@ -59,14 +63,20 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 @celery_app.task(name="process_file_task")
-def process_file_task(staging_id_hex: str, document_type: str, chat_id: int) -> None:
+def process_file_task(
+    staging_id_hex: str,
+    document_type: str,
+    chat_id: int,
+    progress_message_id: int | None = None,
+) -> None:
     """Download, OCR, parse, and send review message for an uploaded file."""
     task_id = _get_task_id()
     settings = get_settings()
+    doc_label = "invoice" if document_type == "invoice" else "price list"
 
     logger.info(
-        "process_file_task start task_id=%s staging=%s doc_type=%s chat_id=%s",
-        task_id, staging_id_hex, document_type, chat_id,
+        "process_file_task start task_id=%s staging=%s doc_type=%s chat_id=%s progress_msg=%s",
+        task_id, staging_id_hex, document_type, chat_id, progress_message_id,
     )
 
     try:
@@ -83,6 +93,71 @@ def process_file_task(staging_id_hex: str, document_type: str, chat_id: int) -> 
 
         staging_svc = StagingService(db)
         session_id = staging.session_id
+        started_at = time.monotonic()
+        last_progress_emit = 0.0
+
+        def _fmt_duration(seconds: float) -> str:
+            total = max(0, int(seconds))
+            mins, secs = divmod(total, 60)
+            hours, mins = divmod(mins, 60)
+            if hours > 0:
+                return f"{hours}h {mins}m {secs}s"
+            if mins > 0:
+                return f"{mins}m {secs}s"
+            return f"{secs}s"
+
+        def _emit_progress(
+            *,
+            step: str,
+            detail: str,
+            current: int | None = None,
+            total: int | None = None,
+            force: bool = False,
+        ) -> None:
+            nonlocal last_progress_emit
+            if progress_message_id is None:
+                return
+
+            now = time.monotonic()
+            if (
+                not force
+                and now - last_progress_emit < 1.5
+                and current is not None
+                and total is not None
+                and current < total
+            ):
+                return
+
+            elapsed = now - started_at
+            lines = [
+                f"⏳ Processing your {doc_label}",
+                "",
+                f"Step: {step}",
+                f"Status: {detail}",
+                f"Elapsed: {_fmt_duration(elapsed)}",
+            ]
+
+            if current is not None and total is not None and total > 0:
+                lines.append(f"Progress: {current}/{total}")
+                if current > 0 and current < total:
+                    eta = (elapsed / current) * (total - current)
+                    lines.append(f"ETA: ~{_fmt_duration(eta)}")
+
+            try:
+                ok = edit_message_text(
+                    chat_id=chat_id,
+                    message_id=progress_message_id,
+                    text="\n".join(lines),
+                    settings=settings,
+                )
+                if ok:
+                    last_progress_emit = now
+            except Exception:
+                logger.exception(
+                    "progress_update_failed staging=%s progress_msg=%s",
+                    staging_id,
+                    progress_message_id,
+                )
 
         def _outgoing_db_logger(
             out_chat_id: int,
@@ -140,9 +215,34 @@ def process_file_task(staging_id_hex: str, document_type: str, chat_id: int) -> 
                     session_id,
                 )
 
+        def _on_progress(meta: dict[str, object]) -> None:
+            step_raw = meta.get("step")
+            detail_raw = meta.get("detail")
+            if not isinstance(step_raw, str) or not step_raw:
+                return
+            detail = str(detail_raw or "Working...")
+            current = meta.get("current")
+            total = meta.get("total")
+            current_int = int(current) if isinstance(current, int) else None
+            total_int = int(total) if isinstance(total, int) else None
+            force_raw = meta.get("force")
+            force = bool(force_raw) if isinstance(force_raw, bool) else False
+            _emit_progress(
+                step=step_raw,
+                detail=detail,
+                current=current_int,
+                total=total_int,
+                force=force,
+            )
+
         with bind_current_session(session_id), bind_outgoing_db_logger(_outgoing_db_logger):
             try:
                 # 1. Download file bytes
+                _emit_progress(
+                    step="Fetching file",
+                    detail="Downloading your upload from Telegram...",
+                    force=True,
+                )
                 file_bytes = get_file_bytes(file_id=staging.file_id, settings=settings)
 
                 # 2. Extract structured data
@@ -153,12 +253,18 @@ def process_file_task(staging_id_hex: str, document_type: str, chat_id: int) -> 
                     document_type,
                     settings,
                     on_llm_call=_on_llm_call,
+                    on_progress=_on_progress,
                 )
 
                 if not extracted.get("line_items"):
                     raise ParseError("No line items could be extracted from this document")
 
                 # 3. Supplier gate
+                _emit_progress(
+                    step="Matching supplier",
+                    detail="Checking your supplier list for the best match...",
+                    force=True,
+                )
                 supplier, sup_buttons = _resolve_supplier(
                     name=extracted.get("supplier"),
                     restaurant_id=staging.restaurant_id,
@@ -174,6 +280,11 @@ def process_file_task(staging_id_hex: str, document_type: str, chat_id: int) -> 
                 staging_svc.set_extracted_data(staging_id, extracted)
 
                 # 5. Build + send review message
+                _emit_progress(
+                    step="Preparing review",
+                    detail="Finalizing extracted items and actions...",
+                    force=True,
+                )
                 text = _build_review_text(staging, extracted, supplier, document_type)
                 keyboard = _build_review_keyboard(staging, extracted, sup_buttons)
                 msg_id = _send_with_keyboard(
@@ -237,6 +348,7 @@ def _extract(
     document_type: str,
     settings,
     on_llm_call=None,
+    on_progress: Callable[[dict[str, object]], None] | None = None,
 ) -> dict:
     """Route to PDF or image extraction based on mime type."""
     is_pdf = "pdf" in mime.lower()
@@ -246,19 +358,36 @@ def _extract(
             document_type,
             settings,
             on_llm_call=on_llm_call,
+            on_progress=on_progress,
         )
     return _extract_image(
         file_bytes,
         document_type,
         settings,
         on_llm_call=on_llm_call,
+        on_progress=on_progress,
     )
 
 
-def _extract_pdf(file_bytes: bytes, document_type: str, settings, on_llm_call=None) -> dict:
+def _extract_pdf(
+    file_bytes: bytes,
+    document_type: str,
+    settings,
+    on_llm_call=None,
+    on_progress: Callable[[dict[str, object]], None] | None = None,
+) -> dict:
     """PDF: pdfplumber full text + camelot tables → combined LLM input.
     If < 5 items extracted, fall back to vision via pdf2image.
     """
+    if on_progress is not None:
+        on_progress(
+            {
+                "step": "Reading document",
+                "detail": "Extracting text and tables from all pages...",
+                "force": True,
+            }
+        )
+
     text_parts: list[str] = []
     table_parts: list[str] = []
 
@@ -307,7 +436,40 @@ def _extract_pdf(file_bytes: bytes, document_type: str, settings, on_llm_call=No
     combined = "\n\n".join(combined_parts)
 
     parse_fn = parse_invoice if document_type == "invoice" else parse_price_list
+    if on_progress is not None:
+        on_progress(
+            {
+                "step": "AI structuring",
+                "detail": "Converting extracted text into structured items...",
+                "force": True,
+            }
+        )
     result = parse_fn(settings, text=combined, on_llm_call=on_llm_call)
+
+    if not (result.get("supplier") or "").strip():
+        if on_progress is not None:
+            on_progress(
+                {
+                    "step": "Supplier detection",
+                    "detail": "Checking first page header to detect supplier...",
+                    "force": True,
+                }
+            )
+        header = _extract_pdf_header_vision(
+            file_bytes,
+            document_type,
+            settings,
+            on_llm_call=on_llm_call,
+        )
+        if header:
+            for field in (
+                "supplier",
+                "supplier_contact_name",
+                "supplier_phone",
+                "supplier_email",
+            ):
+                if not result.get(field) and header.get(field):
+                    result[field] = header[field]
 
     # Vision fallback if < 5 items
     if len(result.get("line_items", [])) < 5:
@@ -315,12 +477,21 @@ def _extract_pdf(file_bytes: bytes, document_type: str, settings, on_llm_call=No
             "pdf: only %d items from text path, trying vision fallback",
             len(result.get("line_items", [])),
         )
+        if on_progress is not None:
+            on_progress(
+                {
+                    "step": "Deep scan",
+                    "detail": "Running detailed page-by-page AI scan for missing items...",
+                    "force": True,
+                }
+            )
         try:
             vision_result = _extract_pdf_vision(
                 file_bytes,
                 document_type,
                 settings,
                 on_llm_call=on_llm_call,
+                on_progress=on_progress,
             )
             if len(vision_result.get("line_items", [])) > len(result.get("line_items", [])):
                 logger.info("pdf: vision fallback produced more items, using it")
@@ -341,11 +512,58 @@ def _resize_for_ocr(img, max_side: int = 4000):
     return img.resize((int(w * scale), int(h * scale)), PILImage.Resampling.LANCZOS)
 
 
+def _extract_pdf_header_vision(
+    file_bytes: bytes,
+    document_type: str,
+    settings,
+    on_llm_call=None,
+) -> dict | None:
+    """Run a lightweight first-page vision pass to recover missing supplier header."""
+    try:
+        from pdf2image import convert_from_bytes
+    except ImportError:
+        return None
+
+    try:
+        pages = convert_from_bytes(file_bytes, dpi=150, first_page=1, last_page=1)
+    except Exception as exc:
+        logger.warning("pdf_header_vision_convert_failed: %s", exc)
+        return None
+
+    if not pages:
+        return None
+
+    buf = io.BytesIO()
+    _resize_for_ocr(pages[0]).save(buf, format="JPEG")
+    b64 = base64.b64encode(buf.getvalue()).decode()
+
+    try:
+        markdown = ocr_page_to_markdown(
+            settings,
+            b64,
+            image_mime="image/jpeg",
+            on_llm_call=on_llm_call,
+        )
+    except Exception as exc:
+        logger.warning("pdf_header_vision_ocr_failed: %s", exc)
+        return None
+
+    parse_fn = parse_invoice if document_type == "invoice" else parse_price_list
+    try:
+        parsed = parse_fn(settings, text=markdown, on_llm_call=on_llm_call)
+    except Exception as exc:
+        logger.warning("pdf_header_vision_parse_failed: %s", exc)
+        return None
+
+    return {k: v for k, v in parsed.items() if k != "line_items"}
+
+
 def _extract_pdf_vision(
     file_bytes: bytes,
     document_type: str,
     settings,
     on_llm_call=None,
+    on_progress: Callable[[dict[str, object]], None] | None = None,
 ) -> dict:
     """Convert PDF pages to images and parse via two-stage OCR → parse."""
     try:
@@ -356,6 +574,18 @@ def _extract_pdf_vision(
     images = convert_from_bytes(file_bytes, dpi=150)
     if not images:
         raise ParseError("PDF yielded no images")
+
+    total_pages = len(images)
+    if on_progress is not None:
+        on_progress(
+            {
+                "step": "Deep scan",
+                "detail": "Scanning PDF pages with AI...",
+                "current": 0,
+                "total": total_pages,
+                "force": True,
+            }
+        )
 
     chunk_size = max(1, settings.vision_pdf_chunk_size or 3)
     all_items: list[dict] = []
@@ -413,11 +643,28 @@ def _extract_pdf_vision(
                 all_items.append(item)
                 seen.add(key)
 
+        if on_progress is not None:
+            done = min(chunk_start + len(batch), total_pages)
+            on_progress(
+                {
+                    "step": "Deep scan",
+                    "detail": "Scanning PDF pages with AI...",
+                    "current": done,
+                    "total": total_pages,
+                }
+            )
+
     header["line_items"] = all_items
     return header
 
 
-def _extract_image(file_bytes: bytes, document_type: str, settings, on_llm_call=None) -> dict:
+def _extract_image(
+    file_bytes: bytes,
+    document_type: str,
+    settings,
+    on_llm_call=None,
+    on_progress: Callable[[dict[str, object]], None] | None = None,
+) -> dict:
     """Image: resize to 4000px max side → OCR markdown → JSON parse."""
     try:
         from PIL import Image as PILImage
@@ -431,6 +678,14 @@ def _extract_image(file_bytes: bytes, document_type: str, settings, on_llm_call=
     img.save(buf, format="JPEG")
     b64 = base64.b64encode(buf.getvalue()).decode()
 
+    if on_progress is not None:
+        on_progress(
+            {
+                "step": "OCR extraction",
+                "detail": "Reading text from your image...",
+                "force": True,
+            }
+        )
     markdown = ocr_page_to_markdown(
         settings,
         b64,
@@ -439,12 +694,56 @@ def _extract_image(file_bytes: bytes, document_type: str, settings, on_llm_call=
     )
 
     parse_fn = parse_invoice if document_type == "invoice" else parse_price_list
+    if on_progress is not None:
+        on_progress(
+            {
+                "step": "AI structuring",
+                "detail": "Converting extracted text into structured items...",
+                "force": True,
+            }
+        )
     return parse_fn(settings, text=markdown, on_llm_call=on_llm_call)
 
 
 # ---------------------------------------------------------------------------
 # Supplier resolution gate
 # ---------------------------------------------------------------------------
+
+def _supplier_candidates_for_name(
+    *,
+    svc: SupplierService,
+    name: str | None,
+    restaurant_id: uuid.UUID,
+) -> list[tuple[object, float]]:
+    """Return ranked restaurant-scoped supplier candidates for a query."""
+    query = (name or "").strip()
+    if not query:
+        suppliers = svc.list_for_restaurant(restaurant_id=restaurant_id, offset=0, limit=5)
+        return [(sup, 1.0) for sup in suppliers]
+
+    strict = svc.fuzzy_search_for_restaurant(
+        name=query,
+        restaurant_id=restaurant_id,
+        threshold=0.5,
+    )
+    if strict:
+        return strict
+
+    relaxed = svc.fuzzy_search_for_restaurant(
+        name=query,
+        restaurant_id=restaurant_id,
+        threshold=0.2,
+    )
+    if relaxed:
+        return relaxed
+
+    # Final fallback: return ranked restaurant suppliers so user can still choose.
+    return svc.fuzzy_search_for_restaurant(
+        name=query,
+        restaurant_id=restaurant_id,
+        threshold=0.0,
+    )
+
 
 def _resolve_supplier(
     name: str | None,
@@ -454,37 +753,30 @@ def _resolve_supplier(
 ) -> tuple[object | None, list[dict] | None]:
     """Return (matched_supplier, extra_buttons_or_None).
 
-    ≥ 0.8 → auto-match; no buttons (None).
-    0.5–0.8 → suggest best matches + "Create new" button.
-    < 0.5 → "Create new" button only.
+    Auto-match at high confidence; otherwise offer:
+    - choose existing supplier
+    - type supplier name
+    - create new supplier
     """
-    if not name:
-        return None, [
-            make_button("➕ Add Supplier", cb_new_supplier(staging_id))
-        ]
-
     svc = SupplierService(db)
-    matches = svc.fuzzy_search_for_restaurant(
-        name=name,
+    query = (name or "").strip()
+    matches = _supplier_candidates_for_name(
+        svc=svc,
+        name=query,
         restaurant_id=restaurant_id,
-        threshold=0.5,
     )
 
-    if not matches:
-        return None, [
-            make_button(f"➕ Create '{name}'", cb_new_supplier(staging_id))
-        ]
-
-    best, score = matches[0]
-
-    if score >= 0.8:
+    if query and matches and matches[0][1] >= 0.8:
+        best = matches[0][0]
         return best, None  # auto-resolved
 
-    # 0.5–0.8: offer top matches + new
     buttons: list[dict] = []
-    for rank, (sup, _s) in enumerate(matches[:2]):
+    for rank, (sup, _score) in enumerate(matches[:3]):
         buttons.append(make_button(f"✅ {sup.name}", cb_set_supplier(staging_id, rank)))
-    buttons.append(make_button(f"➕ Create '{name}'", cb_new_supplier(staging_id)))
+
+    buttons.append(make_button("⌨️ Type Supplier Name", cb_type_supplier(staging_id)))
+    create_label = f"➕ Create '{query}'" if query else "➕ Add Supplier"
+    buttons.append(make_button(create_label, cb_new_supplier(staging_id)))
     return None, buttons
 
 
