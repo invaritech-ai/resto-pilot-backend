@@ -515,8 +515,15 @@ def _handle_set_sup(*, params, user, db, ctx_svc, settings, callback_id, chat_id
                 restaurant_id=staging.restaurant_id,
                 user_id=user.id,
             )
-        except Exception:
-            pass  # already linked or error — proceed anyway
+        except Exception as exc:
+            logger.warning("set_sup: link failed supplier_id=%s: %s", supplier_id, exc)
+            answer_callback_query(
+                callback_id=callback_id,
+                text="⚠️ Failed to link supplier. Please try again.",
+                show_alert=True,
+                settings=settings,
+            )
+            return
 
     staging.supplier_id = supplier_id
     db.commit()
@@ -825,25 +832,25 @@ def _do_confirm_invoice(
     message_id: int | None,
 ):
     """Run confirm_invoice with final resolutions, update staging, clear context."""
-    # Build name → item_id map
-    final: dict[str, _uuid_mod.UUID | None] = {}
+    # Build index → item_id map (index-keyed so duplicate names resolve independently)
+    final: dict[int, _uuid_mod.UUID | None] = {}
     for i, li in enumerate(items):
         name = li.get("name", "")
         res = resolutions.get(str(i))
         if res is None or res == "skip":
-            final[name] = None
+            final[i] = None
         elif res == "new":
             new_item, _ = inv_svc.get_or_create_item(
                 restaurant_id=staging.restaurant_id,
                 name=name,
                 unit=li.get("unit"),
             )
-            final[name] = new_item.id
+            final[i] = new_item.id
         else:
             try:
-                final[name] = _uuid_mod.UUID(res)
+                final[i] = _uuid_mod.UUID(res)
             except ValueError:
-                final[name] = None
+                final[i] = None
 
     count = inv_svc.confirm_invoice(
         restaurant_id=staging.restaurant_id,

@@ -277,15 +277,30 @@ def _extract_pdf_vision(file_bytes: bytes, document_type: str, settings) -> dict
 
     for chunk_start in range(0, len(images), chunk_size):
         batch = images[chunk_start : chunk_start + chunk_size]
-        # Use first image of each batch; resize before OCR
-        img = _resize_for_ocr(batch[0])
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG")
-        b64 = base64.b64encode(buf.getvalue()).decode()
 
+        # OCR every page in this batch, concatenate markdown, then parse once.
+        page_markdowns: list[str] = []
+        for page_offset, pil_img in enumerate(batch):
+            resized = _resize_for_ocr(pil_img)
+            buf = io.BytesIO()
+            resized.save(buf, format="JPEG")
+            b64 = base64.b64encode(buf.getvalue()).decode()
+            try:
+                md = ocr_page_to_markdown(settings, b64, image_mime="image/jpeg")
+                page_markdowns.append(md)
+            except Exception as exc:
+                logger.warning(
+                    "pdf_vision: OCR failed for page %d: %s",
+                    chunk_start + page_offset,
+                    exc,
+                )
+
+        if not page_markdowns:
+            continue
+
+        combined_markdown = "\n\n---\n\n".join(page_markdowns)
         try:
-            markdown = ocr_page_to_markdown(settings, b64, image_mime="image/jpeg")
-            chunk_result = parse_fn(settings, text=markdown)
+            chunk_result = parse_fn(settings, text=combined_markdown)
         except ParseError:
             continue
 
@@ -293,12 +308,13 @@ def _extract_pdf_vision(file_bytes: bytes, document_type: str, settings) -> dict
         if not header.get("supplier") and chunk_result.get("supplier"):
             header = {k: v for k, v in chunk_result.items() if k != "line_items"}
 
-        # Merge items; deduplicate by name
-        seen = {it.get("name") for it in all_items}
+        # Merge items; deduplicate by normalised name
+        seen = {it.get("name", "").strip().lower() for it in all_items}
         for item in chunk_result.get("line_items", []):
-            if item.get("name") not in seen:
+            key = (item.get("name") or "").strip().lower()
+            if key and key not in seen:
                 all_items.append(item)
-                seen.add(item.get("name"))
+                seen.add(key)
 
     header["line_items"] = all_items
     return header

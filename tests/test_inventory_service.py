@@ -493,8 +493,8 @@ class TestConfirmInvoice:
             {"name": "Olive Oil", "qty": 2.0},
         ]
         resolutions = {
-            "Chicken Breast": item_id_1,
-            "Olive Oil": item_id_2,
+            0: item_id_1,
+            1: item_id_2,
         }
 
         svc = InventoryService(session)
@@ -521,8 +521,8 @@ class TestConfirmInvoice:
             {"name": "Unknown Item", "qty": 1.0},
         ]
         resolutions = {
-            "Chicken Breast": item_id_1,
-            "Unknown Item": None,  # user chose to skip
+            0: item_id_1,
+            1: None,  # user chose to skip
         }
 
         svc = InventoryService(session)
@@ -543,7 +543,7 @@ class TestConfirmInvoice:
         session = self._make_session_for_confirm()
 
         line_items = [{"name": "Mystery Item", "qty": 3.0}]
-        resolutions = {"Mystery Item": None}
+        resolutions = {0: None}
 
         svc = InventoryService(session)
         count = svc.confirm_invoice(
@@ -580,7 +580,7 @@ class TestConfirmInvoice:
         line_items = [
             {"name": "Butter", "qty": 3.0, "unit_price": 4.5, "amount": 13.5},
         ]
-        resolutions = {"Butter": item_id}
+        resolutions = {0: item_id}
 
         svc = InventoryService(session)
         svc.confirm_invoice(

@@ -13,8 +13,8 @@ Design decisions:
 
 Price storage:
     SupplierPrice.price_minor + price_exp = integer minor-unit representation.
-    E.g. $8.50 with exp=-2 → minor=850.
-    Use app.services.money.to_minor_units() for conversion.
+    E.g. $8.50 SGD → exp=infer_exp("SGD")=2, minor=850.
+    Uses app.services.money.infer_exp() + to_minor() for conversion.
 """
 
 from __future__ import annotations
@@ -29,21 +29,10 @@ from sqlalchemy.orm import Session
 from app.db.models.supplier_price_lists import SupplierPriceList
 from app.db.models.supplier_prices import SupplierPrice
 from app.db.models.suppliers import Supplier
+from app.services.money import infer_exp, to_minor as _money_to_minor
 from app.services.staging_service import StagingNotFoundError, StagingService
 
 logger = logging.getLogger(__name__)
-
-
-def _to_minor_units(price: float) -> tuple[int, int]:
-    """Convert a decimal price to (price_minor, price_exp) integer representation.
-
-    Uses 4 decimal places of precision (exp = -4).
-    E.g. 8.50 → (85000, -4); 3.1234 → (31234, -4)
-    Consistent with how the rest of the codebase stores prices.
-    """
-    exp = -4
-    minor = round(price * 10_000)
-    return minor, exp
 
 
 def _parse_date(date_str: str | None) -> dt.date | None:
@@ -135,7 +124,8 @@ class PriceService:
             if price_float <= 0:
                 continue
 
-            price_minor, price_exp = _to_minor_units(price_float)
+            price_exp = infer_exp(currency)
+            price_minor = _money_to_minor(price_float, price_exp)
             unit = str(item.get("unit") or "").strip() or None
 
             self.session.add(

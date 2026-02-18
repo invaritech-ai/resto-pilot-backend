@@ -220,7 +220,7 @@ class InventoryService:
         user_id: uuid.UUID,
         staging_id: uuid.UUID,
         line_items: list[dict],
-        resolutions: dict[str, uuid.UUID | None],
+        resolutions: dict[int, uuid.UUID | None],
     ) -> int:
         """Batch-credit inventory from a confirmed invoice. Caller must commit.
 
@@ -236,23 +236,27 @@ class InventoryService:
             line_items:    Extracted invoice lines, each a dict with at minimum
                            {"name": str, "qty": float} and optionally
                            {"unit_price": float, "amount": float}.
-            resolutions:   Mapping of line item name → inventory_item_id (UUID)
-                           or None to skip that line.
+            resolutions:   Mapping of 0-based line item index → inventory_item_id
+                           (UUID) or None to skip that line. Keyed by index (not
+                           name) so duplicate item names resolve independently.
 
         Returns:
             Number of transactions created.
         """
         created = 0
-        for item in line_items:
-            name = item.get("name", "")
-            item_id = resolutions.get(name)
+        for i, item in enumerate(line_items):
+            item_id = resolutions.get(i)
             if item_id is None:
                 continue  # user chose to skip this line
+            qty = item.get("qty")
+            if qty is None:
+                logger.warning("confirm_invoice: skipping item idx=%d — no qty", i)
+                continue
             self.record_transaction(
                 restaurant_id=restaurant_id,
                 item_id=item_id,
                 txn_type="credit",
-                quantity=float(item["qty"]),
+                quantity=float(qty),
                 created_by=user_id,
                 source="invoice",
                 unit_price=item.get("unit_price"),
