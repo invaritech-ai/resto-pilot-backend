@@ -214,7 +214,7 @@ class TestSupplierGateAutoMatch:
         mock_send.assert_called_once()
         call_args = mock_send.call_args
         # chat_id is passed
-        assert call_args[0][0] == 99999 or call_args[1].get("chat_id") == 99999
+        assert call_args.kwargs.get("chat_id") == 99999 or (call_args.args and call_args.args[0] == 99999)
 
 
 # ---------------------------------------------------------------------------

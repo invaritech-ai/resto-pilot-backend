@@ -1,12 +1,18 @@
 """
-Item parser — LLM-based structured extraction for invoices and price lists.
+Item parser — two-stage LLM pipeline for invoices and price lists.
 
-Uses the OpenAI Python client (works with OpenAI native, OpenRouter, or any
-OpenAI-compatible endpoint) configured via app.core.config vision_* settings.
+Stage 1 (ocr_page_to_markdown):
+    Vision LLM reads the image and returns clean Markdown text.
+    Uses vision_* settings (e.g. Gemini Flash).
+
+Stage 2 (parse_invoice / parse_price_list):
+    Cheap text LLM reads the Markdown and returns structured JSON.
+    Uses parser_* settings (e.g. gpt-4o-mini), falling back to openai_* if blank.
 
 Public API:
-    parse_invoice(settings, *, text=None, image_b64=None, image_mime=...) → dict
-    parse_price_list(settings, *, text=None, image_b64=None, image_mime=...) → dict
+    ocr_page_to_markdown(settings, image_b64, image_mime) → str
+    parse_invoice(settings, text) → dict
+    parse_price_list(settings, text) → dict
     ParseError — raised when extraction fails validation
 
 Output schema:
@@ -27,7 +33,8 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+
+from openai import OpenAI
 
 from app.core.config import Settings
 
@@ -42,6 +49,16 @@ class ParseError(Exception):
 # ---------------------------------------------------------------------------
 # Prompts
 # ---------------------------------------------------------------------------
+
+OCR_PROMPT = (
+    "Extract all text from this page (1/1). "
+    "This may contain handwritten text - carefully distinguish similar-looking "
+    "characters (4 vs 9, 1 vs 7, 0 vs 6, 3 vs 8, 5 vs S). "
+    "Preserve tables using Markdown table syntax. "
+    "Keep all headers, footers, and page numbers. "
+    "Use headings (##, ###) for section titles. "
+    "Return ONLY Markdown - no commentary."
+)
 
 _INVOICE_SYSTEM = """\
 You are an expert at extracting structured data from supplier invoices.
@@ -95,88 +112,18 @@ Rules:
 # Public API
 # ---------------------------------------------------------------------------
 
-def parse_invoice(
+def ocr_page_to_markdown(
     settings: Settings,
-    *,
-    text: str | None = None,
-    image_b64: str | None = None,
+    image_b64: str,
     image_mime: str = "image/jpeg",
-) -> dict:
-    """Extract structured invoice data from text or image.
+) -> str:
+    """Stage 1: send image to vision LLM, returns raw Markdown text.
 
-    Exactly one of `text` or `image_b64` must be provided.
-
-    Returns:
-        Dict with keys: supplier, supplier_contact_name, supplier_phone,
-        supplier_email, invoice_date, invoice_number, currency, line_items.
+    Uses vision_* settings (vision_model, vision_api_key, vision_base_url).
 
     Raises:
-        ValueError:  Neither or both inputs provided.
-        ParseError:  LLM returned bad JSON or missing required fields.
+        ParseError: LLM call failed.
     """
-    return _call_llm(
-        system_prompt=_INVOICE_SYSTEM,
-        document_type="invoice",
-        settings=settings,
-        text=text,
-        image_b64=image_b64,
-        image_mime=image_mime,
-    )
-
-
-def parse_price_list(
-    settings: Settings,
-    *,
-    text: str | None = None,
-    image_b64: str | None = None,
-    image_mime: str = "image/jpeg",
-) -> dict:
-    """Extract structured price list data from text or image.
-
-    Exactly one of `text` or `image_b64` must be provided.
-
-    Returns:
-        Dict with keys: supplier, supplier_contact_name, supplier_phone,
-        supplier_email, lead_time, effective_date, currency, line_items.
-
-    Raises:
-        ValueError:  Neither or both inputs provided.
-        ParseError:  LLM returned bad JSON or missing required fields.
-    """
-    return _call_llm(
-        system_prompt=_PRICE_LIST_SYSTEM,
-        document_type="price_list",
-        settings=settings,
-        text=text,
-        image_b64=image_b64,
-        image_mime=image_mime,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Internal implementation
-# ---------------------------------------------------------------------------
-
-def _call_llm(
-    system_prompt: str,
-    document_type: str,
-    settings: Settings,
-    *,
-    text: str | None,
-    image_b64: str | None,
-    image_mime: str,
-) -> dict:
-    """Shared LLM call logic for both document types."""
-    if text is None and image_b64 is None:
-        raise ValueError("Provide either text or image_b64")
-    if text is not None and image_b64 is not None:
-        raise ValueError("Provide either text or image_b64, not both")
-
-    try:
-        from openai import OpenAI
-    except ImportError as e:
-        raise ParseError("openai package not installed") from e
-
     client = OpenAI(
         api_key=settings.vision_api_key or settings.openai_api_key,
         base_url=settings.vision_base_url or settings.openai_base_url,
@@ -185,28 +132,98 @@ def _call_llm(
     )
     model = settings.vision_model or settings.openai_model
 
-    if image_b64 is not None:
-        content: Any = [
-            {"type": "text", "text": system_prompt},
-            {
-                "type": "image_url",
-                "image_url": {"url": f"data:{image_mime};base64,{image_b64}"},
-            },
-        ]
-    else:
-        content = f"{system_prompt}\n\nDOCUMENT CONTENT:\n{text}"
+    logger.info("ocr_page_to_markdown model=%s", model)
+
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{image_mime};base64,{image_b64}"},
+                    },
+                    {"type": "text", "text": OCR_PROMPT},
+                ],
+            }],
+            temperature=0.0,
+        )
+    except Exception as exc:
+        logger.error("ocr_page_to_markdown error: %s", exc)
+        raise ParseError(f"OCR LLM call failed: {exc}") from exc
+
+    return (response.choices[0].message.content or "").strip()
+
+
+def parse_invoice(settings: Settings, text: str) -> dict:
+    """Stage 2: extract structured invoice data from Markdown text.
+
+    Returns:
+        Dict with keys: supplier, supplier_contact_name, supplier_phone,
+        supplier_email, invoice_date, invoice_number, currency, line_items.
+
+    Raises:
+        ParseError: LLM returned bad JSON or missing required fields.
+    """
+    return _call_parser(
+        system_prompt=_INVOICE_SYSTEM,
+        document_type="invoice",
+        settings=settings,
+        text=text,
+    )
+
+
+def parse_price_list(settings: Settings, text: str) -> dict:
+    """Stage 2: extract structured price list data from Markdown text.
+
+    Returns:
+        Dict with keys: supplier, supplier_contact_name, supplier_phone,
+        supplier_email, lead_time, effective_date, currency, line_items.
+
+    Raises:
+        ParseError: LLM returned bad JSON or missing required fields.
+    """
+    return _call_parser(
+        system_prompt=_PRICE_LIST_SYSTEM,
+        document_type="price_list",
+        settings=settings,
+        text=text,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Internal implementation
+# ---------------------------------------------------------------------------
+
+def _call_parser(
+    system_prompt: str,
+    document_type: str,
+    settings: Settings,
+    text: str,
+) -> dict:
+    """Shared stage-2 LLM call: Markdown text → structured JSON dict."""
+    client = OpenAI(
+        api_key=settings.parser_api_key or settings.openai_api_key,
+        base_url=settings.parser_base_url or settings.openai_base_url,
+        timeout=settings.openai_timeout_seconds,
+        max_retries=settings.openai_max_retries,
+    )
+    model = settings.parser_model or settings.openai_model
 
     logger.info(
-        "item_parser_call doc_type=%s model=%s input=%s",
+        "item_parser_call doc_type=%s model=%s",
         document_type,
         model,
-        "image" if image_b64 else "text",
     )
 
     try:
         response = client.chat.completions.create(
             model=model,
-            messages=[{"role": "user", "content": content}],
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"DOCUMENT CONTENT:\n{text}"},
+            ],
             temperature=0.0,
         )
     except Exception as exc:
