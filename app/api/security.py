@@ -95,8 +95,16 @@ class AccessTokenError(ValueError):
 
 
 def encode_access_token(*, payload: AccessTokenPayload, settings: Settings) -> str:
+    if not settings.auth_secret:
+        raise AccessTokenError(
+            "APP_AUTH_SECRET is not set. Token encoding requires a secret."
+        )
     header = {"typ": "RP", "alg": "HS256"}
-    body = {"sub": payload.user_id, "telegram_id": payload.telegram_id, "exp": payload.exp}
+    body = {
+        "sub": payload.user_id,
+        "telegram_id": payload.telegram_id,
+        "exp": payload.exp,
+    }
     signing_input = f"{_b64url_encode(json.dumps(header).encode())}.{_b64url_encode(json.dumps(body).encode())}"
     sig = hmac.new(
         settings.auth_secret.encode("utf-8"),
@@ -106,7 +114,14 @@ def encode_access_token(*, payload: AccessTokenPayload, settings: Settings) -> s
     return f"{signing_input}.{_b64url_encode(sig)}"
 
 
-def decode_access_token(*, token: str, settings: Settings, now: int | None = None) -> AccessTokenPayload:
+def decode_access_token(
+    *, token: str, settings: Settings, now: int | None = None
+) -> AccessTokenPayload:
+    if not settings.auth_secret:
+        raise AccessTokenError(
+            "APP_AUTH_SECRET is not set. Token decoding requires a secret."
+        )
+
     try:
         header_b64, body_b64, sig_b64 = token.split(".", 2)
     except ValueError as e:
@@ -134,7 +149,11 @@ def decode_access_token(*, token: str, settings: Settings, now: int | None = Non
     exp = body.get("exp")
     sub = body.get("sub")
     telegram_id = body.get("telegram_id")
-    if not isinstance(exp, int) or not isinstance(sub, str) or not isinstance(telegram_id, int):
+    if (
+        not isinstance(exp, int)
+        or not isinstance(sub, str)
+        or not isinstance(telegram_id, int)
+    ):
         raise AccessTokenError("Invalid token payload fields")
 
     now = now or int(time.time())

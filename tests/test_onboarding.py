@@ -1,10 +1,7 @@
 """Tests for app/telegram/handlers/onboarding.py.
 
-Written TDD. Implementation must make these pass.
-
 Interface under test:
     def needs_onboarding(user: User) -> bool
-        # True if user.full_name is None
 
     def handle(
         update: dict,
@@ -13,14 +10,6 @@ Interface under test:
         ctx_svc: ContextService,
         settings: Settings,
     ) -> None
-        # Drives the 3-step onboarding state machine.
-        # Sends messages via send_message(chat_id, text, settings).
-        # Mutates user and context via ctx_svc.
-
-Onboarding steps (stored in user.context["onboarding_step"]):
-    None / absent  → user.full_name is None → ask for name
-    "awaiting_name"         → save name, ask for restaurant
-    "awaiting_restaurant"   → create Restaurant, set active_restaurant_id, done
 """
 
 import uuid
@@ -44,10 +33,9 @@ def make_user(full_name=None, context=None):
     return u
 
 
-def make_ctx_svc():
+def make_ctx_svc(context=None):
     svc = MagicMock()
-    # get() returns context dict (or {})
-    svc.get.return_value = {}
+    svc.get.return_value = dict(context) if context else {}
     return svc
 
 
@@ -61,6 +49,9 @@ def text_update(text: str, chat_id: int = 12345) -> dict:
     return {"message": {"text": text, "chat": {"id": chat_id}, "from": {"id": chat_id}}}
 
 
+_ACTIVE_RESTAURANT_ID = str(uuid.uuid4())
+
+
 # ---------------------------------------------------------------------------
 # needs_onboarding
 # ---------------------------------------------------------------------------
@@ -70,13 +61,14 @@ class TestNeedsOnboarding:
         user = make_user(full_name=None)
         assert needs_onboarding(user) is True
 
-    def test_false_when_full_name_is_set(self):
-        user = make_user(full_name="Ali")
+    def test_false_when_fully_onboarded(self):
+        """Name set + no pending step + active_restaurant_id = done."""
+        user = make_user(full_name="Ali", context={"active_restaurant_id": _ACTIVE_RESTAURANT_ID})
         assert needs_onboarding(user) is False
 
-    def test_false_for_empty_string_name(self):
-        """Empty string counts as set — use None to indicate missing."""
-        user = make_user(full_name="")
+    def test_false_for_empty_string_name_when_restaurant_active(self):
+        """Empty string full_name still counts as set (not None)."""
+        user = make_user(full_name="", context={"active_restaurant_id": _ACTIVE_RESTAURANT_ID})
         assert needs_onboarding(user) is False
 
     def test_true_when_step_still_in_context(self):
@@ -84,9 +76,20 @@ class TestNeedsOnboarding:
         user = make_user(full_name="Ali", context={"onboarding_step": "awaiting_restaurant"})
         assert needs_onboarding(user) is True
 
-    def test_false_when_name_set_and_no_step(self):
+    def test_true_when_name_set_but_no_restaurant_in_context(self):
+        """Webapp auth sets full_name but doesn't set active_restaurant_id."""
         user = make_user(full_name="Ali", context={})
-        assert needs_onboarding(user) is False
+        assert needs_onboarding(user) is True
+
+    def test_true_when_context_is_none(self):
+        """No context at all → no active_restaurant_id → onboarding needed."""
+        user = make_user(full_name="Ali", context=None)
+        assert needs_onboarding(user) is True
+
+    def test_true_when_active_restaurant_id_is_invalid_uuid(self):
+        """Corrupted context with invalid UUID should require onboarding."""
+        user = make_user(full_name="Ali", context={"active_restaurant_id": "not-a-uuid"})
+        assert needs_onboarding(user) is True
 
 
 # ---------------------------------------------------------------------------
@@ -95,8 +98,7 @@ class TestNeedsOnboarding:
 
 class TestStep1AskName:
     def _handle(self, user, text="hello"):
-        ctx_svc = make_ctx_svc()
-        ctx_svc.get.return_value = {}   # no onboarding_step
+        ctx_svc = make_ctx_svc()  # no onboarding_step
         settings = make_settings()
         db = MagicMock()
 
@@ -132,14 +134,46 @@ class TestStep1AskName:
 
 
 # ---------------------------------------------------------------------------
+# Webapp bypass: full_name set (e.g. via webapp auth) but no restaurant yet
+# ---------------------------------------------------------------------------
+
+class TestWebappBypass:
+    def _handle(self, text="hello"):
+        # full_name set, no step, no active_restaurant_id
+        user = make_user(full_name="Ali", context={})
+        ctx_svc = make_ctx_svc(context={})
+        settings = make_settings()
+        db = MagicMock()
+
+        with patch("app.telegram.handlers.onboarding.send_message") as mock_send:
+            handle(text_update(text), user, db, ctx_svc, settings)
+            return mock_send, ctx_svc, user
+
+    def test_asks_for_restaurant(self):
+        mock_send, _, _ = self._handle()
+        mock_send.assert_called_once()
+        text_sent = mock_send.call_args[1].get("text") or mock_send.call_args[0][1]
+        assert "restaurant" in text_sent.lower()
+
+    def test_sets_awaiting_restaurant_step(self):
+        _, ctx_svc, _ = self._handle()
+        all_kwargs = {k: v for call_ in ctx_svc.set_fields.call_args_list for k, v in call_[1].items()}
+        assert all_kwargs.get("onboarding_step") == "awaiting_restaurant"
+
+    def test_greets_by_name(self):
+        mock_send, _, user = self._handle()
+        text_sent = mock_send.call_args[1].get("text") or mock_send.call_args[0][1]
+        assert user.full_name in text_sent
+
+
+# ---------------------------------------------------------------------------
 # Step 2: awaiting_name — save name, ask for restaurant
 # ---------------------------------------------------------------------------
 
 class TestStep2SaveName:
     def _handle(self, name_text):
         user = make_user(full_name=None)
-        ctx_svc = make_ctx_svc()
-        ctx_svc.get.return_value = {"onboarding_step": "awaiting_name"}
+        ctx_svc = make_ctx_svc(context={"onboarding_step": "awaiting_name"})
         settings = make_settings()
         db = MagicMock()
 
@@ -166,17 +200,35 @@ class TestStep2SaveName:
         all_kwargs = {k: v for call_ in ctx_svc.set_fields.call_args_list for k, v in call_[1].items()}
         assert all_kwargs.get("onboarding_step") == "awaiting_restaurant"
 
-    def test_flushes_user_to_session(self):
+    def test_commits_before_sending_message(self):
+        """Name must be persisted before the user is notified."""
         _, _, user, db = self._handle("Ali Hassan")
         db.add.assert_called()
-        db.flush.assert_called()
+        db.commit.assert_called()
 
     def test_empty_name_re_asks(self):
-        """Blank input should not save and should re-ask for name."""
         mock_send, ctx_svc, user, _ = self._handle("   ")
         assert user.full_name is None
         text_sent = mock_send.call_args[1].get("text") or mock_send.call_args[0][1]
         assert "name" in text_sent.lower()
+
+    def test_reset_word_re_asks(self):
+        """Reset words like /start should not be saved as names."""
+        mock_send, _, user, _ = self._handle("/start")
+        assert user.full_name is None
+        text_sent = mock_send.call_args[1].get("text") or mock_send.call_args[0][1]
+        assert "name" in text_sent.lower()
+
+    def test_slash_command_re_asks(self):
+        """Slash commands should not be saved as names."""
+        mock_send, _, user, _ = self._handle("/help")
+        assert user.full_name is None
+        text_sent = mock_send.call_args[1].get("text") or mock_send.call_args[0][1]
+        assert "name" in text_sent.lower()
+
+    def test_cancel_word_re_asks(self):
+        mock_send, _, user, _ = self._handle("cancel")
+        assert user.full_name is None
 
 
 # ---------------------------------------------------------------------------
@@ -186,59 +238,129 @@ class TestStep2SaveName:
 class TestStep3CreateRestaurant:
     def _handle(self, restaurant_name, user_name="Ali"):
         user = make_user(full_name=user_name)
-        ctx_svc = make_ctx_svc()
-        ctx_svc.get.return_value = {"onboarding_step": "awaiting_restaurant"}
+        ctx_svc = make_ctx_svc(context={"onboarding_step": "awaiting_restaurant"})
         settings = make_settings()
         db = MagicMock()
 
+        fake_restaurant = MagicMock()
+        fake_restaurant.id = uuid.uuid4()
+        fake_restaurant.name = restaurant_name
+
         with patch("app.telegram.handlers.onboarding.send_message") as mock_send, \
-             patch("app.telegram.handlers.onboarding.Restaurant") as MockRestaurant:
-            fake_restaurant = MagicMock()
-            fake_restaurant.id = uuid.uuid4()
-            MockRestaurant.return_value = fake_restaurant
+             patch("app.telegram.handlers.onboarding.RestaurantService") as MockRestaurantService, \
+             patch("app.telegram.handlers.onboarding._get_existing_restaurant_for_user") as mock_get_existing:
+
+            mock_svc = MagicMock()
+            MockRestaurantService.return_value = mock_svc
+            mock_svc.list_for_user.return_value = []
+            mock_svc.create_restaurant.return_value = fake_restaurant
+            mock_get_existing.return_value = None  # No existing restaurant
 
             handle(text_update(restaurant_name), user, db, ctx_svc, settings)
-            return mock_send, ctx_svc, user, db, fake_restaurant
+            return mock_send, ctx_svc, user, db, fake_restaurant, mock_svc
 
-    def test_creates_restaurant_with_name(self):
-        _, _, _, db, restaurant = self._handle("Burger Barn")
-        db.add.assert_called()
+    def test_uses_restaurant_service(self):
+        """Must use RestaurantService (creates owner membership), not Restaurant directly."""
+        _, _, _, _, _, mock_svc = self._handle("Burger Barn")
+        mock_svc.create_restaurant.assert_called_once()
+
+    def test_creates_with_correct_owner_and_name(self):
+        _, _, user, _, _, mock_svc = self._handle("Burger Barn")
+        kwargs = mock_svc.create_restaurant.call_args[1]
+        assert kwargs["name"] == "Burger Barn"
+        assert kwargs["owner_user_id"] == user.id
 
     def test_sets_active_restaurant_in_context(self):
-        _, ctx_svc, _, _, restaurant = self._handle("Burger Barn")
+        _, ctx_svc, _, _, restaurant, _ = self._handle("Burger Barn")
         ctx_svc.set_active_restaurant.assert_called_once_with(
-            pytest.approx(unittest_any()), restaurant.id
+            AnyArg(), restaurant.id
         )
 
     def test_clears_onboarding_step(self):
-        _, ctx_svc, _, _, _ = self._handle("Burger Barn")
+        _, ctx_svc, _, _, _, _ = self._handle("Burger Barn")
         all_kwargs = {k: v for call_ in ctx_svc.set_fields.call_args_list for k, v in call_[1].items()}
         assert all_kwargs.get("onboarding_step") is None
 
     def test_sends_welcome_message(self):
-        mock_send, _, user, _, _ = self._handle("Burger Barn")
+        mock_send, _, user, _, _, _ = self._handle("Burger Barn")
         mock_send.assert_called_once()
         text_sent = mock_send.call_args[1].get("text") or mock_send.call_args[0][1]
-        # Should greet by name and mention they're set up
         assert user.full_name.lower() in text_sent.lower() or "welcome" in text_sent.lower()
 
     def test_empty_restaurant_name_re_asks(self):
-        """Blank input should not create restaurant and should re-ask."""
-        mock_send, _, _, db, _ = self._handle("   ")
-        # Restaurant should NOT have been added for blank input
+        mock_send, _, _, _, _, mock_svc = self._handle("   ")
+        mock_svc.create_restaurant.assert_not_called()
         text_sent = mock_send.call_args[1].get("text") or mock_send.call_args[0][1]
         assert "restaurant" in text_sent.lower()
 
-    def test_flushes_after_restaurant_creation(self):
-        _, _, _, db, _ = self._handle("Burger Barn")
-        db.flush.assert_called()
+    def test_reset_word_not_saved_as_restaurant(self):
+        _, _, _, _, _, mock_svc = self._handle("/start")
+        mock_svc.create_restaurant.assert_not_called()
+
+    def test_cancel_not_saved_as_restaurant(self):
+        _, _, _, _, _, mock_svc = self._handle("cancel")
+        mock_svc.create_restaurant.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Step 3: idempotency — retry / re-delivery
+# ---------------------------------------------------------------------------
+
+class TestStep3Idempotency:
+    def test_reuses_existing_restaurant_on_retry(self):
+        """If a restaurant already exists, create_restaurant must NOT be called."""
+        user = make_user(full_name="Ali")
+        ctx_svc = make_ctx_svc(context={"onboarding_step": "awaiting_restaurant"})
+        settings = make_settings()
+        db = MagicMock()
+
+        existing_restaurant = MagicMock()
+        existing_restaurant.id = uuid.uuid4()
+        existing_restaurant.name = "Burger Barn"
+
+        with patch("app.telegram.handlers.onboarding.send_message") as mock_send, \
+             patch("app.telegram.handlers.onboarding.RestaurantService") as MockRestaurantService, \
+             patch("app.telegram.handlers.onboarding._get_existing_restaurant_for_user") as mock_get_existing:
+
+            mock_svc = MagicMock()
+            MockRestaurantService.return_value = mock_svc
+            mock_get_existing.return_value = existing_restaurant  # Existing restaurant found
+
+            handle(text_update("Burger Barn"), user, db, ctx_svc, settings)
+
+            mock_svc.create_restaurant.assert_not_called()
+            ctx_svc.set_active_restaurant.assert_called_once()
+            all_kwargs = {k: v for call_ in ctx_svc.set_fields.call_args_list for k, v in call_[1].items()}
+            assert all_kwargs.get("onboarding_step") is None
+
+
+# ---------------------------------------------------------------------------
+# Unknown / corrupted step — recovery
+# ---------------------------------------------------------------------------
+
+class TestUnknownStep:
+    def test_clears_bad_step_and_restarts(self):
+        user = make_user(full_name="Ali")
+        ctx_svc = make_ctx_svc(context={"onboarding_step": "some_garbage_value"})
+        settings = make_settings()
+        db = MagicMock()
+
+        with patch("app.telegram.handlers.onboarding.send_message") as mock_send:
+            handle(text_update("whatever"), user, db, ctx_svc, settings)
+
+        mock_send.assert_called_once()
+        text_sent = mock_send.call_args[1].get("text") or mock_send.call_args[0][1]
+        assert "start over" in text_sent.lower() or "went wrong" in text_sent.lower()
+
+        all_kwargs = {k: v for call_ in ctx_svc.set_fields.call_args_list for k, v in call_[1].items()}
+        assert all_kwargs.get("onboarding_step") == "awaiting_name"
 
 
 # ---------------------------------------------------------------------------
 # Helper
 # ---------------------------------------------------------------------------
 
-class unittest_any:
-    """Matches any value — for use in assert_called_once_with."""
+class AnyArg:
+    """Matches any value in assert_called_once_with."""
     def __eq__(self, other):
         return True

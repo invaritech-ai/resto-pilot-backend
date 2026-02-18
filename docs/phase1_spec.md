@@ -1,7 +1,10 @@
 # Phase 1 Technical Specification
 ## Supplier & Price List Management
 
-**Revision 3** — corrected: integer money storage, global supplier registry, patch flow, auth on staging, pg_trgm declaration, user confirmation gates, /link command.
+**Revision 4** — corrected: integer money storage, global supplier registry, patch flow, auth on staging, pg_trgm declaration, user confirmation gates, /link command; build order updated with completion status (2026-02-18).
+
+### Current Status
+Steps 1–5 + onboarding infrastructure complete. **Next: step 6 (reset handler).** 229 tests passing. Bot live on Neon production with onboarding working end-to-end.
 
 ---
 
@@ -743,20 +746,25 @@ app/
 
 ## 7. Build Order
 
-1. **DB models + migration** — `CREATE EXTENSION pg_trgm` first, then 6 new tables + restaurant location columns.
-2. **`services/money.py`** — `to_minor(decimal, exp)`, `to_display(minor, exp)`, `infer_exp(currency)`. Everything touching prices depends on this.
-3. **`services/context_service.py`** — `get_context()`, `set_context()`, `clear_context()`.
-4. **`services/supplier_service.py`** — create (global), link to restaurant, list, fuzzy match.
-5. **`telegram/router.py`** — skeleton dispatching to stubs.
-6. **`telegram/handlers/reset.py`** — gets end-to-end routing working.
-7. **`telegram/handlers/commands.py`** — `/list suppliers`, `/add supplier`, `/link supplier`, `/uploads`, `/switch`.
-8. **`telegram/keyboards.py` + `telegram/renderer.py`** — shared formatting used by all handlers.
-9. **`telegram/handlers/buttons.py`** — `rev_u`, `del_u`, `set_sup`, `new_sup`, `list_p`.
-10. **`services/staging_service.py`** + **`telegram/handlers/files.py`** — upload flow with stubbed OCR.
-11. **`llm/parser.py`** + **`workers/ocr_tasks.py`** — real parsing + decimal→integer conversion.
-12. **`llm/patcher.py`** + `ed_row` in buttons — edit flow with conversion on apply.
-13. **`services/price_service.py`** + `conf_u` — final write to `supplier_price_lists` + `supplier_prices`.
-14. **`telegram/handlers/llm_fallback.py`** + **`llm/intent.py`** — LLM router last.
+| # | What | Status | Notes |
+|---|------|--------|-------|
+| 1 | DB models + migration | ✅ Done | pg_trgm, pgvector, 6 new tables, location columns on restaurants |
+| 2 | `services/money.py` | ✅ Done | `to_minor`, `to_display`, `infer_exp`, `QTY_EXP=3` |
+| 3 | `services/context_service.py` | ✅ Done | JSONB get/set_fields/clear_navigation; caller owns commit |
+| 4 | `services/supplier_service.py` | ✅ Done | Global registry, link, list, fuzzy match (pg_trgm) |
+| 5 | `telegram/router.py` | ✅ Done | 6-priority dispatcher; 42 tests |
+| — | User service + onboarding | ✅ Done | get_or_create, 3-step state machine, idempotent, membership via RestaurantService |
+| — | `workers/telegram_tasks.py` | ✅ Done | Wired: get-or-create → onboarding intercept → commit |
+| — | `telegram/ack_handler.py` | ✅ Done | Synchronous ACK from webhook before Celery enqueue |
+| 6 | `telegram/handlers/reset.py` | ⏳ Next | Clear nav context, show main menu |
+| 7 | `telegram/handlers/commands.py` | ⏳ | `/list suppliers`, `/add supplier`, `/link supplier`, `/uploads`, `/switch`, `/help` |
+| 8 | `telegram/keyboards.py` + `renderer.py` | ⏳ | Shared formatting; inline keyboard builders |
+| 9 | `telegram/handlers/buttons.py` | ⏳ | `rev_u`, `del_u`, `set_sup`, `new_sup`, `list_p` |
+| 10 | `services/staging_service.py` + `handlers/files.py` | ⏳ | Upload flow with stubbed OCR |
+| 11 | `llm/parser.py` + `workers/ocr_tasks.py` | ⏳ | Real parsing + decimal→integer conversion |
+| 12 | `llm/patcher.py` + `ed_row` handler | ⏳ | Edit flow; patch in display space, convert back to integers |
+| 13 | `services/price_service.py` + `conf_u` | ⏳ | Final write to `supplier_price_lists` + `supplier_prices` |
+| 14 | `handlers/llm_fallback.py` + `llm/intent.py` | ⏳ | LLM intent router (Contract A) |
 
 ---
 

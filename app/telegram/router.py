@@ -18,12 +18,7 @@ from typing import Any, Callable
 from sqlalchemy.orm import Session
 
 from app.db.models.user import User
-
-# ---------------------------------------------------------------------------
-# Reset words — checked case-insensitively after strip.
-# /start is listed here so it cannot fall through to the command handler.
-# ---------------------------------------------------------------------------
-_RESET_WORDS = {"home", "menu", "cancel", "exit", "/start"}
+from app.telegram.constants import RESET_WORDS
 
 # ---------------------------------------------------------------------------
 # Pattern regexes (Priority 5)
@@ -40,12 +35,12 @@ class RouteContext:
 
 @dataclass
 class Handlers:
-    reset:   Callable[[dict, RouteContext], Any]
-    button:  Callable[[dict, RouteContext], Any]
+    reset: Callable[[dict, RouteContext], Any]
+    button: Callable[[dict, RouteContext], Any]
     command: Callable[[dict, RouteContext], Any]
-    file:    Callable[[dict, RouteContext], Any]
+    file: Callable[[dict, RouteContext], Any]
     pattern: Callable[[dict, RouteContext], Any]
-    llm:     Callable[[dict, RouteContext], Any]
+    llm: Callable[[dict, RouteContext], Any]
 
 
 class Router:
@@ -60,7 +55,7 @@ class Router:
         text_lower = text_stripped.lower()
 
         # Priority 1 — Global Reset
-        if text_lower in _RESET_WORDS:
+        if text_lower in RESET_WORDS:
             return h.reset(update, ctx)
 
         # Priority 2 — Button callback

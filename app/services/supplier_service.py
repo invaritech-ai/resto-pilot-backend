@@ -2,12 +2,15 @@
 Supplier service — global registry + restaurant link management.
 
 Responsibilities:
-    create()                    — new global supplier + immediate restaurant link
-    link()                      — link existing global supplier to a restaurant
-    list_for_restaurant()       — paginated active suppliers for a restaurant
-    is_linked()                 — active link existence check
-    fuzzy_search()              — trigram similarity search across global registry
+    create()                       — new global supplier + immediate restaurant link
+    link()                         — link existing global supplier to a restaurant
+    list_for_restaurant()          — paginated active suppliers for a restaurant
+    is_linked()                    — active link existence check
+    fuzzy_search()                 — trigram similarity search across global registry
     list_restaurants_for_supplier() — reverse lookup: which restaurants use this supplier
+    list_products_for_restaurant() — paginated (Supplier, SupplierPrice) for display
+    count_products_for_restaurant() — total product count for pagination
+    list_prices_for_supplier()     — paginated prices from one supplier for a restaurant
 
 Exceptions:
     SupplierNotFoundError  — supplier_id does not exist in global registry
@@ -18,6 +21,7 @@ Callers own the commit. This service only flushes within the caller's transactio
 
 from __future__ import annotations
 
+import datetime as dt
 import uuid
 
 from sqlalchemy import func, select, true
@@ -25,6 +29,8 @@ from sqlalchemy.orm import Session
 
 from app.db.models.restaurant import Restaurant
 from app.db.models.restaurant_suppliers import RestaurantSupplier
+from app.db.models.supplier_price_lists import SupplierPriceList
+from app.db.models.supplier_prices import SupplierPrice
 from app.db.models.suppliers import Supplier
 
 
@@ -154,11 +160,7 @@ class SupplierService:
         return list(self.session.scalars(stmt).all())
 
     def list_restaurants_for_supplier(self, supplier_id: uuid.UUID) -> list[Restaurant]:
-        """Reverse lookup: restaurants actively linked to this supplier.
-
-        Strictly one restaurant right now (single-outlet), but the query is
-        restaurant-agnostic for future multi-outlet expansion.
-        """
+        """Reverse lookup: restaurants actively linked to this supplier."""
         stmt = (
             select(Restaurant)
             .join(RestaurantSupplier, RestaurantSupplier.restaurant_id == Restaurant.id)
@@ -203,3 +205,120 @@ class SupplierService:
         )
         rows = self.session.execute(stmt).all()
         return [(row[0], float(row[1])) for row in rows]
+
+    def fuzzy_search_for_restaurant(
+        self,
+        name: str,
+        restaurant_id: uuid.UUID,
+        threshold: float = 0.6,
+    ) -> list[tuple[Supplier, float]]:
+        """Search suppliers linked to a specific restaurant by trigram similarity.
+
+        Unlike fuzzy_search(), this is scoped to suppliers actively linked to
+        the given restaurant. Use this for commands like /prices where a global
+        match could return a supplier the restaurant has never linked.
+
+        Args:
+            name:          Search query (lowercased internally).
+            restaurant_id: Restrict matches to this restaurant's active links.
+            threshold:     Minimum similarity score (0.0–1.0). Default 0.6.
+
+        Returns:
+            List of (Supplier, score) tuples, highest score first.
+        """
+        query_lower = name.strip().lower()
+        score = func.similarity(Supplier.name_lower, query_lower).label("score")
+        stmt = (
+            select(Supplier, score)
+            .join(RestaurantSupplier, RestaurantSupplier.supplier_id == Supplier.id)
+            .where(
+                RestaurantSupplier.restaurant_id == restaurant_id,
+                RestaurantSupplier.is_active == true(),
+                func.similarity(Supplier.name_lower, query_lower) >= threshold,
+            )
+            .order_by(score.desc())
+        )
+        rows = self.session.execute(stmt).all()
+        return [(row[0], float(row[1])) for row in rows]
+
+    # ------------------------------------------------------------------
+    # Price list queries (used by /products and /prices commands)
+    # ------------------------------------------------------------------
+
+    def list_products_for_restaurant(
+        self,
+        restaurant_id: uuid.UUID,
+        offset: int = 0,
+        limit: int = 10,
+    ) -> list[tuple[Supplier, SupplierPrice]]:
+        """Return paginated (Supplier, SupplierPrice) pairs for a restaurant.
+
+        Orders by supplier name then item name. Used by /products command.
+        """
+        stmt = (
+            select(Supplier, SupplierPrice)
+            .join(SupplierPriceList, SupplierPriceList.supplier_id == Supplier.id)
+            .join(SupplierPrice, SupplierPrice.price_list_id == SupplierPriceList.id)
+            .where(SupplierPriceList.restaurant_id == restaurant_id)
+            .order_by(Supplier.name_lower, SupplierPrice.item_name_lower)
+            .offset(offset)
+            .limit(limit)
+        )
+        rows = self.session.execute(stmt).all()
+        return [(row[0], row[1]) for row in rows]
+
+    def count_products_for_restaurant(self, restaurant_id: uuid.UUID) -> int:
+        """Return total product count across all price lists for a restaurant."""
+        stmt = (
+            select(func.count())
+            .select_from(SupplierPrice)
+            .join(SupplierPriceList, SupplierPrice.price_list_id == SupplierPriceList.id)
+            .where(SupplierPriceList.restaurant_id == restaurant_id)
+        )
+        return self.session.scalar(stmt) or 0
+
+    def list_prices_for_supplier(
+        self,
+        restaurant_id: uuid.UUID,
+        supplier_id: uuid.UUID,
+        offset: int = 0,
+        limit: int = 10,
+    ) -> list[tuple[SupplierPrice, dt.date | None]]:
+        """Return paginated (SupplierPrice, effective_date) for a supplier + restaurant.
+
+        Orders by effective_date descending (newest first), then item name.
+        Used by /prices command.
+        """
+        stmt = (
+            select(SupplierPrice, SupplierPriceList.effective_date)
+            .join(SupplierPriceList, SupplierPrice.price_list_id == SupplierPriceList.id)
+            .where(
+                SupplierPriceList.restaurant_id == restaurant_id,
+                SupplierPrice.supplier_id == supplier_id,
+            )
+            .order_by(
+                SupplierPriceList.effective_date.desc().nulls_last(),
+                SupplierPrice.item_name_lower,
+            )
+            .offset(offset)
+            .limit(limit)
+        )
+        rows = self.session.execute(stmt).all()
+        return [(row[0], row[1]) for row in rows]
+
+    def count_prices_for_supplier(
+        self,
+        restaurant_id: uuid.UUID,
+        supplier_id: uuid.UUID,
+    ) -> int:
+        """Return total price count for a supplier + restaurant."""
+        stmt = (
+            select(func.count())
+            .select_from(SupplierPrice)
+            .join(SupplierPriceList, SupplierPrice.price_list_id == SupplierPriceList.id)
+            .where(
+                SupplierPriceList.restaurant_id == restaurant_id,
+                SupplierPrice.supplier_id == supplier_id,
+            )
+        )
+        return self.session.scalar(stmt) or 0

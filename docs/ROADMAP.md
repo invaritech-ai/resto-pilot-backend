@@ -6,7 +6,7 @@ entirely through chat — no app install, no dashboard login required.
 
 ---
 
-## Phase 0 — Clean Foundation (current)
+## Phase 0 — Clean Foundation ✅ Complete
 **Goal:** Stable, minimal skeleton. Everything that isn't the core loop is gone.
 
 - [x] Auth via Telegram WebApp token (JWT)
@@ -14,25 +14,43 @@ entirely through chat — no app install, no dashboard login required.
 - [x] Telegram webhook → instant ACK → Celery worker
 - [x] Message and session telemetry (incoming + outgoing logged)
 - [x] LLM call cost tracking infrastructure
-- [ ] Alembic migration finalized and tested against clean schema
-- [ ] All remaining tests green
+- [x] Alembic migration finalized (single head, pg_trgm + pgvector extensions)
+- [x] 229 tests green; deployed live on Neon (production branch only)
 
-**Outcome:** Deploy skeleton to staging. Webhook accepts messages, creates users, does nothing else yet.
+**Outcome:** ✅ Skeleton deployed. Bot accepts messages, creates users, sends ACK.
 
 ---
 
-## Phase 1 — Supplier & Catalog
-**Goal:** A restaurant can manage its suppliers and the products they sell.
+## Phase 1 — Supplier & Catalog (in progress)
+**Goal:** A restaurant can upload supplier price lists, review parsed items, and confirm to save prices.
 
-- Supplier onboarding via Telegram (`/add supplier`)
-- Supplier product catalog (name, SKU, unit, price, currency)
-- Price list upload (PDF/photo) → parsed and confirmed by user before saving
-- Basic `/list suppliers`, `/list products` commands
+### ✅ Done
+- User get-or-create on first message; `last_interaction_at` tracked
+- 3-step onboarding flow (name → restaurant → welcome); owner membership always created
+- Onboarding idempotent under Celery retry; commits before sending user messages
+- `needs_onboarding()` catches webapp-auth bypass (full_name set but no restaurant)
+- Reset/command words filtered from onboarding inputs; unknown step recovers gracefully
+- 6-priority message router (`router.py`) wired into Celery worker
+- `services/money.py` — `to_minor`, `to_display`, `infer_exp`, `QTY_EXP=3`
+- `services/context_service.py` — JSONB read/write/clear with navigation state
+- `services/supplier_service.py` — global registry, link to restaurant, fuzzy match
+- `services/restaurant_service.py` — create (with owner membership), members list
+- All DB models + migration (suppliers, restaurant_suppliers, supplier_prices, supplier_price_lists, file_processing_staging, handshake_requests)
 
-**Data:**
-- `suppliers` — name, contact, currency, notes
-- `products` — name, unit, category
-- `supplier_items` — links supplier ↔ product with price + effective date
+### 🔧 In Progress (current branch: `phase-1-step-6`)
+- Steps 6–9: reset handler, commands handler, keyboards, renderer, button handler (reads only)
+
+### ⏳ Remaining
+- Steps 10–11: file upload handler + OCR Celery task (pdfplumber → LLM parser)
+- Steps 12–13: correction patch flow + `conf_u` confirm → write to `supplier_prices`
+- Step 14: LLM fallback intent classifier
+
+**Data model (all migrated):**
+- `suppliers` — global registry with trigram search
+- `restaurant_suppliers` — link table (per-restaurant)
+- `supplier_price_lists` — upload header records
+- `supplier_prices` — BIGINT minor-unit prices, append-only
+- `file_processing_staging` — working state during upload review
 
 ---
 

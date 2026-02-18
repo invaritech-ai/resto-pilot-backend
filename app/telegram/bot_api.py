@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from contextlib import contextmanager
 from contextvars import ContextVar
 import logging
@@ -16,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_MAX_MESSAGE_LEN = 4096
 
-_OUTGOING_MESSAGE_SINK: ContextVar[callable[[int, str], None] | None] = ContextVar(
+_OUTGOING_MESSAGE_SINK: ContextVar[Callable[[int, str], None] | None] = ContextVar(
     "_OUTGOING_MESSAGE_SINK",
     default=None,
 )
@@ -52,7 +53,9 @@ class TelegramFileNetworkError(TelegramFileError):
     pass
 
 
-def _split_telegram_message_text(*, text: str, limit: int = TELEGRAM_MAX_MESSAGE_LEN) -> list[str]:
+def _split_telegram_message_text(
+    *, text: str, limit: int = TELEGRAM_MAX_MESSAGE_LEN
+) -> list[str]:
     if limit <= 0:
         return [text]
     if len(text) <= limit:
@@ -101,7 +104,9 @@ def send_message(chat_id: int, text: str, settings: Settings) -> int | None:
     if sink is not None:
         if not isinstance(text, str) or not text.strip():
             return None
-        for part in _split_telegram_message_text(text=text, limit=TELEGRAM_MAX_MESSAGE_LEN):
+        for part in _split_telegram_message_text(
+            text=text, limit=TELEGRAM_MAX_MESSAGE_LEN
+        ):
             sink(chat_id, part)
         # Return a deterministic placeholder message_id for telemetry.
         return 1
@@ -111,7 +116,9 @@ def send_message(chat_id: int, text: str, settings: Settings) -> int | None:
     if chat_id == 0:
         if not isinstance(text, str) or not text.strip():
             return None
-        for part in _split_telegram_message_text(text=text, limit=TELEGRAM_MAX_MESSAGE_LEN):
+        for part in _split_telegram_message_text(
+            text=text, limit=TELEGRAM_MAX_MESSAGE_LEN
+        ):
             print(part, flush=True)  # noqa: T201
         return 1
 
@@ -119,7 +126,9 @@ def send_message(chat_id: int, text: str, settings: Settings) -> int | None:
         raise ValueError("Telegram bot token is not configured")
 
     if not isinstance(text, str) or not text.strip():
-        logger.warning("telegram_send_message_skipped_empty", extra={"chat_id": chat_id})
+        logger.warning(
+            "telegram_send_message_skipped_empty", extra={"chat_id": chat_id}
+        )
         return None
 
     url = f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage"
@@ -174,7 +183,9 @@ def send_message(chat_id: int, text: str, settings: Settings) -> int | None:
                 "telegram_send_message_bad_json",
                 extra={"chat_id": chat_id, "status_code": response.status_code},
             )
-            raise TelegramSendMessageError("Telegram sendMessage returned invalid JSON") from None
+            raise TelegramSendMessageError(
+                "Telegram sendMessage returned invalid JSON"
+            ) from None
 
         if not result.get("ok"):
             logger.error(
@@ -251,12 +262,16 @@ def get_file_bytes_unified(
         TelegramFileNetworkError: Download/read error
     """
     if local_file_path:
-        return get_file_bytes_from_local_path(file_path=local_file_path, max_bytes=max_bytes)
+        return get_file_bytes_from_local_path(
+            file_path=local_file_path, max_bytes=max_bytes
+        )
     else:
         return get_file_bytes(file_id=file_id, settings=settings, max_bytes=max_bytes)
 
 
-def get_file_bytes_from_local_path(*, file_path: str, max_bytes: int = 20_000_000) -> bytes:
+def get_file_bytes_from_local_path(
+    *, file_path: str, max_bytes: int = 20_000_000
+) -> bytes:
     """
     Read a local file with the same error handling as Telegram file downloads.
 
@@ -313,7 +328,9 @@ def get_file_bytes_from_local_path(*, file_path: str, max_bytes: int = 20_000_00
         ) from None
 
 
-def get_file_bytes(*, file_id: str, settings: Settings, max_bytes: int = 20_000_000) -> bytes:
+def get_file_bytes(
+    *, file_id: str, settings: Settings, max_bytes: int = 20_000_000
+) -> bytes:
     """
     Download a Telegram file by file_id with specific error handling.
 
@@ -338,9 +355,7 @@ def get_file_bytes(*, file_id: str, settings: Settings, max_bytes: int = 20_000_
         raise ValueError("Telegram bot token is not configured")
 
     file_id_q = urllib.parse.quote(file_id, safe="")
-    get_file_url = (
-        f"https://api.telegram.org/bot{settings.telegram_bot_token}/getFile?file_id={file_id_q}"
-    )
+    get_file_url = f"https://api.telegram.org/bot{settings.telegram_bot_token}/getFile?file_id={file_id_q}"
 
     # Step 1: Get file path from Telegram
     try:
@@ -420,3 +435,130 @@ def get_file_bytes(*, file_id: str, settings: Settings, max_bytes: int = 20_000_
         raise TelegramFileNetworkError(
             f"Network error downloading file: {type(e).__name__}"
         ) from None
+
+
+def answer_callback_query(
+    callback_id: str,
+    text: str = "",
+    show_alert: bool = False,
+    settings: Settings | None = None,
+) -> bool:
+    """Answer a callback query from an inline button press.
+
+    Args:
+        callback_id: The callback_query.id from the update
+        text: Optional text to show to the user
+        show_alert: If True, show as a popup alert instead of toast
+        settings: Application settings containing the bot token
+
+    Returns:
+        True if successful, False otherwise
+    """
+    from app.core.config import get_settings
+
+    if settings is None:
+        settings = get_settings()
+
+    if not settings.telegram_bot_token:
+        logger.warning("answer_callback_query_skipped: no bot token")
+        return False
+
+    url = (
+        f"https://api.telegram.org/bot{settings.telegram_bot_token}/answerCallbackQuery"
+    )
+
+    payload: dict[str, Any] = {
+        "callback_query_id": callback_id,
+    }
+    if text:
+        payload["text"] = text
+    if show_alert:
+        payload["show_alert"] = True
+
+    try:
+        response = httpx.post(url, json=payload, timeout=10.0)
+        response.raise_for_status()
+        result = response.json()
+        if result.get("ok"):
+            logger.debug("callback_query_answered", extra={"callback_id": callback_id})
+            return True
+        else:
+            logger.warning(
+                "answer_callback_query_failed",
+                extra={"callback_id": callback_id, "error": result.get("description")},
+            )
+            return False
+    except httpx.HTTPError as e:
+        logger.error(
+            "answer_callback_query_http_error",
+            extra={"callback_id": callback_id, "error": type(e).__name__},
+        )
+        return False
+
+
+def edit_message_text(
+    chat_id: int,
+    message_id: int,
+    text: str,
+    settings: Settings,
+    reply_markup: dict | None = None,
+) -> bool:
+    """Edit an existing message's text.
+
+    Args:
+        chat_id: The Telegram chat ID
+        message_id: The message ID to edit
+        text: The new text content
+        settings: Application settings containing the bot token
+        reply_markup: Optional inline keyboard markup
+
+    Returns:
+        True if successful, False otherwise
+    """
+    if not settings.telegram_bot_token:
+        raise ValueError("Telegram bot token is not configured")
+
+    if not isinstance(text, str) or not text.strip():
+        logger.warning("edit_message_text_skipped_empty", extra={"chat_id": chat_id})
+        return False
+
+    url = f"https://api.telegram.org/bot{settings.telegram_bot_token}/editMessageText"
+
+    payload: dict[str, Any] = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+    }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+
+    try:
+        response = httpx.post(url, json=payload, timeout=10.0)
+        response.raise_for_status()
+        result = response.json()
+        if result.get("ok"):
+            logger.debug(
+                "message_edited",
+                extra={"chat_id": chat_id, "message_id": message_id},
+            )
+            return True
+        else:
+            logger.warning(
+                "edit_message_text_failed",
+                extra={
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "error": result.get("description"),
+                },
+            )
+            return False
+    except httpx.HTTPError as e:
+        logger.error(
+            "edit_message_text_http_error",
+            extra={
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "error": type(e).__name__,
+            },
+        )
+        return False
