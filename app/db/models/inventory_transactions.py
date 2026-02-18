@@ -4,7 +4,7 @@ import datetime as dt
 import uuid
 from typing import ClassVar
 
-from sqlalchemy import DateTime, ForeignKey, Index, Numeric, String, Text, func
+from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, Numeric, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -17,6 +17,8 @@ class InventoryTransaction(Base):
     __table_args__ = (
         Index("ix_inv_txn_restaurant_item", "restaurant_id", "item_id"),
         Index("ix_inv_txn_staging", "staging_id"),
+        CheckConstraint("txn_type IN ('credit', 'debit')", name="ck_inv_txn_type"),
+        CheckConstraint("source IN ('invoice', 'manual')", name="ck_inv_txn_source"),
     )
 
     restaurant_id: Mapped[uuid.UUID] = mapped_column(

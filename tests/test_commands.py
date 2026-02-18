@@ -419,8 +419,8 @@ class TestTeamCommand:
         assert [uuid.UUID(s) for s in stored] == member_ids
 
 
-class TestInventoryStub:
-    def test_inventory_stub_no_active_restaurant(self):
+class TestInventoryCommand:
+    def test_no_active_restaurant_prompts_setup(self):
         user = _make_user(None)
         ctx_svc = _make_ctx_svc(user)
         db = _make_db()
@@ -431,24 +431,77 @@ class TestInventoryStub:
             handle(_make_update("/inventory"), user, db, ctx_svc, _make_settings())
 
         text = mock_send.call_args[1]["text"]
-        assert "no active" in text.lower() or "switch" in text.lower() or "/start" in text.lower()
+        assert "no active" in text.lower() or "/start" in text.lower()
 
-    def test_inventory_stub_returns_stub_message(self):
-        user = _make_user(uuid.uuid4())
+    def test_empty_inventory_shows_onboarding_hint(self):
+        user = _make_user(RESTAURANT_ID)
         ctx_svc = _make_ctx_svc(user)
         db = _make_db()
 
-        with patch("app.telegram.handlers.commands.RestaurantService") as MockSvc, \
+        with patch("app.telegram.handlers.commands.RestaurantService") as MockRest, \
+             patch("app.telegram.handlers.commands.InventoryService") as MockInv, \
              patch("app.telegram.handlers.commands.send_message") as mock_send:
-            MockSvc.return_value.user_membership_exists.return_value = True
+            MockRest.return_value.user_membership_exists.return_value = True
+            MockInv.return_value.count_items.return_value = 0
             handle(_make_update("/inventory"), user, db, ctx_svc, _make_settings())
 
         text = mock_send.call_args[1]["text"]
         assert "No inventory data yet" in text
 
+    def test_lists_items_with_balances(self):
+        user = _make_user(RESTAURANT_ID)
+        ctx_svc = _make_ctx_svc(user)
+        db = _make_db()
 
-class TestBalanceStub:
-    def test_balance_stub_no_active_restaurant(self):
+        item1 = MagicMock()
+        item1.id = uuid.uuid4()
+        item1.name = "Chicken Breast"
+        item1.unit = "kg"
+
+        balance1 = MagicMock()
+        balance1.balance = 10.5
+
+        with patch("app.telegram.handlers.commands.RestaurantService") as MockRest, \
+             patch("app.telegram.handlers.commands.InventoryService") as MockInv, \
+             patch("app.telegram.handlers.commands.send_message") as mock_send:
+            MockRest.return_value.user_membership_exists.return_value = True
+            MockInv.return_value.count_items.return_value = 1
+            MockInv.return_value.list_items.return_value = [(item1, balance1)]
+            handle(_make_update("/inventory"), user, db, ctx_svc, _make_settings())
+
+        text = mock_send.call_args[1]["text"]
+        assert "Chicken Breast" in text
+        assert "10.5" in text
+        assert "kg" in text
+
+    def test_negative_balance_shows_warning(self):
+        user = _make_user(RESTAURANT_ID)
+        ctx_svc = _make_ctx_svc(user)
+        db = _make_db()
+
+        item1 = MagicMock()
+        item1.id = uuid.uuid4()
+        item1.name = "Olive Oil"
+        item1.unit = "L"
+
+        balance1 = MagicMock()
+        balance1.balance = -2.5
+
+        with patch("app.telegram.handlers.commands.RestaurantService") as MockRest, \
+             patch("app.telegram.handlers.commands.InventoryService") as MockInv, \
+             patch("app.telegram.handlers.commands.send_message") as mock_send:
+            MockRest.return_value.user_membership_exists.return_value = True
+            MockInv.return_value.count_items.return_value = 1
+            MockInv.return_value.list_items.return_value = [(item1, balance1)]
+            handle(_make_update("/inventory"), user, db, ctx_svc, _make_settings())
+
+        text = mock_send.call_args[1]["text"]
+        assert "⚠️" in text
+        assert "Olive Oil" in text
+
+
+class TestBalanceCommand:
+    def test_no_active_restaurant_prompts_setup(self):
         user = _make_user(None)
         ctx_svc = _make_ctx_svc(user)
         db = _make_db()
@@ -459,20 +512,81 @@ class TestBalanceStub:
             handle(_make_update("/balance"), user, db, ctx_svc, _make_settings())
 
         text = mock_send.call_args[1]["text"]
-        assert "no active" in text.lower() or "switch" in text.lower() or "/start" in text.lower()
+        assert "no active" in text.lower() or "/start" in text.lower()
 
-    def test_balance_stub_returns_stub_message(self):
-        user = _make_user(uuid.uuid4())
+    def test_empty_inventory_shows_onboarding_hint(self):
+        user = _make_user(RESTAURANT_ID)
         ctx_svc = _make_ctx_svc(user)
         db = _make_db()
 
-        with patch("app.telegram.handlers.commands.RestaurantService") as MockSvc, \
+        from app.services.inventory_service import BalanceSummary
+        summary = BalanceSummary(total_items=0, zero_stock_count=0, negative_count=0)
+
+        with patch("app.telegram.handlers.commands.RestaurantService") as MockRest, \
+             patch("app.telegram.handlers.commands.InventoryService") as MockInv, \
              patch("app.telegram.handlers.commands.send_message") as mock_send:
-            MockSvc.return_value.user_membership_exists.return_value = True
+            MockRest.return_value.user_membership_exists.return_value = True
+            MockInv.return_value.get_balance_summary.return_value = summary
             handle(_make_update("/balance"), user, db, ctx_svc, _make_settings())
 
         text = mock_send.call_args[1]["text"]
         assert "No inventory data yet" in text
+
+    def test_shows_summary_counts(self):
+        user = _make_user(RESTAURANT_ID)
+        ctx_svc = _make_ctx_svc(user)
+        db = _make_db()
+
+        from app.services.inventory_service import BalanceSummary
+        summary = BalanceSummary(total_items=15, zero_stock_count=2, negative_count=1)
+
+        with patch("app.telegram.handlers.commands.RestaurantService") as MockRest, \
+             patch("app.telegram.handlers.commands.InventoryService") as MockInv, \
+             patch("app.telegram.handlers.commands.send_message") as mock_send:
+            MockRest.return_value.user_membership_exists.return_value = True
+            MockInv.return_value.get_balance_summary.return_value = summary
+            handle(_make_update("/balance"), user, db, ctx_svc, _make_settings())
+
+        text = mock_send.call_args[1]["text"]
+        assert "15" in text
+        assert "2" in text
+        assert "1" in text
+
+    def test_zero_stock_shows_warning_flag(self):
+        user = _make_user(RESTAURANT_ID)
+        ctx_svc = _make_ctx_svc(user)
+        db = _make_db()
+
+        from app.services.inventory_service import BalanceSummary
+        summary = BalanceSummary(total_items=5, zero_stock_count=3, negative_count=0)
+
+        with patch("app.telegram.handlers.commands.RestaurantService") as MockRest, \
+             patch("app.telegram.handlers.commands.InventoryService") as MockInv, \
+             patch("app.telegram.handlers.commands.send_message") as mock_send:
+            MockRest.return_value.user_membership_exists.return_value = True
+            MockInv.return_value.get_balance_summary.return_value = summary
+            handle(_make_update("/balance"), user, db, ctx_svc, _make_settings())
+
+        text = mock_send.call_args[1]["text"]
+        assert "⚠️" in text
+
+    def test_no_warning_when_all_healthy(self):
+        user = _make_user(RESTAURANT_ID)
+        ctx_svc = _make_ctx_svc(user)
+        db = _make_db()
+
+        from app.services.inventory_service import BalanceSummary
+        summary = BalanceSummary(total_items=10, zero_stock_count=0, negative_count=0)
+
+        with patch("app.telegram.handlers.commands.RestaurantService") as MockRest, \
+             patch("app.telegram.handlers.commands.InventoryService") as MockInv, \
+             patch("app.telegram.handlers.commands.send_message") as mock_send:
+            MockRest.return_value.user_membership_exists.return_value = True
+            MockInv.return_value.get_balance_summary.return_value = summary
+            handle(_make_update("/balance"), user, db, ctx_svc, _make_settings())
+
+        text = mock_send.call_args[1]["text"]
+        assert "⚠️" not in text
 
 
 # ---------------------------------------------------------------------------

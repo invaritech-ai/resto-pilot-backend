@@ -25,8 +25,11 @@ import logging
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
+from app.db.models.file_processing_staging import FileProcessingStaging
 from app.db.models.user import User
 from app.services.context_service import ContextService
+from app.services.inventory_service import InventoryService
+from app.services.restaurant_service import RestaurantService
 from app.telegram.bot_api import answer_callback_query, edit_message_text, send_message
 from app.telegram.keyboards import hex_to_uuid
 
@@ -102,7 +105,7 @@ def handle(
         )
         return
 
-    # --- conf_u: Confirm upload ---
+    # --- conf_u: Confirm upload (invoice → inventory) ---
     if action == "conf_u":
         if len(params) < 1:
             answer_callback_query(
@@ -119,18 +122,107 @@ def handle(
             )
             return
 
-        # TODO: Implement confirm logic
-        # 1. Load staging record
-        # 2. Verify status='pending_review' and supplier_id is set
-        # 3. Create supplier_price_lists record
-        # 4. Bulk insert supplier_prices rows
-        # 5. Set staging.status='confirmed'
-        # 6. Edit original message
+        staging = db.get(FileProcessingStaging, staging_id)
+        if staging is None:
+            answer_callback_query(
+                callback_id=callback_id, text="Upload not found.", settings=settings
+            )
+            return
 
+        # Authorization: uploader or active member of the restaurant.
+        is_owner = staging.uploaded_by == user.id
+        is_member = RestaurantService(db).user_membership_exists(
+            restaurant_id=staging.restaurant_id, user_id=user.id
+        )
+        if not (is_owner or is_member):
+            answer_callback_query(
+                callback_id=callback_id, text="Not authorized.", settings=settings
+            )
+            return
+
+        if staging.status != "pending_review":
+            answer_callback_query(
+                callback_id=callback_id,
+                text="This upload has already been processed.",
+                settings=settings,
+            )
+            return
+
+        if staging.document_type != "invoice":
+            answer_callback_query(
+                callback_id=callback_id,
+                text="Only invoice uploads can be confirmed here.",
+                settings=settings,
+            )
+            return
+
+        extracted = staging.extracted_data_json or {}
+        raw_items = extracted.get("line_items", [])
+
+        # Validate each line item: must have a non-empty name and a positive qty.
+        line_items = []
+        for li in raw_items:
+            name = str(li.get("name") or "").strip()
+            try:
+                qty = float(li["qty"])
+            except (KeyError, TypeError, ValueError):
+                qty = 0.0
+            if name and qty > 0:
+                line_items.append(li)
+
+        if not line_items:
+            answer_callback_query(
+                callback_id=callback_id,
+                text="No valid line items found in this upload.",
+                settings=settings,
+            )
+            return
+
+        restaurant_id = staging.restaurant_id
+        inv_svc = InventoryService(db)
+
+        # Build resolutions: fuzzy-match at ≥0.8 → use existing item.
+        # No match ≥0.8 → auto-create as new inventory item.
+        resolutions: dict[str, object] = {}
+        for li in line_items:
+            name = li.get("name", "")
+            if not name:
+                continue
+            matches = inv_svc.fuzzy_match_item(
+                restaurant_id=restaurant_id, name=name, threshold=0.8
+            )
+            if matches:
+                matched_item, _ = matches[0]
+                resolutions[name] = matched_item.id
+            else:
+                new_item, _ = inv_svc.get_or_create_item(
+                    restaurant_id=restaurant_id,
+                    name=name,
+                    unit=li.get("unit"),
+                )
+                resolutions[name] = new_item.id
+
+        count = inv_svc.confirm_invoice(
+            restaurant_id=restaurant_id,
+            user_id=user.id,
+            staging_id=staging_id,
+            line_items=line_items,
+            resolutions=resolutions,
+        )
+
+        staging.status = "confirmed"
+        ctx_svc.set_fields(user, active_staging_id=None)
+        db.commit()
+
+        if message_id:
+            edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=f"✅ Invoice confirmed — {count} item{'s' if count != 1 else ''} added to inventory.",
+                settings=settings,
+            )
         answer_callback_query(
-            callback_id=callback_id,
-            text="Confirm upload (not yet implemented)",
-            settings=settings,
+            callback_id=callback_id, text="Invoice confirmed!", settings=settings
         )
         return
 

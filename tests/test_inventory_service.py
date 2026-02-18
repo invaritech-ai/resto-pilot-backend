@@ -17,6 +17,8 @@ from app.services.inventory_service import (
     ItemNotFoundError,
 )
 
+STAGING_ID = uuid.uuid4()
+
 # ---------------------------------------------------------------------------
 # Shared fixtures
 # ---------------------------------------------------------------------------
@@ -142,7 +144,7 @@ class TestRecordTransaction:
         assert txn_obj.txn_type == "credit"
         assert float(txn_obj.quantity) == 5.0
         assert float(balance_obj.balance) == 5.0
-        session.commit.assert_called_once()
+        session.commit.assert_not_called()
 
     def test_debit_creates_negative_balance_when_none_exists(self):
         session = _make_session()
@@ -178,7 +180,7 @@ class TestRecordTransaction:
         )
 
         assert float(existing_balance.balance) == 15.0
-        session.commit.assert_called_once()
+        session.commit.assert_not_called()
 
     def test_debit_decrements_existing_balance(self):
         session = _make_session()
@@ -453,3 +455,131 @@ class TestFuzzyMatchItem:
         results = svc.fuzzy_match_item(RESTAURANT_ID, "xyz unknown")
 
         assert results == []
+
+
+# ---------------------------------------------------------------------------
+# confirm_invoice
+# ---------------------------------------------------------------------------
+
+
+class TestConfirmInvoice:
+    def _make_session_for_confirm(self) -> MagicMock:
+        """Session configured so record_transaction flushes without error."""
+        session = _make_session()
+        session.flush = MagicMock()
+        session.commit = MagicMock()
+        # scalar returns None → new balance created each time
+        session.scalar.return_value = None
+        return session
+
+    def test_credits_all_resolved_items(self):
+        session = self._make_session_for_confirm()
+        item_id_1 = uuid.uuid4()
+        item_id_2 = uuid.uuid4()
+
+        line_items = [
+            {"name": "Chicken Breast", "qty": 5.0, "unit_price": 8.5, "amount": 42.5},
+            {"name": "Olive Oil", "qty": 2.0},
+        ]
+        resolutions = {
+            "Chicken Breast": item_id_1,
+            "Olive Oil": item_id_2,
+        }
+
+        svc = InventoryService(session)
+        count = svc.confirm_invoice(
+            restaurant_id=RESTAURANT_ID,
+            user_id=USER_ID,
+            staging_id=STAGING_ID,
+            line_items=line_items,
+            resolutions=resolutions,
+        )
+
+        assert count == 2
+        # Each record_transaction adds 2 objects (txn + balance) → 4 total
+        assert session.add.call_count == 4
+        session.commit.assert_not_called()  # caller owns commit
+
+    def test_skips_items_mapped_to_none(self):
+        session = self._make_session_for_confirm()
+        item_id_1 = uuid.uuid4()
+
+        line_items = [
+            {"name": "Chicken Breast", "qty": 5.0},
+            {"name": "Unknown Item", "qty": 1.0},
+        ]
+        resolutions = {
+            "Chicken Breast": item_id_1,
+            "Unknown Item": None,  # user chose to skip
+        }
+
+        svc = InventoryService(session)
+        count = svc.confirm_invoice(
+            restaurant_id=RESTAURANT_ID,
+            user_id=USER_ID,
+            staging_id=STAGING_ID,
+            line_items=line_items,
+            resolutions=resolutions,
+        )
+
+        assert count == 1
+        # Only one record_transaction called → 2 adds (txn + balance)
+        assert session.add.call_count == 2
+
+    def test_returns_zero_when_all_skipped(self):
+        session = self._make_session_for_confirm()
+
+        line_items = [{"name": "Mystery Item", "qty": 3.0}]
+        resolutions = {"Mystery Item": None}
+
+        svc = InventoryService(session)
+        count = svc.confirm_invoice(
+            restaurant_id=RESTAURANT_ID,
+            user_id=USER_ID,
+            staging_id=STAGING_ID,
+            line_items=line_items,
+            resolutions=resolutions,
+        )
+
+        assert count == 0
+        session.add.assert_not_called()
+
+    def test_returns_zero_for_empty_line_items(self):
+        session = self._make_session_for_confirm()
+
+        svc = InventoryService(session)
+        count = svc.confirm_invoice(
+            restaurant_id=RESTAURANT_ID,
+            user_id=USER_ID,
+            staging_id=STAGING_ID,
+            line_items=[],
+            resolutions={},
+        )
+
+        assert count == 0
+        session.add.assert_not_called()
+
+    def test_passes_optional_fields_to_transaction(self):
+        session = self._make_session_for_confirm()
+        item_id = uuid.uuid4()
+        staging_id = uuid.uuid4()
+
+        line_items = [
+            {"name": "Butter", "qty": 3.0, "unit_price": 4.5, "amount": 13.5},
+        ]
+        resolutions = {"Butter": item_id}
+
+        svc = InventoryService(session)
+        svc.confirm_invoice(
+            restaurant_id=RESTAURANT_ID,
+            user_id=USER_ID,
+            staging_id=staging_id,
+            line_items=line_items,
+            resolutions=resolutions,
+        )
+
+        txn_obj = session.add.call_args_list[0][0][0]
+        assert float(txn_obj.unit_price) == 4.5
+        assert float(txn_obj.amount) == 13.5
+        assert txn_obj.staging_id == staging_id
+        assert txn_obj.source == "invoice"

@@ -27,6 +27,7 @@ from sqlalchemy.orm import Session
 from app.core.config import Settings
 from app.db.models.user import User
 from app.services.context_service import ContextService
+from app.services.inventory_service import InventoryService
 from app.services.money import format_price
 from app.services.restaurant_service import RestaurantService
 from app.services.supplier_service import AlreadyLinkedError, SupplierService
@@ -367,7 +368,7 @@ def handle(
         send_message(chat_id=chat_id, text="\n".join(lines), settings=settings)
         return
 
-    # --- /inventory (stub) ---
+    # --- /inventory ---
     if command == "inventory":
         restaurant_id = _require_active_restaurant(user, ctx_svc, db, settings)
         if restaurant_id is None:
@@ -378,14 +379,37 @@ def handle(
             )
             return
 
-        send_message(
-            chat_id=chat_id,
-            text="📦 No inventory data yet. Upload an invoice to get started.",
-            settings=settings,
-        )
+        inv_svc = InventoryService(db)
+        total = inv_svc.count_items(restaurant_id)
+
+        if total == 0:
+            send_message(
+                chat_id=chat_id,
+                text="📦 No inventory data yet. Upload an invoice to get started.",
+                settings=settings,
+            )
+            return
+
+        items = inv_svc.list_items(restaurant_id, offset=0, limit=10)
+        ctx_svc.set_numbered_items(user, [item.id for item, _ in items])
+        ctx_svc.set_list_state(user, "inventory", 0)
+        db.commit()
+
+        lines = ["📦 Inventory\n"]
+        for i, (item, balance) in enumerate(items, 1):
+            bal_val = float(balance.balance) if balance is not None else 0.0
+            unit = f" {item.unit}" if item.unit else ""
+            prefix = "⚠️ " if bal_val < 0 else ""
+            lines.append(f"{i}. {prefix}{item.name} — {bal_val:g}{unit}")
+
+        total_pages = (total + 9) // 10
+        if total_pages > 1:
+            lines.append(f"\nPage 1/{total_pages}  [Next ▶]")
+
+        send_message(chat_id=chat_id, text="\n".join(lines), settings=settings)
         return
 
-    # --- /balance (stub) ---
+    # --- /balance ---
     if command == "balance":
         restaurant_id = _require_active_restaurant(user, ctx_svc, db, settings)
         if restaurant_id is None:
@@ -396,11 +420,28 @@ def handle(
             )
             return
 
-        send_message(
-            chat_id=chat_id,
-            text="📊 No inventory data yet.",
-            settings=settings,
-        )
+        inv_svc = InventoryService(db)
+        summary = inv_svc.get_balance_summary(restaurant_id)
+
+        if summary.total_items == 0:
+            send_message(
+                chat_id=chat_id,
+                text="📊 No inventory data yet. Upload an invoice to get started.",
+                settings=settings,
+            )
+            return
+
+        zero_flag = " ⚠️" if summary.zero_stock_count > 0 else ""
+        neg_flag = " ⚠️" if summary.negative_count > 0 else ""
+
+        lines = [
+            "📊 Stock Summary\n",
+            f"Total items: {summary.total_items}",
+            f"Zero stock: {summary.zero_stock_count}{zero_flag}",
+            f"Negative balance: {summary.negative_count}{neg_flag}",
+        ]
+
+        send_message(chat_id=chat_id, text="\n".join(lines), settings=settings)
         return
 
     # --- /list suppliers ---

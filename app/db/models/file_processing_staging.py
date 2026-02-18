@@ -4,7 +4,7 @@ import datetime as dt
 import uuid
 from typing import ClassVar
 
-from sqlalchemy import DateTime, Enum, ForeignKey, Index, String, Text, func
+from sqlalchemy import CheckConstraint, DateTime, Enum, ForeignKey, Index, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -21,6 +21,10 @@ class FileProcessingStaging(Base):
     __table_args__ = (
         Index("idx_staging_restaurant_status", "restaurant_id", "status"),
         Index("idx_staging_uploaded_by", "uploaded_by"),
+        CheckConstraint(
+            "document_type IS NULL OR document_type IN ('invoice', 'price_list')",
+            name="ck_staging_document_type",
+        ),
     )
 
     restaurant_id: Mapped[uuid.UUID] = mapped_column(

@@ -132,7 +132,11 @@ class InventoryService:
         staging_id: uuid.UUID | None = None,
         notes: str | None = None,
     ) -> InventoryTransaction:
-        """Insert ledger row + update balance atomically. Commits internally.
+        """Insert ledger row + update balance within the caller's transaction.
+
+        Flushes to get txn.id for the balance FK, but does NOT commit.
+        Caller must commit after all related work is done (e.g., after a full
+        batch of line items in confirm_invoice).
 
         Args:
             txn_type: 'credit' or 'debit'
@@ -140,7 +144,7 @@ class InventoryService:
             source:   'invoice' or 'manual'
 
         Returns:
-            The newly created InventoryTransaction.
+            The newly created InventoryTransaction (not yet committed).
         """
         if txn_type not in ("credit", "debit"):
             raise ValueError(f"txn_type must be 'credit' or 'debit', got {txn_type!r}")
@@ -160,7 +164,7 @@ class InventoryService:
             created_by=created_by,
         )
         self.session.add(txn)
-        self.session.flush()  # get txn.id before balance upsert
+        self.session.flush()  # get txn.id for the balance FK
 
         delta = float(quantity) if txn_type == "credit" else -float(quantity)
         now = dt.datetime.now(tz=dt.timezone.utc)
@@ -187,8 +191,55 @@ class InventoryService:
             )
             self.session.add(balance)
 
-        self.session.commit()
         return txn
+
+    def confirm_invoice(
+        self,
+        restaurant_id: uuid.UUID,
+        user_id: uuid.UUID,
+        staging_id: uuid.UUID,
+        line_items: list[dict],
+        resolutions: dict[str, uuid.UUID | None],
+    ) -> int:
+        """Batch-credit inventory from a confirmed invoice. Caller must commit.
+
+        For each line item, looks up its resolved inventory_item_id from
+        `resolutions`. Items mapped to None are skipped (user chose to ignore).
+        All transactions + balance updates flush within the caller's session;
+        a single commit at the end makes everything atomic.
+
+        Args:
+            restaurant_id: The restaurant being updated.
+            user_id:       The user confirming (recorded as created_by).
+            staging_id:    FK reference stored on each transaction.
+            line_items:    Extracted invoice lines, each a dict with at minimum
+                           {"name": str, "qty": float} and optionally
+                           {"unit_price": float, "amount": float}.
+            resolutions:   Mapping of line item name → inventory_item_id (UUID)
+                           or None to skip that line.
+
+        Returns:
+            Number of transactions created.
+        """
+        created = 0
+        for item in line_items:
+            name = item.get("name", "")
+            item_id = resolutions.get(name)
+            if item_id is None:
+                continue  # user chose to skip this line
+            self.record_transaction(
+                restaurant_id=restaurant_id,
+                item_id=item_id,
+                txn_type="credit",
+                quantity=float(item["qty"]),
+                created_by=user_id,
+                source="invoice",
+                unit_price=item.get("unit_price"),
+                amount=item.get("amount"),
+                staging_id=staging_id,
+            )
+            created += 1
+        return created
 
     # ------------------------------------------------------------------
     # Read queries
