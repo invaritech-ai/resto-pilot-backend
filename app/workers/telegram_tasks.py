@@ -1,13 +1,24 @@
-"""Telegram update Celery task."""
+"""Telegram update Celery task.
+
+Fixes applied:
+- update_id deduplication to prevent duplicate processing under concurrent/replayed scenarios
+- Session-based transaction isolation for proper idempotency
+"""
 
 from __future__ import annotations
 
+import datetime as dt
 import logging
+import uuid
 
 from app.core.config import get_settings
 from app.services.context_service import ContextService
+from app.services.dedup_service import DedupService
 from app.services.user_service import UserService
-from app.telegram.handlers.onboarding import handle as handle_onboarding, needs_onboarding
+from app.telegram.handlers.onboarding import (
+    handle as handle_onboarding,
+    needs_onboarding,
+)
 from app.workers.celery_app import celery_app
 from app.workers.db import worker_db_session
 from app.workers.utils import _get_task_id
@@ -15,48 +26,198 @@ from app.workers.utils import _get_task_id
 logger = logging.getLogger(__name__)
 
 
+def _get_or_create_session(db, chat_id: int) -> uuid.UUID:
+    """Get or create a telegram session for dedup tracking.
+
+    We need a session_id for the telegram_messages table.
+    Create a minimal session record if one doesn't exist.
+    """
+    from sqlalchemy import select
+    from app.db.models.telegram_session import TelegramSessions
+
+    # Try to find an existing open session for this chat
+    existing = db.scalar(
+        select(TelegramSessions.id)
+        .where(
+            TelegramSessions.chat_id == chat_id,
+            TelegramSessions.status == "open",
+        )
+        .order_by(TelegramSessions.started_at.desc())
+        .limit(1)
+    )
+    if existing:
+        return existing
+
+    # Create a new session
+    session = TelegramSessions(
+        chat_id=chat_id,
+        started_at=dt.datetime.now(dt.timezone.utc),
+        last_activity_at=dt.datetime.now(dt.timezone.utc),
+        status="open",
+    )
+    db.add(session)
+    db.flush()
+    return session.id
+
+
 @celery_app.task(name="handle_telegram_update")
 def handle_telegram_update(update: dict) -> None:
-    """Process a Telegram update: get-or-create user, onboard or route."""
+    """Process a Telegram update: get-or-create user, onboard or route.
+
+    Deduplication:
+        - Uses update_id as idempotency key
+        - Records update_id in telegram_messages before processing
+        - If update_id already exists, skips processing entirely
+
+    Transaction safety:
+        - All state changes committed before sending user-facing messages
+        - Onboarding handlers are responsible for their own commits
+    """
     task_id = _get_task_id()
     settings = get_settings()
 
-    message = (update.get("message") or update.get("edited_message") or {}) if isinstance(update, dict) else {}
-    chat_id = (message.get("chat") or {}).get("id") if isinstance(message, dict) else None
+    message = (
+        (update.get("message") or update.get("edited_message") or {})
+        if isinstance(update, dict)
+        else {}
+    )
+    chat_id = (
+        (message.get("chat") or {}).get("id") if isinstance(message, dict) else None
+    )
     update_id = update.get("update_id") if isinstance(update, dict) else None
 
     from_data = (message.get("from") or {}) if isinstance(message, dict) else {}
     telegram_id: int | None = from_data.get("id") or chat_id
     username: str | None = from_data.get("username")
+    message_id: int | None = (
+        message.get("message_id") if isinstance(message, dict) else None
+    )
+    text: str | None = message.get("text") if isinstance(message, dict) else None
 
     logger.info(
         "celery_task_started name=handle_telegram_update task_id=%s update_id=%s chat_id=%s",
-        task_id, update_id, chat_id,
+        task_id,
+        update_id,
+        chat_id,
     )
 
     if not telegram_id or not chat_id:
-        logger.warning("handle_telegram_update: missing telegram_id or chat_id, skipping")
+        logger.warning(
+            "handle_telegram_update: missing telegram_id or chat_id, skipping"
+        )
+        return
+
+    if update_id is None:
+        logger.warning("handle_telegram_update: missing update_id, skipping")
+        return
+
+    if message_id is None:
+        logger.warning("handle_telegram_update: missing message_id, skipping")
         return
 
     with worker_db_session() as db:
-        user_svc = UserService(db)
-        ctx_svc = ContextService(db)
+        # Create/get session for dedup tracking
+        session_id = _get_or_create_session(db, chat_id)
 
+        # Dedup check: try to record this update_id
+        # This is the FIRST thing we do - before any other processing
+        user_svc = UserService(db)
         user, created = user_svc.get_or_create(
             telegram_id=telegram_id,
             chat_id=chat_id,
             username=username,
         )
 
+        dedup_svc = DedupService(db)
+        if not dedup_svc.record_if_new(
+            update_id=update_id,
+            session_id=session_id,
+            chat_id=chat_id,
+            user_id=user.id,
+            telegram_id=telegram_id,
+            message_id=message_id,
+            text=text,
+        ):
+            logger.info(
+                "handle_telegram_update: duplicate update_id=%s, skipping", update_id
+            )
+            db.commit()  # Commit the session creation if any
+            return
+
         if created:
             logger.info("new_user_created telegram_id=%s", telegram_id)
 
         user_svc.update_last_interaction(user)
+        db.commit()  # Commit user creation + dedup record before onboarding
 
+        # Now process onboarding with a fresh transaction context
+        # Onboarding handlers manage their own commits
         if needs_onboarding(user):
+            ctx_svc = ContextService(db)
             handle_onboarding(update, user, db, ctx_svc, settings)
         else:
-            # TODO: wire Router in next step
-            logger.info("handle_telegram_update: user onboarded, routing not yet wired")
+            # Wire Router for onboarded users
+            from app.telegram.router import Handlers, Router, RouteContext
+            from app.telegram.handlers.reset import handle as handle_reset
+            from app.telegram.handlers.commands import handle as handle_command
+            from app.telegram.handlers.buttons import handle as handle_button
+            from app.telegram.bot_api import send_message
 
-        db.commit()
+            ctx_svc = ContextService(db)
+
+            def _make_reset_handler():
+                def handler(update: dict, ctx: RouteContext) -> None:
+                    handle_reset(update, ctx.user, ctx.db, ctx_svc, settings)
+                return handler
+
+            def _make_button_handler():
+                def handler(update: dict, ctx: RouteContext) -> None:
+                    handle_button(update, ctx.user, ctx.db, ctx_svc, settings)
+                return handler
+
+            def _make_command_handler():
+                def handler(update: dict, ctx: RouteContext) -> None:
+                    handle_command(update, ctx.user, ctx.db, ctx_svc, settings)
+                return handler
+
+            def _handle_file(update: dict, ctx: RouteContext) -> None:
+                """Stub for file upload handler (Phase 2)."""
+                logger.info("file_handler_stub: file upload received")
+                send_message(
+                    chat_id=ctx.user.chat_id,
+                    text="File received! Processing will be available in Phase 2.",
+                    settings=settings,
+                )
+
+            def _handle_pattern(update: dict, ctx: RouteContext) -> None:
+                """Stub for pattern handler (#N, qty+unit)."""
+                msg = update.get("message", {})
+                text = msg.get("text", "")
+                logger.info("pattern_handler_stub: pattern=%s", text)
+                send_message(
+                    chat_id=ctx.user.chat_id,
+                    text=f"Pattern recognized: {text}",
+                    settings=settings,
+                )
+
+            def _handle_llm(update: dict, ctx: RouteContext) -> None:
+                """Stub for LLM fallback handler (Phase 2)."""
+                logger.info("llm_handler_stub: falling back to LLM")
+                send_message(
+                    chat_id=ctx.user.chat_id,
+                    text="I'm not sure how to help with that. Try /help for available commands.",
+                    settings=settings,
+                )
+
+            handlers = Handlers(
+                reset=_make_reset_handler(),
+                button=_make_button_handler(),
+                command=_make_command_handler(),
+                file=_handle_file,
+                pattern=_handle_pattern,
+                llm=_handle_llm,
+            )
+
+            router = Router(handlers)
+            route_ctx = RouteContext(db=db, user=user)
+            router.route(update, route_ctx)

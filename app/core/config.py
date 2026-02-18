@@ -38,7 +38,7 @@ class Settings(BaseSettings):
     celery_sqs_visibility_timeout_seconds: int = 60 * 30  # 30 minutes
     celery_sqs_wait_time_seconds: int = 10  # long polling (max 20)
 
-    auth_secret: str = "dev-secret-change-me"
+    auth_secret: str = ""  # REQUIRED in production. Must be set via APP_AUTH_SECRET env var.
     auth_token_ttl_seconds: int = 60 * 60 * 24 * 7  # 7 days
     telegram_webapp_auth_max_age_seconds: int = 60 * 60 * 24  # 24h
 
