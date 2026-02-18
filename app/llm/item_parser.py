@@ -31,6 +31,7 @@ All top-level string fields are nullable. line_items is always a list.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import json
 import logging
 
@@ -39,6 +40,8 @@ from openai import OpenAI
 from app.core.config import Settings
 
 logger = logging.getLogger(__name__)
+
+LlmCallCallback = Callable[[dict[str, object]], None]
 
 
 class ParseError(Exception):
@@ -116,6 +119,7 @@ def ocr_page_to_markdown(
     settings: Settings,
     image_b64: str,
     image_mime: str = "image/jpeg",
+    on_llm_call: LlmCallCallback | None = None,
 ) -> str:
     """Stage 1: send image to vision LLM, returns raw Markdown text.
 
@@ -150,13 +154,34 @@ def ocr_page_to_markdown(
             temperature=0.0,
         )
     except Exception as exc:
+        _emit_llm_call(
+            on_llm_call=on_llm_call,
+            payload={
+                "purpose": "ocr_page_to_markdown",
+                "model": model,
+                "error": str(exc),
+            },
+        )
         logger.error("ocr_page_to_markdown error: %s", exc)
         raise ParseError(f"OCR LLM call failed: {exc}") from exc
 
+    _emit_llm_call(
+        on_llm_call=on_llm_call,
+        payload={
+            "purpose": "ocr_page_to_markdown",
+            "model": model,
+            "upstream_id": getattr(response, "id", None),
+            "usage": _extract_usage_dict(response),
+        },
+    )
     return (response.choices[0].message.content or "").strip()
 
 
-def parse_invoice(settings: Settings, text: str) -> dict:
+def parse_invoice(
+    settings: Settings,
+    text: str,
+    on_llm_call: LlmCallCallback | None = None,
+) -> dict:
     """Stage 2: extract structured invoice data from Markdown text.
 
     Returns:
@@ -171,10 +196,15 @@ def parse_invoice(settings: Settings, text: str) -> dict:
         document_type="invoice",
         settings=settings,
         text=text,
+        on_llm_call=on_llm_call,
     )
 
 
-def parse_price_list(settings: Settings, text: str) -> dict:
+def parse_price_list(
+    settings: Settings,
+    text: str,
+    on_llm_call: LlmCallCallback | None = None,
+) -> dict:
     """Stage 2: extract structured price list data from Markdown text.
 
     Returns:
@@ -189,6 +219,7 @@ def parse_price_list(settings: Settings, text: str) -> dict:
         document_type="price_list",
         settings=settings,
         text=text,
+        on_llm_call=on_llm_call,
     )
 
 
@@ -201,6 +232,7 @@ def _call_parser(
     document_type: str,
     settings: Settings,
     text: str,
+    on_llm_call: LlmCallCallback | None = None,
 ) -> dict:
     """Shared stage-2 LLM call: Markdown text → structured JSON dict."""
     client = OpenAI(
@@ -227,8 +259,26 @@ def _call_parser(
             temperature=0.0,
         )
     except Exception as exc:
+        _emit_llm_call(
+            on_llm_call=on_llm_call,
+            payload={
+                "purpose": f"parse_{document_type}",
+                "model": model,
+                "error": str(exc),
+            },
+        )
         logger.error("item_parser_llm_error doc_type=%s error=%s", document_type, exc)
         raise ParseError(f"LLM call failed: {exc}") from exc
+
+    _emit_llm_call(
+        on_llm_call=on_llm_call,
+        payload={
+            "purpose": f"parse_{document_type}",
+            "model": model,
+            "upstream_id": getattr(response, "id", None),
+            "usage": _extract_usage_dict(response),
+        },
+    )
 
     raw_text = (response.choices[0].message.content or "").strip()
 
@@ -248,6 +298,39 @@ def _call_parser(
         raise ParseError(f"LLM returned invalid JSON: {exc}") from exc
 
     return _validate(parsed, document_type)
+
+
+def _extract_usage_dict(response: object) -> dict[str, int] | None:
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return None
+
+    prompt_tokens = getattr(usage, "prompt_tokens", None)
+    completion_tokens = getattr(usage, "completion_tokens", None)
+    total_tokens = getattr(usage, "total_tokens", None)
+
+    usage_dict: dict[str, int] = {}
+    if isinstance(prompt_tokens, int):
+        usage_dict["prompt_tokens"] = prompt_tokens
+    if isinstance(completion_tokens, int):
+        usage_dict["completion_tokens"] = completion_tokens
+    if isinstance(total_tokens, int):
+        usage_dict["total_tokens"] = total_tokens
+
+    return usage_dict or None
+
+
+def _emit_llm_call(
+    *,
+    on_llm_call: LlmCallCallback | None,
+    payload: dict[str, object],
+) -> None:
+    if on_llm_call is None:
+        return
+    try:
+        on_llm_call(payload)
+    except Exception:
+        logger.exception("item_parser_on_llm_call_failed")
 
 
 def _validate(raw: dict, document_type: str) -> dict:

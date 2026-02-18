@@ -123,8 +123,47 @@ def handle_telegram_update(update: dict) -> None:
         return
 
     with worker_db_session() as db:
-        # Create/get session for dedup tracking
-        session_id = _get_or_create_session(db, chat_id)
+        # Reuse session_id from webhook ACK when available so downstream writes
+        # (staging, outgoing messages, LLM calls) stay in one thread.
+        session_id: uuid.UUID | None = None
+        session_id_raw = update.get("_session_id") if isinstance(update, dict) else None
+        if isinstance(session_id_raw, str):
+            try:
+                session_id = uuid.UUID(session_id_raw)
+            except ValueError:
+                logger.warning(
+                    "handle_telegram_update: invalid _session_id=%s", session_id_raw
+                )
+        if session_id is None:
+            session_id = _get_or_create_session(db, chat_id)
+
+        from app.telegram.bot_api import bind_current_session, bind_outgoing_db_logger
+        from app.services.telemetry import record_outgoing_message
+
+        def _outgoing_db_logger(
+            out_chat_id: int,
+            out_text: str,
+            telegram_message_id: int | None,
+        ) -> None:
+            if not out_text.strip():
+                return
+            try:
+                with worker_db_session() as telemetry_db:
+                    record_outgoing_message(
+                        db=telemetry_db,
+                        session_id=session_id,
+                        chat_id=out_chat_id,
+                        kind="reply",
+                        text=out_text,
+                        telegram_message_id=telegram_message_id,
+                    )
+                    telemetry_db.commit()
+            except Exception:
+                logger.exception(
+                    "telegram_outgoing_log_failed session_id=%s chat_id=%s",
+                    session_id,
+                    out_chat_id,
+                )
 
         # Dedup check: try to record this update_id
         # This is the FIRST thing we do - before any other processing
@@ -159,95 +198,96 @@ def handle_telegram_update(update: dict) -> None:
 
         # Process the update. On any exception (including send_message failures),
         # delete the dedup record so Celery can retry and re-send the message.
-        try:
-            if needs_onboarding(user):
-                ctx_svc = ContextService(db)
-                handle_onboarding(update, user, db, ctx_svc, settings)
-            else:
-                # Wire Router for onboarded users
-                from app.telegram.router import Handlers, Router, RouteContext
-                from app.telegram.handlers.reset import handle as handle_reset
-                from app.telegram.handlers.commands import handle as handle_command
-                from app.telegram.handlers.buttons import handle as handle_button
-                from app.telegram.bot_api import send_message
-
-                ctx_svc = ContextService(db)
-
-                def _make_reset_handler():
-                    def handler(update: dict, ctx: RouteContext) -> None:
-                        handle_reset(update, ctx.user, ctx.db, ctx_svc, settings)
-                    return handler
-
-                def _make_button_handler():
-                    def handler(update: dict, ctx: RouteContext) -> None:
-                        handle_button(update, ctx.user, ctx.db, ctx_svc, settings)
-                    return handler
-
-                def _make_command_handler():
-                    def handler(update: dict, ctx: RouteContext) -> None:
-                        handle_command(update, ctx.user, ctx.db, ctx_svc, settings)
-                    return handler
-
-                def _handle_file(update: dict, ctx: RouteContext) -> None:
-                    """Handle file/photo uploads — create staging + ask doc type."""
-                    from app.telegram.handlers.files import handle as handle_files
-                    handle_files(update, ctx.user, ctx.db, ctx_svc, settings)
-
-                def _handle_pattern(update: dict, ctx: RouteContext) -> None:
-                    """Stub for pattern handler (#N, qty+unit)."""
-                    msg = update.get("message", {})
-                    text = msg.get("text", "")
-                    logger.info("pattern_handler_stub: pattern=%s", text)
-                    send_message(
-                        chat_id=ctx.user.chat_id,
-                        text=f"Pattern recognized: {text}",
-                        settings=settings,
-                    )
-
-                def _handle_llm(update: dict, ctx: RouteContext) -> None:
-                    """LLM fallback — intercepts item-edit text input if editing context is active."""
-                    # Check for active item-edit flow before falling through to LLM stub
-                    edit_ctx = ctx_svc.get_fields(ctx.user)
-                    if (
-                        edit_ctx.get("editing_staging_id") is not None
-                        and edit_ctx.get("editing_item_idx") is not None
-                        and edit_ctx.get("editing_field") is not None
-                    ):
-                        from app.telegram.handlers.buttons import handle_item_edit_input
-                        handle_item_edit_input(update, ctx.user, ctx.db, ctx_svc, settings)
-                        return
-
-                    logger.info("llm_handler_stub: falling back to LLM")
-                    send_message(
-                        chat_id=ctx.user.chat_id,
-                        text="I'm not sure how to help with that. Try /help for available commands.",
-                        settings=settings,
-                    )
-
-                handlers = Handlers(
-                    reset=_make_reset_handler(),
-                    button=_make_button_handler(),
-                    command=_make_command_handler(),
-                    file=_handle_file,
-                    pattern=_handle_pattern,
-                    llm=_handle_llm,
-                )
-
-                router = Router(handlers)
-                route_ctx = RouteContext(db=db, user=user)
-                router.route(update, route_ctx)
-
-        except Exception:
-            # Roll back any uncommitted handler state, then delete the dedup record
-            # so Celery's retry can reprocess (re-send) this update.
+        with bind_current_session(session_id), bind_outgoing_db_logger(_outgoing_db_logger):
             try:
-                db.rollback()
-                dedup_svc.delete_by_update_id(update_id)
-                db.commit()
+                if needs_onboarding(user):
+                    ctx_svc = ContextService(db)
+                    handle_onboarding(update, user, db, ctx_svc, settings)
+                else:
+                    # Wire Router for onboarded users
+                    from app.telegram.router import Handlers, Router, RouteContext
+                    from app.telegram.handlers.reset import handle as handle_reset
+                    from app.telegram.handlers.commands import handle as handle_command
+                    from app.telegram.handlers.buttons import handle as handle_button
+                    from app.telegram.bot_api import send_message
+
+                    ctx_svc = ContextService(db)
+
+                    def _make_reset_handler():
+                        def handler(update: dict, ctx: RouteContext) -> None:
+                            handle_reset(update, ctx.user, ctx.db, ctx_svc, settings)
+                        return handler
+
+                    def _make_button_handler():
+                        def handler(update: dict, ctx: RouteContext) -> None:
+                            handle_button(update, ctx.user, ctx.db, ctx_svc, settings)
+                        return handler
+
+                    def _make_command_handler():
+                        def handler(update: dict, ctx: RouteContext) -> None:
+                            handle_command(update, ctx.user, ctx.db, ctx_svc, settings)
+                        return handler
+
+                    def _handle_file(update: dict, ctx: RouteContext) -> None:
+                        """Handle file/photo uploads — create staging + ask doc type."""
+                        from app.telegram.handlers.files import handle as handle_files
+                        handle_files(update, ctx.user, ctx.db, ctx_svc, settings)
+
+                    def _handle_pattern(update: dict, ctx: RouteContext) -> None:
+                        """Stub for pattern handler (#N, qty+unit)."""
+                        msg = update.get("message", {})
+                        text = msg.get("text", "")
+                        logger.info("pattern_handler_stub: pattern=%s", text)
+                        send_message(
+                            chat_id=ctx.user.chat_id,
+                            text=f"Pattern recognized: {text}",
+                            settings=settings,
+                        )
+
+                    def _handle_llm(update: dict, ctx: RouteContext) -> None:
+                        """LLM fallback — intercepts item-edit text input if editing context is active."""
+                        # Check for active item-edit flow before falling through to LLM stub
+                        edit_ctx = ctx_svc.get_fields(ctx.user)
+                        if (
+                            edit_ctx.get("editing_staging_id") is not None
+                            and edit_ctx.get("editing_item_idx") is not None
+                            and edit_ctx.get("editing_field") is not None
+                        ):
+                            from app.telegram.handlers.buttons import handle_item_edit_input
+                            handle_item_edit_input(update, ctx.user, ctx.db, ctx_svc, settings)
+                            return
+
+                        logger.info("llm_handler_stub: falling back to LLM")
+                        send_message(
+                            chat_id=ctx.user.chat_id,
+                            text="I'm not sure how to help with that. Try /help for available commands.",
+                            settings=settings,
+                        )
+
+                    handlers = Handlers(
+                        reset=_make_reset_handler(),
+                        button=_make_button_handler(),
+                        command=_make_command_handler(),
+                        file=_handle_file,
+                        pattern=_handle_pattern,
+                        llm=_handle_llm,
+                    )
+
+                    router = Router(handlers)
+                    route_ctx = RouteContext(db=db, user=user)
+                    router.route(update, route_ctx)
+
             except Exception:
-                logger.exception(
-                    "handle_telegram_update: failed to remove dedup for retry "
-                    "update_id=%s",
-                    update_id,
-                )
-            raise
+                # Roll back any uncommitted handler state, then delete the dedup record
+                # so Celery's retry can reprocess (re-send) this update.
+                try:
+                    db.rollback()
+                    dedup_svc.delete_by_update_id(update_id)
+                    db.commit()
+                except Exception:
+                    logger.exception(
+                        "handle_telegram_update: failed to remove dedup for retry "
+                        "update_id=%s",
+                        update_id,
+                    )
+                raise

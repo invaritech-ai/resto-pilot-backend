@@ -24,6 +24,7 @@ the balance update runs atomically via INSERT ... ON CONFLICT DO UPDATE.
 from __future__ import annotations
 
 import datetime as dt
+import logging
 import uuid
 from dataclasses import dataclass
 
@@ -34,6 +35,8 @@ from sqlalchemy.orm import Session
 from app.db.models.inventory_balances import InventoryBalance
 from app.db.models.inventory_items import InventoryItem
 from app.db.models.inventory_transactions import InventoryTransaction
+
+logger = logging.getLogger(__name__)
 
 
 class ItemNotFoundError(Exception):
@@ -355,3 +358,49 @@ class InventoryService:
             zero_stock_count=zero_count,
             negative_count=negative_count,
         )
+
+    def list_negative_items(
+        self,
+        restaurant_id: uuid.UUID,
+        limit: int = 5,
+    ) -> list[tuple[InventoryItem, InventoryBalance]]:
+        """Return most-negative balance items for a restaurant."""
+        stmt = (
+            select(InventoryItem, InventoryBalance)
+            .join(
+                InventoryBalance,
+                (InventoryBalance.item_id == InventoryItem.id)
+                & (InventoryBalance.restaurant_id == restaurant_id),
+            )
+            .where(
+                InventoryItem.restaurant_id == restaurant_id,
+                InventoryBalance.balance < 0,
+            )
+            .order_by(InventoryBalance.balance.asc(), InventoryItem.name_lower)
+            .limit(limit)
+        )
+        rows = self.session.execute(stmt).all()
+        return [(row[0], row[1]) for row in rows]
+
+    def list_zero_stock_items(
+        self,
+        restaurant_id: uuid.UUID,
+        limit: int = 5,
+    ) -> list[tuple[InventoryItem, InventoryBalance]]:
+        """Return zero-balance items for a restaurant."""
+        stmt = (
+            select(InventoryItem, InventoryBalance)
+            .join(
+                InventoryBalance,
+                (InventoryBalance.item_id == InventoryItem.id)
+                & (InventoryBalance.restaurant_id == restaurant_id),
+            )
+            .where(
+                InventoryItem.restaurant_id == restaurant_id,
+                InventoryBalance.balance == 0,
+            )
+            .order_by(InventoryItem.name_lower)
+            .limit(limit)
+        )
+        rows = self.session.execute(stmt).all()
+        return [(row[0], row[1]) for row in rows]

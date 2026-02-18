@@ -384,7 +384,8 @@ class TestTeamCommand:
             members.append((u, m))
 
         with patch("app.telegram.handlers.commands.RestaurantService") as MockSvc, \
-             patch("app.telegram.handlers.commands.send_message") as mock_send:
+             patch("app.telegram.handlers.commands.send_message_with_keyboard") as mock_send, \
+             patch("app.telegram.handlers.commands.send_message"):
             MockSvc.return_value.user_membership_exists.return_value = True
             MockSvc.return_value.list_for_user.return_value = [(restaurant, owner_mem)]
             MockSvc.return_value.list_members.return_value = members
@@ -527,6 +528,8 @@ class TestBalanceCommand:
              patch("app.telegram.handlers.commands.send_message") as mock_send:
             MockRest.return_value.user_membership_exists.return_value = True
             MockInv.return_value.get_balance_summary.return_value = summary
+            MockInv.return_value.list_negative_items.return_value = []
+            MockInv.return_value.list_zero_stock_items.return_value = []
             handle(_make_update("/balance"), user, db, ctx_svc, _make_settings())
 
         text = mock_send.call_args[1]["text"]
@@ -545,12 +548,47 @@ class TestBalanceCommand:
              patch("app.telegram.handlers.commands.send_message") as mock_send:
             MockRest.return_value.user_membership_exists.return_value = True
             MockInv.return_value.get_balance_summary.return_value = summary
+            MockInv.return_value.list_negative_items.return_value = []
+            MockInv.return_value.list_zero_stock_items.return_value = []
             handle(_make_update("/balance"), user, db, ctx_svc, _make_settings())
 
         text = mock_send.call_args[1]["text"]
         assert "15" in text
         assert "2" in text
         assert "1" in text
+
+    def test_includes_item_breakdown_sections(self):
+        user = _make_user(RESTAURANT_ID)
+        ctx_svc = _make_ctx_svc(user)
+        db = _make_db()
+
+        from app.services.inventory_service import BalanceSummary
+        summary = BalanceSummary(total_items=20, zero_stock_count=2, negative_count=3)
+        neg_item = MagicMock()
+        neg_item.name = "Olive Oil"
+        neg_item.unit = "L"
+        neg_balance = MagicMock()
+        neg_balance.balance = -4
+        zero_item = MagicMock()
+        zero_item.name = "Chicken Breast"
+        zero_item.unit = "kg"
+        zero_balance = MagicMock()
+        zero_balance.balance = 0
+
+        with patch("app.telegram.handlers.commands.RestaurantService") as MockRest, \
+             patch("app.telegram.handlers.commands.InventoryService") as MockInv, \
+             patch("app.telegram.handlers.commands.send_message") as mock_send:
+            MockRest.return_value.user_membership_exists.return_value = True
+            MockInv.return_value.get_balance_summary.return_value = summary
+            MockInv.return_value.list_negative_items.return_value = [(neg_item, neg_balance)]
+            MockInv.return_value.list_zero_stock_items.return_value = [(zero_item, zero_balance)]
+            handle(_make_update("/balance"), user, db, ctx_svc, _make_settings())
+
+        text = mock_send.call_args[1]["text"]
+        assert "Most negative items" in text
+        assert "Olive Oil" in text
+        assert "Zero-stock items" in text
+        assert "Chicken Breast" in text
 
     def test_zero_stock_shows_warning_flag(self):
         user = _make_user(RESTAURANT_ID)
@@ -565,6 +603,8 @@ class TestBalanceCommand:
              patch("app.telegram.handlers.commands.send_message") as mock_send:
             MockRest.return_value.user_membership_exists.return_value = True
             MockInv.return_value.get_balance_summary.return_value = summary
+            MockInv.return_value.list_negative_items.return_value = []
+            MockInv.return_value.list_zero_stock_items.return_value = []
             handle(_make_update("/balance"), user, db, ctx_svc, _make_settings())
 
         text = mock_send.call_args[1]["text"]
@@ -583,6 +623,8 @@ class TestBalanceCommand:
              patch("app.telegram.handlers.commands.send_message") as mock_send:
             MockRest.return_value.user_membership_exists.return_value = True
             MockInv.return_value.get_balance_summary.return_value = summary
+            MockInv.return_value.list_negative_items.return_value = []
+            MockInv.return_value.list_zero_stock_items.return_value = []
             handle(_make_update("/balance"), user, db, ctx_svc, _make_settings())
 
         text = mock_send.call_args[1]["text"]
@@ -692,6 +734,7 @@ class TestProductsCommand:
              patch("app.telegram.handlers.commands.send_message") as mock_send:
             MockSvc.return_value.user_membership_exists.return_value = True
             MockSvc2.return_value.list_products_for_restaurant.return_value = []
+            MockSvc2.return_value.count_products_for_restaurant.return_value = 0
             handle(_make_update("/products"), user, db, ctx_svc, _make_settings())
 
         text = mock_send.call_args[1]["text"]
@@ -759,7 +802,8 @@ class TestProductsCommand:
 
         with patch("app.telegram.handlers.commands.RestaurantService") as MockSvc, \
              patch("app.telegram.handlers.commands.SupplierService") as MockSvc2, \
-             patch("app.telegram.handlers.commands.send_message") as mock_send:
+             patch("app.telegram.handlers.commands.send_message_with_keyboard") as mock_send, \
+             patch("app.telegram.handlers.commands.send_message"):
             MockSvc.return_value.user_membership_exists.return_value = True
             MockSvc2.return_value.list_products_for_restaurant.return_value = page
             MockSvc2.return_value.count_products_for_restaurant.return_value = 11
@@ -857,6 +901,7 @@ class TestPricesCommand:
             MockSvc.return_value.user_membership_exists.return_value = True
             MockSvc2.return_value.fuzzy_search_for_restaurant.return_value = [(supplier, 0.9)]
             MockSvc2.return_value.list_prices_for_supplier.return_value = []
+            MockSvc2.return_value.count_prices_for_supplier.return_value = 0
             handle(_make_update("/prices ABC"), user, db, ctx_svc, _make_settings())
 
         text = mock_send.call_args[1]["text"]
@@ -924,7 +969,8 @@ class TestPricesCommand:
 
         with patch("app.telegram.handlers.commands.RestaurantService") as MockSvc, \
              patch("app.telegram.handlers.commands.SupplierService") as MockSvc2, \
-             patch("app.telegram.handlers.commands.send_message") as mock_send:
+             patch("app.telegram.handlers.commands.send_message_with_keyboard") as mock_send, \
+             patch("app.telegram.handlers.commands.send_message"):
             MockSvc.return_value.user_membership_exists.return_value = True
             MockSvc2.return_value.fuzzy_search_for_restaurant.return_value = [(supplier, 0.9)]
             MockSvc2.return_value.list_prices_for_supplier.return_value = page

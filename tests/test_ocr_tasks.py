@@ -57,6 +57,7 @@ def _make_staging(
     s.document_type = document_type
     s.restaurant_id = restaurant_id or RESTAURANT_ID
     s.supplier_id = None
+    s.session_id = None
     return s
 
 
@@ -297,6 +298,60 @@ class TestSupplierGateSuggest:
         call_kwargs = mock_kboard.call_args
         sup_arg = call_kwargs[0][2] if len(call_kwargs[0]) >= 3 else call_kwargs[1].get("sup_buttons")
         assert sup_arg == suggest_buttons
+
+
+class TestLlmTelemetry:
+    @patch("app.workers.ocr_tasks.get_settings")
+    @patch("app.workers.ocr_tasks.worker_db_session")
+    @patch("app.workers.ocr_tasks.get_file_bytes")
+    @patch("app.workers.ocr_tasks._resolve_supplier")
+    @patch("app.workers.ocr_tasks._send_with_keyboard")
+    @patch("app.workers.ocr_tasks.record_llm_call")
+    def test_process_file_records_llm_calls(
+        self,
+        mock_record_llm_call,
+        mock_send,
+        mock_resolve,
+        mock_get_bytes,
+        mock_db_ctx,
+        mock_settings,
+    ):
+        settings = _make_settings()
+        mock_settings.return_value = settings
+
+        staging = _make_staging()
+        staging.session_id = uuid.uuid4()
+        db, fake_ctx = _patch_db_and_task(staging)
+
+        supplier = _make_supplier("ACME Foods")
+        mock_resolve.return_value = (supplier, None)
+        mock_get_bytes.return_value = b"PDF bytes"
+        mock_send.return_value = 42
+
+        def fake_extract(file_bytes, mime, document_type, settings, on_llm_call=None):
+            assert on_llm_call is not None
+            on_llm_call(
+                {
+                    "purpose": "parse_invoice",
+                    "model": "gpt-4o-mini",
+                    "usage": {"prompt_tokens": 12, "completion_tokens": 5, "total_tokens": 17},
+                    "upstream_id": "resp_123",
+                }
+            )
+            return _INVOICE_EXTRACTED
+
+        with (
+            patch("app.workers.ocr_tasks.worker_db_session", fake_ctx),
+            patch("app.workers.ocr_tasks._extract", side_effect=fake_extract),
+        ):
+            _run_task(STAGING_ID.hex, "invoice")
+
+        assert mock_record_llm_call.called
+        kwargs = mock_record_llm_call.call_args.kwargs
+        assert kwargs["session_id"] == staging.session_id
+        assert kwargs["purpose"] == "parse_invoice"
+        assert kwargs["model"] == "gpt-4o-mini"
+        assert kwargs["upstream_id"] == "resp_123"
 
 
 # ---------------------------------------------------------------------------

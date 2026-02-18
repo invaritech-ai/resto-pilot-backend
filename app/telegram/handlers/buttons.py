@@ -37,7 +37,7 @@ Implemented actions:
       Store editing state in context, prompt user to type new value
 
 Stubs (not yet implemented):
-  list_p, res_h
+  res_h
 """
 
 from __future__ import annotations
@@ -118,6 +118,7 @@ def handle(
         "open_u":    _handle_open_u,
         "pick_cur":  _handle_pick_cur,
         "set_cur":   _handle_set_cur,
+        "list_p":    _handle_list_page,
         "ed_row":    _handle_ed_row,
         "ed_fld":    _handle_ed_fld,
     }
@@ -139,7 +140,7 @@ def handle(
     # Stubs
     if action == "rev_u":
         answer_callback_query(callback_id=callback_id, text="", settings=settings)
-    elif action in ("list_p", "res_h"):
+    elif action == "res_h":
         answer_callback_query(callback_id=callback_id, text="", settings=settings)
     else:
         logger.warning("buttons: unknown action %s", action)
@@ -228,7 +229,7 @@ def _handle_conf_u(*, params, user, db, ctx_svc, settings, callback_id, chat_id,
         restaurant_id=staging.restaurant_id, user_id=user.id
     )
     if not (is_owner or is_member):
-        answer_callback_query(callback_id=callback_id, text="Not authorised.", settings=settings)
+        answer_callback_query(callback_id=callback_id, text="Not authorized.", settings=settings)
         return
 
     if staging.status != "pending_review":
@@ -315,7 +316,12 @@ def _handle_conf_u(*, params, user, db, ctx_svc, settings, callback_id, chat_id,
 
     # Load or compute pending_item_resolutions
     ctx = ctx_svc.get(user)
-    resolutions: dict = ctx.get("pending_item_resolutions") or {}
+    if not isinstance(ctx, dict):
+        ctx = {}
+    raw_resolutions = ctx.get("pending_item_resolutions")
+    resolutions: dict = (
+        dict(raw_resolutions) if isinstance(raw_resolutions, dict) else {}
+    )
 
     inv_svc = InventoryService(db)
 
@@ -1126,6 +1132,67 @@ def _handle_rev_page(*, params, user, db, ctx_svc, settings, callback_id, chat_i
             settings=settings,
             reply_markup=keyboard,
         )
+    answer_callback_query(callback_id=callback_id, text="", settings=settings)
+
+
+def _handle_list_page(*, params, user, db, ctx_svc, settings, callback_id, chat_id, message_id):
+    """Navigate paginated slash-command lists (products/prices/inventory/suppliers/team)."""
+    if len(params) < 2:
+        answer_callback_query(callback_id=callback_id, text="Invalid.", settings=settings)
+        return
+
+    list_type = params[0]
+    try:
+        page = int(params[1])
+    except (ValueError, TypeError):
+        answer_callback_query(callback_id=callback_id, text="Invalid.", settings=settings)
+        return
+
+    if page < 0:
+        answer_callback_query(callback_id=callback_id, text="Invalid.", settings=settings)
+        return
+
+    try:
+        from app.telegram.handlers.commands import build_list_page
+
+        text, reply_markup = build_list_page(
+            list_type=list_type,
+            page=page,
+            user=user,
+            db=db,
+            ctx_svc=ctx_svc,
+            settings=settings,
+        )
+    except ValueError as exc:
+        answer_callback_query(
+            callback_id=callback_id,
+            text=str(exc),
+            show_alert=True,
+            settings=settings,
+        )
+        return
+
+    db.commit()
+
+    if message_id:
+        edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+            settings=settings,
+            reply_markup=reply_markup,
+        )
+    else:
+        if reply_markup and reply_markup.get("inline_keyboard"):
+            send_message_with_keyboard(
+                chat_id=chat_id,
+                text=text,
+                reply_markup=reply_markup,
+                settings=settings,
+            )
+        else:
+            send_message(chat_id=chat_id, text=text, settings=settings)
+
     answer_callback_query(callback_id=callback_id, text="", settings=settings)
 
 

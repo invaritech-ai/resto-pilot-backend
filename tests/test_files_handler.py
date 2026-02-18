@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from app.telegram.handlers.files import handle
+from app.telegram.bot_api import bind_current_session
 
 
 # ---------------------------------------------------------------------------
@@ -37,9 +38,17 @@ def _make_staging(staging_id: uuid.UUID | None = None) -> MagicMock:
     return s
 
 
-def _make_ctx_svc(restaurant_id: uuid.UUID | None = None) -> MagicMock:
+_UNSET = object()
+
+
+def _make_ctx_svc(restaurant_id: uuid.UUID | None | object = _UNSET) -> MagicMock:
     ctx = MagicMock()
-    ctx.get_active_restaurant_id.return_value = restaurant_id or uuid.uuid4()
+    if restaurant_id is _UNSET:
+        ctx.get_active_restaurant_id.return_value = uuid.uuid4()
+    elif restaurant_id is None:
+        ctx.get_active_restaurant_id.return_value = None
+    else:
+        ctx.get_active_restaurant_id.return_value = restaurant_id
     return ctx
 
 
@@ -89,14 +98,12 @@ def _photo_update(
 
 class TestHandleDocument:
     @patch("app.telegram.handlers.files.StagingService")
-    @patch("app.telegram.handlers.files.httpx.post")
-    def test_creates_staging_for_document(self, mock_post, MockStagingService):
+    @patch("app.telegram.handlers.files.send_message_with_keyboard")
+    def test_creates_staging_for_document(self, mock_send_kb, MockStagingService):
         staging = _make_staging()
         svc_instance = MockStagingService.return_value
         svc_instance.create.return_value = staging
-
-        mock_post.return_value = MagicMock(status_code=200, json=lambda: {"ok": True, "result": {"message_id": 1}})
-        mock_post.return_value.raise_for_status = MagicMock()
+        mock_send_kb.return_value = 1
 
         user = _make_user()
         db = _make_db()
@@ -113,12 +120,11 @@ class TestHandleDocument:
         assert call_kwargs["uploaded_by"] == user.id
 
     @patch("app.telegram.handlers.files.StagingService")
-    @patch("app.telegram.handlers.files.httpx.post")
-    def test_sets_active_staging_in_context(self, mock_post, MockStagingService):
+    @patch("app.telegram.handlers.files.send_message_with_keyboard")
+    def test_sets_active_staging_in_context(self, mock_send_kb, MockStagingService):
         staging = _make_staging()
         MockStagingService.return_value.create.return_value = staging
-        mock_post.return_value = MagicMock(status_code=200, json=lambda: {"ok": True, "result": {"message_id": 1}})
-        mock_post.return_value.raise_for_status = MagicMock()
+        mock_send_kb.return_value = 1
 
         user = _make_user()
         db = _make_db()
@@ -130,12 +136,11 @@ class TestHandleDocument:
         ctx_svc.set_active_staging.assert_called_once_with(user, staging.id)
 
     @patch("app.telegram.handlers.files.StagingService")
-    @patch("app.telegram.handlers.files.httpx.post")
-    def test_commits_after_staging_created(self, mock_post, MockStagingService):
+    @patch("app.telegram.handlers.files.send_message_with_keyboard")
+    def test_commits_after_staging_created(self, mock_send_kb, MockStagingService):
         staging = _make_staging()
         MockStagingService.return_value.create.return_value = staging
-        mock_post.return_value = MagicMock(status_code=200, json=lambda: {"ok": True, "result": {"message_id": 1}})
-        mock_post.return_value.raise_for_status = MagicMock()
+        mock_send_kb.return_value = 1
 
         user = _make_user()
         db = _make_db()
@@ -147,12 +152,11 @@ class TestHandleDocument:
         db.commit.assert_called_once()
 
     @patch("app.telegram.handlers.files.StagingService")
-    @patch("app.telegram.handlers.files.httpx.post")
-    def test_sends_doc_type_keyboard(self, mock_post, MockStagingService):
+    @patch("app.telegram.handlers.files.send_message_with_keyboard")
+    def test_sends_doc_type_keyboard(self, mock_send_kb, MockStagingService):
         staging = _make_staging()
         MockStagingService.return_value.create.return_value = staging
-        mock_post.return_value = MagicMock(status_code=200, json=lambda: {"ok": True, "result": {"message_id": 1}})
-        mock_post.return_value.raise_for_status = MagicMock()
+        mock_send_kb.return_value = 1
 
         user = _make_user()
         db = _make_db()
@@ -161,12 +165,30 @@ class TestHandleDocument:
 
         handle(_doc_update(), user, db, ctx_svc, settings)
 
-        # httpx.post should be called to send the keyboard message
-        mock_post.assert_called_once()
-        payload = mock_post.call_args[1]["json"]
-        assert payload["chat_id"] == user.chat_id
-        assert "📎" in payload["text"]
-        assert "reply_markup" in payload
+        mock_send_kb.assert_called_once()
+        assert mock_send_kb.call_args.kwargs["chat_id"] == user.chat_id
+        assert "📎" in mock_send_kb.call_args.kwargs["text"]
+        assert "reply_markup" in mock_send_kb.call_args.kwargs
+
+    @patch("app.telegram.handlers.files.StagingService")
+    @patch("app.telegram.handlers.files.send_message_with_keyboard")
+    def test_uses_session_id_from_contextvar(self, mock_send_kb, MockStagingService):
+        staging = _make_staging()
+        svc_instance = MockStagingService.return_value
+        svc_instance.create.return_value = staging
+        mock_send_kb.return_value = 1
+
+        user = _make_user()
+        db = _make_db()
+        ctx_svc = _make_ctx_svc()
+        settings = _make_settings()
+        session_id = uuid.uuid4()
+
+        with bind_current_session(session_id):
+            handle(_doc_update(), user, db, ctx_svc, settings)
+
+        call_kwargs = svc_instance.create.call_args.kwargs
+        assert call_kwargs["session_id"] == session_id
 
 
 # ---------------------------------------------------------------------------
@@ -176,13 +198,12 @@ class TestHandleDocument:
 
 class TestHandlePhoto:
     @patch("app.telegram.handlers.files.StagingService")
-    @patch("app.telegram.handlers.files.httpx.post")
-    def test_picks_largest_photo(self, mock_post, MockStagingService):
+    @patch("app.telegram.handlers.files.send_message_with_keyboard")
+    def test_picks_largest_photo(self, mock_send_kb, MockStagingService):
         staging = _make_staging()
         svc_instance = MockStagingService.return_value
         svc_instance.create.return_value = staging
-        mock_post.return_value = MagicMock(status_code=200, json=lambda: {"ok": True, "result": {"message_id": 1}})
-        mock_post.return_value.raise_for_status = MagicMock()
+        mock_send_kb.return_value = 1
 
         user = _make_user()
         db = _make_db()
@@ -196,12 +217,11 @@ class TestHandlePhoto:
         assert call_kwargs["mime"] == "image/jpeg"
 
     @patch("app.telegram.handlers.files.StagingService")
-    @patch("app.telegram.handlers.files.httpx.post")
-    def test_photo_mime_is_jpeg(self, mock_post, MockStagingService):
+    @patch("app.telegram.handlers.files.send_message_with_keyboard")
+    def test_photo_mime_is_jpeg(self, mock_send_kb, MockStagingService):
         staging = _make_staging()
         MockStagingService.return_value.create.return_value = staging
-        mock_post.return_value = MagicMock(status_code=200, json=lambda: {"ok": True, "result": {"message_id": 1}})
-        mock_post.return_value.raise_for_status = MagicMock()
+        mock_send_kb.return_value = 1
 
         user = _make_user()
         db = _make_db()
@@ -290,9 +310,15 @@ class TestUnknownFile:
 
 
 class TestNoBotToken:
+    @patch("app.telegram.handlers.files.send_message_with_keyboard", return_value=None)
     @patch("app.telegram.handlers.files.send_message")
     @patch("app.telegram.handlers.files.StagingService")
-    def test_falls_back_to_plain_send_message_when_no_token(self, MockStagingService, mock_send):
+    def test_falls_back_to_plain_send_message_when_no_token(
+        self,
+        MockStagingService,
+        mock_send,
+        mock_send_kb,
+    ):
         staging = _make_staging()
         MockStagingService.return_value.create.return_value = staging
 
@@ -304,4 +330,5 @@ class TestNoBotToken:
         handle(_doc_update(), user, db, ctx_svc, settings)
 
         # With no bot token, falls back to send_message
+        mock_send_kb.assert_called_once()
         mock_send.assert_called()

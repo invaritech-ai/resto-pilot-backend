@@ -65,3 +65,55 @@ def test_send_message_http_error_does_not_leak_token(monkeypatch: pytest.MonkeyP
 
     assert token not in str(exc.value)
 
+
+def test_send_message_calls_outgoing_db_logger(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = Settings(telegram_bot_token="TOKEN")
+    logged: list[tuple[int, str, int | None]] = []
+
+    def fake_post(url: str, json: dict, timeout: float) -> httpx.Response:
+        return _response(
+            url=url,
+            status_code=200,
+            json_body={"ok": True, "result": {"message_id": 99}},
+        )
+
+    monkeypatch.setattr(bot_api.httpx, "post", fake_post)
+
+    with bot_api.bind_outgoing_db_logger(
+        lambda chat_id, text, telegram_message_id: logged.append(
+            (chat_id, text, telegram_message_id)
+        )
+    ):
+        bot_api.send_message(chat_id=321, text="hello", settings=settings)
+
+    assert logged == [(321, "hello", 99)]
+
+
+def test_send_message_with_keyboard_calls_outgoing_db_logger(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings(telegram_bot_token="TOKEN")
+    logged: list[tuple[int, str, int | None]] = []
+
+    def fake_post(url: str, json: dict, timeout: float) -> httpx.Response:
+        return _response(
+            url=url,
+            status_code=200,
+            json_body={"ok": True, "result": {"message_id": 7}},
+        )
+
+    monkeypatch.setattr(bot_api.httpx, "post", fake_post)
+
+    with bot_api.bind_outgoing_db_logger(
+        lambda chat_id, text, telegram_message_id: logged.append(
+            (chat_id, text, telegram_message_id)
+        )
+    ):
+        bot_api.send_message_with_keyboard(
+            chat_id=222,
+            text="with keyboard",
+            reply_markup={"inline_keyboard": []},
+            settings=settings,
+        )
+
+    assert logged == [(222, "with keyboard", 7)]

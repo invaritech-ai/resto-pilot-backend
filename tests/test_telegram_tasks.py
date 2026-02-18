@@ -145,6 +145,39 @@ class TestCallbackQueryRouting:
         )
         mock_router.route.assert_called_once()
 
+    def test_reuses_session_id_from_update_payload(self):
+        """If webhook passes _session_id, worker must reuse it (no new session)."""
+        mock_db = _make_mock_db()
+        mock_user_svc, mock_dedup_svc, mock_router, _ = _make_mocks()
+        reused_session_id = uuid.uuid4()
+
+        update = {
+            "update_id": 2,
+            "_session_id": str(reused_session_id),
+            "message": {
+                "message_id": 11,
+                "from": {"id": 100, "username": "alice"},
+                "chat": {"id": 100},
+                "text": "/inventory",
+            },
+        }
+
+        with (
+            patch("app.workers.telegram_tasks.worker_db_session", _fake_wds(mock_db)),
+            patch("app.workers.telegram_tasks._get_or_create_session") as mock_get_session,
+            patch("app.workers.telegram_tasks.UserService", return_value=mock_user_svc),
+            patch("app.workers.telegram_tasks.DedupService", return_value=mock_dedup_svc),
+            patch("app.workers.telegram_tasks.needs_onboarding", return_value=False),
+            patch("app.telegram.router.Router", return_value=mock_router),
+        ):
+            handle_telegram_update(update)
+
+        mock_get_session.assert_not_called()
+        assert (
+            mock_dedup_svc.record_if_new.call_args.kwargs["session_id"]
+            == reused_session_id
+        )
+
 
 # ---------------------------------------------------------------------------
 # H2: dedup deletion on handler failure

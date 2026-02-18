@@ -17,21 +17,22 @@ Commands:
 
 from __future__ import annotations
 
+import math
 import re
 import uuid
-from collections import defaultdict
-from typing import Callable
 
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
+from app.db.models.suppliers import Supplier
 from app.db.models.user import User
 from app.services.context_service import ContextService
 from app.services.inventory_service import InventoryService
 from app.services.money import format_price
 from app.services.restaurant_service import RestaurantService
 from app.services.supplier_service import AlreadyLinkedError, SupplierService
-from app.telegram.bot_api import send_message
+from app.telegram.bot_api import send_message, send_message_with_keyboard
+from app.telegram.keyboards import pagination_keyboard
 
 
 HELP_TEXT = """Available commands:
@@ -124,6 +125,373 @@ def _parse_command(text: str) -> tuple[str, str]:
     return text.split()[0].lower() if text else "", ""
 
 
+_LIST_PAGE_SIZE = 10
+
+
+def _pagination_markup(
+    *,
+    list_type: str,
+    current_page: int,
+    total_pages: int,
+) -> dict | None:
+    """Return inline pagination keyboard or None when not needed."""
+    if total_pages <= 1:
+        return None
+    markup = pagination_keyboard(
+        list_type=list_type,
+        current_page=current_page,
+        has_next=current_page < total_pages - 1,
+        has_prev=current_page > 0,
+    )
+    if not markup.get("inline_keyboard"):
+        return None
+    return markup
+
+
+def _send_with_optional_keyboard(
+    *,
+    chat_id: int,
+    text: str,
+    reply_markup: dict | None,
+    settings: Settings,
+) -> None:
+    if reply_markup and reply_markup.get("inline_keyboard"):
+        send_message_with_keyboard(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=reply_markup,
+            settings=settings,
+        )
+        return
+    send_message(chat_id=chat_id, text=text, settings=settings)
+
+
+def _safe_page(page: int, total_items: int) -> int:
+    total_pages = max(1, math.ceil(total_items / _LIST_PAGE_SIZE))
+    if page < 0:
+        return 0
+    return min(page, total_pages - 1)
+
+
+def _render_team_page(
+    *,
+    user: User,
+    db: Session,
+    ctx_svc: ContextService,
+    settings: Settings,
+    page: int,
+) -> tuple[str, dict | None]:
+    restaurant_id = _require_active_restaurant(user, ctx_svc, db, settings)
+    if restaurant_id is None:
+        raise ValueError("No active restaurant. Send /start to complete setup.")
+
+    restaurants = RestaurantService(db).list_for_user(user_id=user.id)
+    restaurant_name = next(
+        (r.name for r, _ in restaurants if r.id == restaurant_id),
+        "Restaurant",
+    )
+
+    members = RestaurantService(db).list_members(restaurant_id=restaurant_id)
+    total = len(members)
+    if total == 0:
+        raise ValueError("No team members found.")
+
+    page = _safe_page(page, total)
+    offset = page * _LIST_PAGE_SIZE
+    page_members = members[offset : offset + _LIST_PAGE_SIZE]
+
+    ctx_svc.set_numbered_items(user, [u.id for u, _ in page_members])
+    ctx_svc.set_list_state(user, "team", offset)
+
+    lines = [f"👥 Team — {restaurant_name}\n"]
+    for i, (member, mem_record) in enumerate(page_members, offset + 1):
+        role = "Owner" if mem_record.is_owner else "Member"
+        joined = mem_record.joined_at.strftime("%b %Y")
+        name = member.full_name or member.username or "Unknown"
+        lines.append(f"{i}. {name} ({role}) — since {joined}")
+
+    total_pages = max(1, math.ceil(total / _LIST_PAGE_SIZE))
+    lines.append(f"\n{total} member{'s' if total != 1 else ''} total.")
+    if total_pages > 1:
+        lines.append(f"Page {page + 1}/{total_pages}")
+    lines.append("No pending invites.")
+
+    keyboard = _pagination_markup(
+        list_type="team",
+        current_page=page,
+        total_pages=total_pages,
+    )
+    return "\n".join(lines), keyboard
+
+
+def _render_products_page(
+    *,
+    user: User,
+    db: Session,
+    ctx_svc: ContextService,
+    settings: Settings,
+    page: int,
+) -> tuple[str, dict | None]:
+    restaurant_id = _require_active_restaurant(user, ctx_svc, db, settings)
+    if restaurant_id is None:
+        raise ValueError("No active restaurant. Send /start to complete setup.")
+
+    svc = SupplierService(db)
+    total = svc.count_products_for_restaurant(restaurant_id=restaurant_id)
+    if total == 0:
+        raise ValueError("📦 No products yet. Upload a price list to get started.")
+
+    page = _safe_page(page, total)
+    offset = page * _LIST_PAGE_SIZE
+    products = svc.list_products_for_restaurant(
+        restaurant_id=restaurant_id,
+        offset=offset,
+        limit=_LIST_PAGE_SIZE,
+    )
+
+    ctx_svc.set_numbered_items(user, [price.id for _, price in products])
+    ctx_svc.set_list_state(user, "products", offset)
+
+    lines = ["📦 Products\n"]
+    current_supplier_name = None
+    for i, (supplier, price) in enumerate(products, offset + 1):
+        if supplier.name != current_supplier_name:
+            lines.append(f"\n{supplier.name}:")
+            current_supplier_name = supplier.name
+        price_str = format_price(price.price_minor, price.price_exp, price.currency)
+        unit = f"/{price.unit}" if price.unit else ""
+        lines.append(f"{i}. {price.item_name} — {price_str}{unit}")
+
+    total_pages = max(1, math.ceil(total / _LIST_PAGE_SIZE))
+    if total_pages > 1:
+        lines.append(f"\nPage {page + 1}/{total_pages}")
+
+    keyboard = _pagination_markup(
+        list_type="products",
+        current_page=page,
+        total_pages=total_pages,
+    )
+    return "\n".join(lines), keyboard
+
+
+def _parse_uuid(raw: str | None) -> uuid.UUID | None:
+    if not raw:
+        return None
+    try:
+        return uuid.UUID(str(raw))
+    except ValueError:
+        return None
+
+
+def _render_prices_page(
+    *,
+    user: User,
+    db: Session,
+    ctx_svc: ContextService,
+    settings: Settings,
+    page: int,
+    supplier_id: uuid.UUID,
+    supplier_name: str | None = None,
+) -> tuple[str, dict | None]:
+    restaurant_id = _require_active_restaurant(user, ctx_svc, db, settings)
+    if restaurant_id is None:
+        raise ValueError("No active restaurant. Send /start to complete setup.")
+
+    svc = SupplierService(db)
+    total = svc.count_prices_for_supplier(
+        restaurant_id=restaurant_id,
+        supplier_id=supplier_id,
+    )
+    if total == 0:
+        supplier_label = supplier_name or "that supplier"
+        raise ValueError(
+            f"No prices found for {supplier_label}. Upload a price list to get started."
+        )
+
+    page = _safe_page(page, total)
+    offset = page * _LIST_PAGE_SIZE
+    prices = svc.list_prices_for_supplier(
+        restaurant_id=restaurant_id,
+        supplier_id=supplier_id,
+        offset=offset,
+        limit=_LIST_PAGE_SIZE,
+    )
+
+    if supplier_name is None:
+        supplier = db.get(Supplier, supplier_id)
+        supplier_name = supplier.name if supplier else "Supplier"
+
+    ctx_svc.set_numbered_items(user, [price.id for price, _ in prices])
+    ctx_svc.set_list_state(user, "prices", offset)
+    ctx_svc.set_fields(user, prices_supplier_id=str(supplier_id))
+
+    lines = [f"💰 Prices — {supplier_name}\n"]
+    for i, (price, effective_date) in enumerate(prices, offset + 1):
+        price_str = format_price(price.price_minor, price.price_exp, price.currency)
+        unit = f"/{price.unit}" if price.unit else ""
+        date_str = (
+            f" (updated {effective_date.strftime('%b %d')})"
+            if effective_date
+            else ""
+        )
+        lines.append(f"{i}. {price.item_name} — {price_str}{unit}{date_str}")
+
+    total_pages = max(1, math.ceil(total / _LIST_PAGE_SIZE))
+    if total_pages > 1:
+        lines.append(f"\nPage {page + 1}/{total_pages}")
+
+    keyboard = _pagination_markup(
+        list_type="prices",
+        current_page=page,
+        total_pages=total_pages,
+    )
+    return "\n".join(lines), keyboard
+
+
+def _render_inventory_page(
+    *,
+    user: User,
+    db: Session,
+    ctx_svc: ContextService,
+    settings: Settings,
+    page: int,
+) -> tuple[str, dict | None]:
+    restaurant_id = _require_active_restaurant(user, ctx_svc, db, settings)
+    if restaurant_id is None:
+        raise ValueError("No active restaurant. Send /start to complete setup.")
+
+    inv_svc = InventoryService(db)
+    total = inv_svc.count_items(restaurant_id)
+    if total == 0:
+        raise ValueError("📦 No inventory data yet. Upload an invoice to get started.")
+
+    page = _safe_page(page, total)
+    offset = page * _LIST_PAGE_SIZE
+    items = inv_svc.list_items(restaurant_id, offset=offset, limit=_LIST_PAGE_SIZE)
+
+    ctx_svc.set_numbered_items(user, [item.id for item, _ in items])
+    ctx_svc.set_list_state(user, "inventory", offset)
+
+    lines = ["📦 Inventory\n"]
+    for i, (item, balance) in enumerate(items, offset + 1):
+        bal_val = float(balance.balance) if balance is not None else 0.0
+        unit = f" {item.unit}" if item.unit else ""
+        prefix = "⚠️ " if bal_val < 0 else ""
+        lines.append(f"{i}. {prefix}{item.name} — {bal_val:g}{unit}")
+
+    total_pages = max(1, math.ceil(total / _LIST_PAGE_SIZE))
+    if total_pages > 1:
+        lines.append(f"\nPage {page + 1}/{total_pages}")
+
+    keyboard = _pagination_markup(
+        list_type="inventory",
+        current_page=page,
+        total_pages=total_pages,
+    )
+    return "\n".join(lines), keyboard
+
+
+def _render_suppliers_page(
+    *,
+    user: User,
+    db: Session,
+    ctx_svc: ContextService,
+    settings: Settings,
+    page: int,
+) -> tuple[str, dict | None]:
+    restaurant_id = _require_active_restaurant(user, ctx_svc, db, settings)
+    if restaurant_id is None:
+        raise ValueError("No active restaurant. Send /start to complete setup.")
+
+    svc = SupplierService(db)
+    total = svc.count_for_restaurant(restaurant_id=restaurant_id)
+    if total == 0:
+        raise ValueError("No suppliers linked yet. Use /add supplier to add one.")
+
+    page = _safe_page(page, total)
+    offset = page * _LIST_PAGE_SIZE
+    suppliers = svc.list_for_restaurant(
+        restaurant_id=restaurant_id,
+        offset=offset,
+        limit=_LIST_PAGE_SIZE,
+    )
+
+    ctx_svc.set_numbered_items(user, [s.id for s in suppliers])
+    ctx_svc.set_list_state(user, "suppliers", offset)
+
+    lines = ["📋 Suppliers\n"]
+    for i, supplier in enumerate(suppliers, offset + 1):
+        lines.append(f"{i}. {supplier.name}")
+
+    total_pages = max(1, math.ceil(total / _LIST_PAGE_SIZE))
+    if total_pages > 1:
+        lines.append(f"\nPage {page + 1}/{total_pages}")
+
+    keyboard = _pagination_markup(
+        list_type="suppliers",
+        current_page=page,
+        total_pages=total_pages,
+    )
+    return "\n".join(lines), keyboard
+
+
+def build_list_page(
+    *,
+    list_type: str,
+    page: int,
+    user: User,
+    db: Session,
+    ctx_svc: ContextService,
+    settings: Settings,
+) -> tuple[str, dict | None]:
+    """Build list text + keyboard for callback pagination/edit-in-place updates."""
+    if list_type == "team":
+        return _render_team_page(
+            user=user,
+            db=db,
+            ctx_svc=ctx_svc,
+            settings=settings,
+            page=page,
+        )
+    if list_type == "products":
+        return _render_products_page(
+            user=user,
+            db=db,
+            ctx_svc=ctx_svc,
+            settings=settings,
+            page=page,
+        )
+    if list_type == "prices":
+        supplier_id = _parse_uuid((user.context or {}).get("prices_supplier_id"))
+        if supplier_id is None:
+            raise ValueError("Prices page expired. Run /prices <supplier name> again.")
+        return _render_prices_page(
+            user=user,
+            db=db,
+            ctx_svc=ctx_svc,
+            settings=settings,
+            page=page,
+            supplier_id=supplier_id,
+        )
+    if list_type == "inventory":
+        return _render_inventory_page(
+            user=user,
+            db=db,
+            ctx_svc=ctx_svc,
+            settings=settings,
+            page=page,
+        )
+    if list_type == "suppliers":
+        return _render_suppliers_page(
+            user=user,
+            db=db,
+            ctx_svc=ctx_svc,
+            settings=settings,
+            page=page,
+        )
+    raise ValueError("Unsupported list type.")
+
+
 def handle(
     update: dict,
     user: User,
@@ -194,42 +562,26 @@ def handle(
 
     # --- /team ---
     if command == "team":
-        restaurant_id = _require_active_restaurant(user, ctx_svc, db, settings)
-        if restaurant_id is None:
-            send_message(
-                chat_id=chat_id,
-                text="No active restaurant. Send /start to complete setup.",
+        try:
+            text_out, keyboard = build_list_page(
+                list_type="team",
+                page=0,
+                user=user,
+                db=db,
+                ctx_svc=ctx_svc,
                 settings=settings,
             )
+        except ValueError as exc:
+            send_message(chat_id=chat_id, text=str(exc), settings=settings)
             return
 
-        # Get restaurant name from user's restaurant list
-        restaurants = RestaurantService(db).list_for_user(user_id=user.id)
-        restaurant_name = next(
-            (r.name for r, _ in restaurants if r.id == restaurant_id), "Restaurant"
-        )
-
-        members = RestaurantService(db).list_members(restaurant_id=restaurant_id)
-
-        page_members = members[:10]
-        ctx_svc.set_numbered_items(user, [u.id for u, _ in page_members])
-        ctx_svc.set_list_state(user, "team", 0)
         db.commit()
-
-        lines = [f"👥 Team — {restaurant_name}\n"]
-        for i, (member, mem_record) in enumerate(page_members, 1):
-            role = "Owner" if mem_record.is_owner else "Member"
-            joined = mem_record.joined_at.strftime("%b %Y")
-            name = member.full_name or member.username or "Unknown"
-            lines.append(f"{i}. {name} ({role}) — since {joined}")
-
-        total = len(members)
-        lines.append(f"\n{total} member{'s' if total != 1 else ''} total.")
-        if total > 10:
-            lines.append(f"Page 1/{(total + 9) // 10}  [Next ▶]")
-        lines.append("No pending invites.")
-
-        send_message(chat_id=chat_id, text="\n".join(lines), settings=settings)
+        _send_with_optional_keyboard(
+            chat_id=chat_id,
+            text=text_out,
+            reply_markup=keyboard,
+            settings=settings,
+        )
         return
 
     # --- /outlets ---
@@ -256,48 +608,26 @@ def handle(
 
     # --- /products ---
     if command == "products":
-        restaurant_id = _require_active_restaurant(user, ctx_svc, db, settings)
-        if restaurant_id is None:
-            send_message(
-                chat_id=chat_id,
-                text="No active restaurant. Send /start to complete setup.",
+        try:
+            text_out, keyboard = build_list_page(
+                list_type="products",
+                page=0,
+                user=user,
+                db=db,
+                ctx_svc=ctx_svc,
                 settings=settings,
             )
+        except ValueError as exc:
+            send_message(chat_id=chat_id, text=str(exc), settings=settings)
             return
 
-        svc = SupplierService(db)
-        products = svc.list_products_for_restaurant(
-            restaurant_id=restaurant_id, offset=0, limit=10
-        )
-
-        if not products:
-            send_message(
-                chat_id=chat_id,
-                text="📦 No products yet. Upload a price list to get started.",
-                settings=settings,
-            )
-            return
-
-        total = svc.count_products_for_restaurant(restaurant_id=restaurant_id)
-        ctx_svc.set_numbered_items(user, [price.id for _, price in products])
-        ctx_svc.set_list_state(user, "products", 0)
         db.commit()
-
-        lines = ["📦 Products\n"]
-        current_supplier_name = None
-        for i, (supplier, price) in enumerate(products, 1):
-            if supplier.name != current_supplier_name:
-                lines.append(f"\n{supplier.name}:")
-                current_supplier_name = supplier.name
-            price_str = format_price(price.price_minor, price.price_exp, price.currency)
-            unit = f"/{price.unit}" if price.unit else ""
-            lines.append(f"{i}. {price.item_name} — {price_str}{unit}")
-
-        total_pages = (total + 9) // 10
-        if total_pages > 1:
-            lines.append(f"\nPage 1/{total_pages}  [Next ▶]")
-
-        send_message(chat_id=chat_id, text="\n".join(lines), settings=settings)
+        _send_with_optional_keyboard(
+            chat_id=chat_id,
+            text=text_out,
+            reply_markup=keyboard,
+            settings=settings,
+        )
         return
 
     # --- /prices ---
@@ -330,83 +660,51 @@ def handle(
             return
 
         supplier, _ = matches[0]
-        prices = svc.list_prices_for_supplier(
-            restaurant_id=restaurant_id,
-            supplier_id=supplier.id,
-            offset=0,
-            limit=10,
-        )
-
-        if not prices:
-            send_message(
-                chat_id=chat_id,
-                text=f"No prices found for {supplier.name}. Upload a price list to get started.",
+        try:
+            text_out, keyboard = _render_prices_page(
+                user=user,
+                db=db,
+                ctx_svc=ctx_svc,
                 settings=settings,
+                page=0,
+                supplier_id=supplier.id,
+                supplier_name=supplier.name,
             )
+        except ValueError as exc:
+            send_message(chat_id=chat_id, text=str(exc), settings=settings)
             return
 
-        total = svc.count_prices_for_supplier(
-            restaurant_id=restaurant_id, supplier_id=supplier.id
-        )
-        ctx_svc.set_numbered_items(user, [price.id for price, _ in prices])
-        ctx_svc.set_list_state(user, "prices", 0)
         db.commit()
-
-        lines = [f"💰 Prices — {supplier.name}\n"]
-        for i, (price, effective_date) in enumerate(prices, 1):
-            price_str = format_price(price.price_minor, price.price_exp, price.currency)
-            unit = f"/{price.unit}" if price.unit else ""
-            date_str = (
-                f" (updated {effective_date.strftime('%b %d')})" if effective_date else ""
-            )
-            lines.append(f"{i}. {price.item_name} — {price_str}{unit}{date_str}")
-
-        total_pages = (total + 9) // 10
-        if total_pages > 1:
-            lines.append(f"\nPage 1/{total_pages}  [Next ▶]")
-
-        send_message(chat_id=chat_id, text="\n".join(lines), settings=settings)
+        _send_with_optional_keyboard(
+            chat_id=chat_id,
+            text=text_out,
+            reply_markup=keyboard,
+            settings=settings,
+        )
         return
 
     # --- /inventory ---
     if command == "inventory":
-        restaurant_id = _require_active_restaurant(user, ctx_svc, db, settings)
-        if restaurant_id is None:
-            send_message(
-                chat_id=chat_id,
-                text="No active restaurant. Send /start to complete setup.",
+        try:
+            text_out, keyboard = build_list_page(
+                list_type="inventory",
+                page=0,
+                user=user,
+                db=db,
+                ctx_svc=ctx_svc,
                 settings=settings,
             )
+        except ValueError as exc:
+            send_message(chat_id=chat_id, text=str(exc), settings=settings)
             return
 
-        inv_svc = InventoryService(db)
-        total = inv_svc.count_items(restaurant_id)
-
-        if total == 0:
-            send_message(
-                chat_id=chat_id,
-                text="📦 No inventory data yet. Upload an invoice to get started.",
-                settings=settings,
-            )
-            return
-
-        items = inv_svc.list_items(restaurant_id, offset=0, limit=10)
-        ctx_svc.set_numbered_items(user, [item.id for item, _ in items])
-        ctx_svc.set_list_state(user, "inventory", 0)
         db.commit()
-
-        lines = ["📦 Inventory\n"]
-        for i, (item, balance) in enumerate(items, 1):
-            bal_val = float(balance.balance) if balance is not None else 0.0
-            unit = f" {item.unit}" if item.unit else ""
-            prefix = "⚠️ " if bal_val < 0 else ""
-            lines.append(f"{i}. {prefix}{item.name} — {bal_val:g}{unit}")
-
-        total_pages = (total + 9) // 10
-        if total_pages > 1:
-            lines.append(f"\nPage 1/{total_pages}  [Next ▶]")
-
-        send_message(chat_id=chat_id, text="\n".join(lines), settings=settings)
+        _send_with_optional_keyboard(
+            chat_id=chat_id,
+            text=text_out,
+            reply_markup=keyboard,
+            settings=settings,
+        )
         return
 
     # --- /balance ---
@@ -434,6 +732,9 @@ def handle(
         zero_flag = " ⚠️" if summary.zero_stock_count > 0 else ""
         neg_flag = " ⚠️" if summary.negative_count > 0 else ""
 
+        negative_items = inv_svc.list_negative_items(restaurant_id=restaurant_id, limit=5)
+        zero_items = inv_svc.list_zero_stock_items(restaurant_id=restaurant_id, limit=5)
+
         lines = [
             "📊 Stock Summary\n",
             f"Total items: {summary.total_items}",
@@ -441,42 +742,48 @@ def handle(
             f"Negative balance: {summary.negative_count}{neg_flag}",
         ]
 
+        if negative_items:
+            lines.append("\nMost negative items:")
+            for item, balance in negative_items:
+                bal_val = float(balance.balance)
+                unit = f" {item.unit}" if item.unit else ""
+                lines.append(f"• {item.name}: {bal_val:g}{unit}")
+            if summary.negative_count > len(negative_items):
+                lines.append(f"• +{summary.negative_count - len(negative_items)} more")
+
+        if zero_items:
+            lines.append("\nZero-stock items:")
+            for item, _balance in zero_items:
+                unit = f" ({item.unit})" if item.unit else ""
+                lines.append(f"• {item.name}{unit}")
+            if summary.zero_stock_count > len(zero_items):
+                lines.append(f"• +{summary.zero_stock_count - len(zero_items)} more")
+
         send_message(chat_id=chat_id, text="\n".join(lines), settings=settings)
         return
 
     # --- /list suppliers ---
     if command == "list suppliers":
-        restaurant_id = _require_active_restaurant(user, ctx_svc, db, settings)
-        if restaurant_id is None:
-            send_message(
-                chat_id=chat_id,
-                text="No active restaurant. Send /start to complete setup.",
+        try:
+            text_out, keyboard = build_list_page(
+                list_type="suppliers",
+                page=0,
+                user=user,
+                db=db,
+                ctx_svc=ctx_svc,
                 settings=settings,
             )
+        except ValueError as exc:
+            send_message(chat_id=chat_id, text=str(exc), settings=settings)
             return
 
-        suppliers = SupplierService(db).list_for_restaurant(
-            restaurant_id=restaurant_id, offset=0, limit=10
-        )
-
-        if not suppliers:
-            send_message(
-                chat_id=chat_id,
-                text="No suppliers linked yet. Use /add supplier to add one.",
-                settings=settings,
-            )
-            return
-
-        # Store UUIDs in context for "#N" selection
-        ctx_svc.set_numbered_items(user, [s.id for s in suppliers])
-        ctx_svc.set_list_state(user, "suppliers", 0)
         db.commit()
-
-        lines = ["📋 **Suppliers:**\n"]
-        for i, s in enumerate(suppliers, 1):
-            lines.append(f"{i}. {s.name}")
-
-        send_message(chat_id=chat_id, text="\n".join(lines), settings=settings)
+        _send_with_optional_keyboard(
+            chat_id=chat_id,
+            text=text_out,
+            reply_markup=keyboard,
+            settings=settings,
+        )
         return
 
     # --- /add supplier ---
@@ -593,7 +900,6 @@ def handle(
         from sqlalchemy import desc, select
         from app.db.models.file_processing_staging import FileProcessingStaging
         from app.db.models.suppliers import Supplier
-        from app.telegram.bot_api import send_message_with_keyboard
         from app.telegram.keyboards import cb_open_upload, make_button
 
         records = db.scalars(

@@ -426,6 +426,53 @@ class TestOcrPageToMarkdown:
         user_msg = next(m for m in messages if m["role"] == "user")
         assert "Raw invoice text" in user_msg["content"]
 
+    def test_on_llm_call_callback_receives_usage(self):
+        settings = _make_settings()
+        calls: list[dict[str, object]] = []
+        response = _mock_llm_response("## OCR text")
+        response.id = "resp_123"
+        usage = MagicMock()
+        usage.prompt_tokens = 10
+        usage.completion_tokens = 5
+        usage.total_tokens = 15
+        response.usage = usage
+
+        with patch("app.llm.item_parser.OpenAI") as MockOpenAI:
+            client = MockOpenAI.return_value
+            client.chat.completions.create.return_value = response
+            ocr_page_to_markdown(
+                settings,
+                image_b64="abc==",
+                on_llm_call=lambda payload: calls.append(payload),
+            )
+
+        assert len(calls) == 1
+        assert calls[0]["purpose"] == "ocr_page_to_markdown"
+        assert calls[0]["model"] == "gpt-4o"
+        assert calls[0]["upstream_id"] == "resp_123"
+        assert calls[0]["usage"] == {
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+            "total_tokens": 15,
+        }
+
+    def test_parse_invoice_on_llm_call_reports_error(self):
+        settings = _make_settings()
+        calls: list[dict[str, object]] = []
+        with patch("app.llm.item_parser.OpenAI") as MockOpenAI:
+            client = MockOpenAI.return_value
+            client.chat.completions.create.side_effect = RuntimeError("network down")
+            with pytest.raises(ParseError, match="LLM call failed"):
+                parse_invoice(
+                    settings,
+                    text="Invoice text",
+                    on_llm_call=lambda payload: calls.append(payload),
+                )
+
+        assert len(calls) == 1
+        assert calls[0]["purpose"] == "parse_invoice"
+        assert calls[0]["error"] == "network down"
+
 
 # ---------------------------------------------------------------------------
 # Nullable top-level fields

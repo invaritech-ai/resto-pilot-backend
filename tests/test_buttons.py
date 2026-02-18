@@ -25,6 +25,7 @@ from app.db.models.inventory_balances import InventoryBalance
 from app.db.models.inventory_items import InventoryItem
 from app.db.models.inventory_transactions import InventoryTransaction
 from app.db.models.restaurant import Restaurant
+from app.db.models.suppliers import Supplier
 from app.db.models.user import User
 from app.telegram.handlers.buttons import handle
 from app.telegram.keyboards import uuid_to_hex
@@ -52,6 +53,7 @@ def _make_user() -> MagicMock:
 def _make_ctx_svc() -> MagicMock:
     ctx_svc = MagicMock()
     ctx_svc.set_fields = MagicMock()
+    ctx_svc.get.return_value = {}
     return ctx_svc
 
 
@@ -191,7 +193,7 @@ class TestConfirmUploadValidation:
             )
 
         mock_acq.assert_called_once()
-        assert "invoice" in mock_acq.call_args[1]["text"].lower()
+        assert "currency" in mock_acq.call_args[1]["text"].lower()
         db.commit.assert_not_called()
 
     def test_empty_line_items_answers_error(self):
@@ -368,7 +370,7 @@ class TestConfirmUploadHappyPath:
             user_id=USER_ID,
             staging_id=STAGING_ID,
             line_items=staging.extracted_data_json["line_items"],
-            resolutions={"Chicken Breast": existing_item.id},
+            resolutions={0: existing_item.id},
         )
 
     def test_confirm_sets_staging_status_to_confirmed(self):
@@ -392,8 +394,8 @@ class TestConfirmUploadHappyPath:
             fuzzy_match_return=[(existing_item, 0.9)],
         )
 
-        ctx_svc.set_fields.assert_called_once()
-        call_kwargs = ctx_svc.set_fields.call_args[1]
+        assert ctx_svc.set_fields.call_count >= 1
+        call_kwargs = ctx_svc.set_fields.call_args_list[-1][1]
         assert call_kwargs.get("active_staging_id") is None
 
     def test_confirm_edits_message_with_count(self):
@@ -414,28 +416,21 @@ class TestConfirmUploadHappyPath:
         mock_acq.assert_called_once()
         assert "confirmed" in mock_acq.call_args[1]["text"].lower()
 
-    def test_no_fuzzy_match_creates_new_item(self):
-        """Items with no ≥0.8 match are auto-created via get_or_create_item."""
+    def test_no_fuzzy_match_opens_resolution_hub(self):
+        """Items with no match stay unresolved and require explicit user choice."""
         staging = _make_staging(
             line_items=[{"name": "Brand New Item", "qty": 2.0, "unit": "kg"}]
         )
-        new_item = _make_inventory_item(item_id=uuid.uuid4())
-        new_item.name = "Brand New Item"
 
-        inv, _, _, staging_obj, _, db = self._run_confirm(
+        inv, _, mock_edit, staging_obj, _, db = self._run_confirm(
             staging=staging,
             fuzzy_match_return=[],  # no match at ≥0.8
-            get_or_create_return=(new_item, True),
         )
 
-        inv.get_or_create_item.assert_called_once_with(
-            restaurant_id=RESTAURANT_ID,
-            name="Brand New Item",
-            unit="kg",
-        )
-        inv.confirm_invoice.assert_called_once()
-        assert staging_obj.status == "confirmed"
-        db.commit.assert_called_once()
+        inv.get_or_create_item.assert_not_called()
+        inv.confirm_invoice.assert_not_called()
+        assert staging_obj.status == "pending_review"
+        assert "resolve items" in mock_edit.call_args[1]["text"].lower()
 
     def test_multiple_line_items_all_matched(self):
         item_id_2 = uuid.uuid4()
@@ -480,8 +475,8 @@ class TestConfirmUploadHappyPath:
             staging_id=STAGING_ID,
             line_items=staging.extracted_data_json["line_items"],
             resolutions={
-                "Chicken Breast": item1.id,
-                "Olive Oil": item2.id,
+                0: item1.id,
+                1: item2.id,
             },
         )
         assert staging.status == "confirmed"
@@ -531,11 +526,13 @@ class TestConfirmUploadIntegration:
         user_id: uuid.UUID,
         staging_id: uuid.UUID,
         line_items: list,
+        supplier_id: uuid.UUID | None = None,
     ) -> FileProcessingStaging:
         staging = FileProcessingStaging(
             id=staging_id,
             restaurant_id=restaurant_id,
             uploaded_by=user_id,
+            supplier_id=supplier_id,
             file_id="tg_file_001",
             file_unique_id="unique_001",
             status="pending_review",
@@ -563,6 +560,16 @@ class TestConfirmUploadIntegration:
         session.flush()
         return item
 
+    def _make_real_supplier(
+        self,
+        session,
+        name: str = "Test Supplier",
+    ) -> Supplier:
+        supplier = Supplier(name=name, name_lower=name.lower())
+        session.add(supplier)
+        session.flush()
+        return supplier
+
     def test_confirm_writes_ledger_balance_and_staging_status(self, pg_session):
         """Happy path: one line item matches existing item via pg_trgm → txn + balance
         created atomically, staging status updated to confirmed, context cleared."""
@@ -572,12 +579,14 @@ class TestConfirmUploadIntegration:
 
         # Pre-create item with exact name — pg_trgm similarity("chicken breast","chicken breast")=1.0
         item = self._make_real_item(pg_session, restaurant.id)
+        supplier = self._make_real_supplier(pg_session, "ACME Foods")
         staging = self._make_real_staging(
             pg_session,
             restaurant_id=restaurant.id,
             user_id=db_user.id,
             staging_id=staging_id,
             line_items=[{"name": "Chicken Breast", "qty": 5.0, "unit_price": 8.5, "amount": 42.5}],
+            supplier_id=supplier.id,
         )
         pg_session.commit()
 
@@ -623,9 +632,9 @@ class TestConfirmUploadIntegration:
         pg_session.refresh(staging)
         assert staging.status == "confirmed"
 
-        # context cleared
-        ctx_svc.set_fields.assert_called_once()
-        assert ctx_svc.set_fields.call_args[1].get("active_staging_id") is None
+        # context cleared (last call clears active staging + pending resolutions)
+        assert ctx_svc.set_fields.call_count >= 1
+        assert ctx_svc.set_fields.call_args_list[-1][1].get("active_staging_id") is None
 
         # user feedback sent
         mock_acq.assert_called_once()
@@ -641,6 +650,7 @@ class TestConfirmUploadIntegration:
 
         item1 = self._make_real_item(pg_session, restaurant.id, "Chicken Breast", "kg")
         item2 = self._make_real_item(pg_session, restaurant.id, "Olive Oil", "L")
+        supplier = self._make_real_supplier(pg_session, "ACME Foods")
         staging = self._make_real_staging(
             pg_session,
             restaurant_id=restaurant.id,
@@ -650,6 +660,7 @@ class TestConfirmUploadIntegration:
                 {"name": "Chicken Breast", "qty": 5.0},
                 {"name": "Olive Oil", "qty": 2.0},
             ],
+            supplier_id=supplier.id,
         )
         pg_session.commit()
 

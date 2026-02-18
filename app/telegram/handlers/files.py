@@ -15,13 +15,15 @@ from __future__ import annotations
 
 import logging
 
-import httpx
-
 from app.core.config import Settings
 from app.db.models.user import User
 from app.services.context_service import ContextService
 from app.services.staging_service import StagingService
-from app.telegram.bot_api import send_message
+from app.telegram.bot_api import (
+    get_current_session_id,
+    send_message,
+    send_message_with_keyboard,
+)
 from app.telegram.keyboards import doc_type_keyboard
 from sqlalchemy.orm import Session
 
@@ -80,6 +82,7 @@ def handle(
         return
 
     # Create staging record
+    session_id = get_current_session_id()
     staging_svc = StagingService(db)
     staging = staging_svc.create(
         uploaded_by=user.id,
@@ -87,7 +90,7 @@ def handle(
         file_id=file_id,
         file_unique_id=file_unique_id,
         mime=mime,
-        session_id=None,  # session_id optional; populated by task layer if needed
+        session_id=session_id,
     )
 
     # Store active staging ID in user context
@@ -114,25 +117,18 @@ def _send_doc_type_question(chat_id: int, staging_id, settings: Settings) -> Non
     keyboard = doc_type_keyboard(staging_id)
     text = "📎 File received! What type of document is this?"
 
-    if not settings.telegram_bot_token:
-        # Dev fallback — plain message
-        send_message(chat_id=chat_id, text=text, settings=settings)
+    msg_id = send_message_with_keyboard(
+        chat_id=chat_id,
+        text=text,
+        reply_markup=keyboard,
+        settings=settings,
+    )
+    if msg_id is not None:
         return
 
-    url = f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "reply_markup": keyboard,
-    }
-    try:
-        resp = httpx.post(url, json=payload, timeout=10.0)
-        resp.raise_for_status()
-    except Exception as exc:
-        logger.error("files: failed to send doc_type keyboard: %s", exc)
-        # Fall back to plain message
-        send_message(
-            chat_id=chat_id,
-            text=f"{text}\n\nReply with 'invoice' or 'pricelist'.",
-            settings=settings,
-        )
+    logger.error("files: failed to send doc_type keyboard")
+    send_message(
+        chat_id=chat_id,
+        text=f"{text}\n\nReply with 'invoice' or 'pricelist'.",
+        settings=settings,
+    )

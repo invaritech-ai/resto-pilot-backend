@@ -37,6 +37,7 @@ _NAV_FIELDS = (
     "editing_staging_id",        # step 8: staging_id being edited (item edit flow)
     "editing_item_idx",          # step 8: 0-based item index being edited
     "editing_field",             # step 8: field name being edited (name/qty/unit/price)
+    "prices_supplier_id",        # active supplier context for /prices pagination callbacks
 )
 
 

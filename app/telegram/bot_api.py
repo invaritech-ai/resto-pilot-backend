@@ -8,6 +8,7 @@ from contextvars import ContextVar
 import logging
 from typing import Any
 import urllib.parse
+import uuid
 
 import httpx
 
@@ -19,6 +20,14 @@ TELEGRAM_MAX_MESSAGE_LEN = 4096
 
 _OUTGOING_MESSAGE_SINK: ContextVar[Callable[[int, str], None] | None] = ContextVar(
     "_OUTGOING_MESSAGE_SINK",
+    default=None,
+)
+_OUTGOING_DB_LOGGER: ContextVar[Callable[[int, str, int | None], None] | None] = ContextVar(
+    "_OUTGOING_DB_LOGGER",
+    default=None,
+)
+_CURRENT_SESSION_ID: ContextVar[uuid.UUID | None] = ContextVar(
+    "_CURRENT_SESSION_ID",
     default=None,
 )
 
@@ -84,6 +93,29 @@ def _split_telegram_message_text(
     return parts or [text[:limit]]
 
 
+def _log_outgoing_message(
+    *,
+    chat_id: int,
+    text: str,
+    telegram_message_id: int | None,
+) -> None:
+    db_logger = _OUTGOING_DB_LOGGER.get()
+    if db_logger is None:
+        return
+    if not isinstance(text, str) or not text.strip():
+        return
+    try:
+        db_logger(chat_id, text, telegram_message_id)
+    except Exception:
+        logger.exception(
+            "telegram_outgoing_db_logger_failed",
+            extra={
+                "chat_id": chat_id,
+                "telegram_message_id": telegram_message_id,
+            },
+        )
+
+
 def send_message(chat_id: int, text: str, settings: Settings) -> int | None:
     """
     Send a text message to a Telegram chat via the Bot API.
@@ -108,6 +140,11 @@ def send_message(chat_id: int, text: str, settings: Settings) -> int | None:
             text=text, limit=TELEGRAM_MAX_MESSAGE_LEN
         ):
             sink(chat_id, part)
+            _log_outgoing_message(
+                chat_id=chat_id,
+                text=part,
+                telegram_message_id=None,
+            )
         # Return a deterministic placeholder message_id for telemetry.
         return 1
 
@@ -120,6 +157,11 @@ def send_message(chat_id: int, text: str, settings: Settings) -> int | None:
             text=text, limit=TELEGRAM_MAX_MESSAGE_LEN
         ):
             print(part, flush=True)  # noqa: T201
+            _log_outgoing_message(
+                chat_id=chat_id,
+                text=part,
+                telegram_message_id=None,
+            )
         return 1
 
     if not settings.telegram_bot_token:
@@ -201,12 +243,18 @@ def send_message(chat_id: int, text: str, settings: Settings) -> int | None:
             ) from None
 
         candidate = (result.get("result") or {}).get("message_id")
-        if isinstance(candidate, int):
-            message_id = candidate
+        part_message_id: int | None = candidate if isinstance(candidate, int) else None
+        if part_message_id is not None:
+            message_id = part_message_id
             logger.info(
                 "telegram_message_sent",
                 extra={"chat_id": chat_id, "message_id": message_id},
             )
+        _log_outgoing_message(
+            chat_id=chat_id,
+            text=part,
+            telegram_message_id=part_message_id,
+        )
 
     return message_id
 
@@ -229,6 +277,33 @@ def capture_outgoing_messages() -> Any:
         yield captured
     finally:
         _OUTGOING_MESSAGE_SINK.reset(token)
+
+
+@contextmanager
+def bind_outgoing_db_logger(
+    logger_fn: Callable[[int, str, int | None], None] | None,
+) -> Any:
+    """Bind outgoing-message DB logger for the current task context."""
+    token = _OUTGOING_DB_LOGGER.set(logger_fn)
+    try:
+        yield
+    finally:
+        _OUTGOING_DB_LOGGER.reset(token)
+
+
+@contextmanager
+def bind_current_session(session_id: uuid.UUID | None) -> Any:
+    """Bind current telegram session_id for the current task context."""
+    token = _CURRENT_SESSION_ID.set(session_id)
+    try:
+        yield
+    finally:
+        _CURRENT_SESSION_ID.reset(token)
+
+
+def get_current_session_id() -> uuid.UUID | None:
+    """Return active telegram session_id from context, if set."""
+    return _CURRENT_SESSION_ID.get()
 
 
 def get_file_bytes_unified(
@@ -450,10 +525,12 @@ def send_message_with_keyboard(
     sink = _OUTGOING_MESSAGE_SINK.get()
     if sink is not None:
         sink(chat_id, text)
+        _log_outgoing_message(chat_id=chat_id, text=text, telegram_message_id=None)
         return 1
 
     if chat_id == 0:
         print(text, flush=True)  # noqa: T201
+        _log_outgoing_message(chat_id=chat_id, text=text, telegram_message_id=None)
         return 1
 
     if not settings.telegram_bot_token:
@@ -471,7 +548,13 @@ def send_message_with_keyboard(
         data = resp.json()
         if data.get("ok"):
             msg_id = (data.get("result") or {}).get("message_id")
-            return int(msg_id) if msg_id else None
+            telegram_message_id = int(msg_id) if msg_id else None
+            _log_outgoing_message(
+                chat_id=chat_id,
+                text=text,
+                telegram_message_id=telegram_message_id,
+            )
+            return telegram_message_id
         logger.error("send_message_with_keyboard failed: %s", data.get("description"))
         return None
     except Exception as exc:

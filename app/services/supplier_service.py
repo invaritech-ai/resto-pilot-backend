@@ -160,6 +160,18 @@ class SupplierService:
         )
         return list(self.session.scalars(stmt).all())
 
+    def count_for_restaurant(self, restaurant_id: uuid.UUID) -> int:
+        """Return total active supplier links for a restaurant."""
+        stmt = (
+            select(func.count())
+            .select_from(RestaurantSupplier)
+            .where(
+                RestaurantSupplier.restaurant_id == restaurant_id,
+                RestaurantSupplier.is_active == true(),
+            )
+        )
+        return self.session.scalar(stmt) or 0
+
     def list_restaurants_for_supplier(self, supplier_id: uuid.UUID) -> list[Restaurant]:
         """Reverse lookup: restaurants actively linked to this supplier."""
         stmt = (

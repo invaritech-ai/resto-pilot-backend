@@ -28,10 +28,14 @@ from app.llm.item_parser import ParseError, ocr_page_to_markdown, parse_invoice,
 from app.services.context_service import ContextService
 from app.services.staging_service import StagingService
 from app.services.supplier_service import SupplierService
+from app.services.telemetry import record_llm_call, record_outgoing_message
 from app.telegram.bot_api import (
     TelegramFileExpiredError,
+    bind_current_session,
+    bind_outgoing_db_logger,
     get_file_bytes,
     send_message,
+    send_message_with_keyboard,
 )
 from app.telegram.keyboards import (
     cb_confirm_upload,
@@ -42,7 +46,6 @@ from app.telegram.keyboards import (
     cb_rev_page,
     cb_set_supplier,
     make_button,
-    uuid_to_hex,
 )
 from app.workers.celery_app import celery_app
 from app.workers.db import worker_db_session
@@ -79,105 +82,180 @@ def process_file_task(staging_id_hex: str, document_type: str, chat_id: int) -> 
             return
 
         staging_svc = StagingService(db)
+        session_id = staging.session_id
 
-        try:
-            # 1. Download file bytes
-            file_bytes = get_file_bytes(file_id=staging.file_id, settings=settings)
+        def _outgoing_db_logger(
+            out_chat_id: int,
+            out_text: str,
+            telegram_message_id: int | None,
+        ) -> None:
+            if session_id is None or not out_text.strip():
+                return
+            try:
+                with worker_db_session() as telemetry_db:
+                    record_outgoing_message(
+                        db=telemetry_db,
+                        session_id=session_id,
+                        chat_id=out_chat_id,
+                        kind="reply",
+                        text=out_text,
+                        telegram_message_id=telegram_message_id,
+                    )
+                    telemetry_db.commit()
+            except Exception:
+                logger.exception(
+                    "ocr_outgoing_log_failed staging=%s session_id=%s",
+                    staging_id,
+                    session_id,
+                )
 
-            # 2. Extract structured data
-            mime = staging.mime or "application/octet-stream"
-            extracted = _extract(file_bytes, mime, document_type, settings)
+        def _on_llm_call(meta: dict[str, object]) -> None:
+            if session_id is None:
+                return
+            model = str(meta.get("model") or "")
+            if not model:
+                return
+            purpose = str(meta.get("purpose") or "ocr")
+            usage_obj = meta.get("usage")
+            usage = usage_obj if isinstance(usage_obj, dict) else None
+            upstream_raw = meta.get("upstream_id")
+            upstream_id = str(upstream_raw) if upstream_raw is not None else None
+            error_raw = meta.get("error")
+            error = str(error_raw) if error_raw is not None else None
+            try:
+                record_llm_call(
+                    db=db,
+                    session_id=session_id,
+                    chat_id=chat_id,
+                    purpose=purpose,
+                    model=model,
+                    upstream_id=upstream_id,
+                    usage=usage,
+                    error=error,
+                )
+            except Exception:
+                logger.exception(
+                    "ocr_llm_telemetry_failed staging=%s session_id=%s",
+                    staging_id,
+                    session_id,
+                )
 
-            if not extracted.get("line_items"):
-                raise ParseError("No line items could be extracted from this document")
+        with bind_current_session(session_id), bind_outgoing_db_logger(_outgoing_db_logger):
+            try:
+                # 1. Download file bytes
+                file_bytes = get_file_bytes(file_id=staging.file_id, settings=settings)
 
-            # 3. Supplier gate
-            supplier, sup_buttons = _resolve_supplier(
-                name=extracted.get("supplier"),
-                restaurant_id=staging.restaurant_id,
-                staging_id=staging_id,
-                db=db,
-            )
+                # 2. Extract structured data
+                mime = staging.mime or "application/octet-stream"
+                extracted = _extract(
+                    file_bytes,
+                    mime,
+                    document_type,
+                    settings,
+                    on_llm_call=_on_llm_call,
+                )
 
-            if supplier is not None:
-                staging.supplier_id = supplier.id
-                db.flush()
+                if not extracted.get("line_items"):
+                    raise ParseError("No line items could be extracted from this document")
 
-            # 4. Persist extracted data → status = pending_review
-            staging_svc.set_extracted_data(staging_id, extracted)
+                # 3. Supplier gate
+                supplier, sup_buttons = _resolve_supplier(
+                    name=extracted.get("supplier"),
+                    restaurant_id=staging.restaurant_id,
+                    staging_id=staging_id,
+                    db=db,
+                )
 
-            # 5. Build + send review message
-            text = _build_review_text(staging, extracted, supplier, document_type)
-            keyboard = _build_review_keyboard(staging, extracted, sup_buttons)
+                if supplier is not None:
+                    staging.supplier_id = supplier.id
+                    db.flush()
 
-            from app.telegram.bot_api import send_message as _send  # local import to ease mocking
+                # 4. Persist extracted data → status = pending_review
+                staging_svc.set_extracted_data(staging_id, extracted)
 
-            # We need to send with reply_markup; use httpx directly since send_message
-            # doesn't support inline keyboards yet in the existing bot_api. Wire via raw call.
-            msg_id = _send_with_keyboard(
-                chat_id=chat_id,
-                text=text,
-                reply_markup=keyboard,
-                settings=settings,
-            )
+                # 5. Build + send review message
+                text = _build_review_text(staging, extracted, supplier, document_type)
+                keyboard = _build_review_keyboard(staging, extracted, sup_buttons)
+                msg_id = _send_with_keyboard(
+                    chat_id=chat_id,
+                    text=text,
+                    reply_markup=keyboard,
+                    settings=settings,
+                )
 
-            # 6. Store review_message_id in user context
-            user = db.get(User, staging.uploaded_by)
-            if user and msg_id:
-                ctx_svc = ContextService(db)
-                ctx_svc.set_fields(user, review_message_id=msg_id)
+                # 6. Store review_message_id in user context
+                user = db.get(User, staging.uploaded_by)
+                if user and msg_id:
+                    ctx_svc = ContextService(db)
+                    ctx_svc.set_fields(user, review_message_id=msg_id)
 
-            db.commit()
+                db.commit()
 
-            logger.info(
-                "process_file_task done staging=%s items=%d",
-                staging_id, len(extracted.get("line_items", [])),
-            )
+                logger.info(
+                    "process_file_task done staging=%s items=%d",
+                    staging_id, len(extracted.get("line_items", [])),
+                )
 
-        except TelegramFileExpiredError as exc:
-            logger.error("process_file_task file_expired staging=%s: %s", staging_id, exc)
-            staging_svc.set_error(staging_id, f"file_expired: {exc}")
-            db.commit()
-            send_message(
-                chat_id=chat_id,
-                text="⚠️ The file is no longer available. Please upload again.",
-                settings=settings,
-            )
+            except TelegramFileExpiredError as exc:
+                logger.error("process_file_task file_expired staging=%s: %s", staging_id, exc)
+                staging_svc.set_error(staging_id, f"file_expired: {exc}")
+                db.commit()
+                send_message(
+                    chat_id=chat_id,
+                    text="⚠️ The file is no longer available. Please upload again.",
+                    settings=settings,
+                )
 
-        except ParseError as exc:
-            logger.error("process_file_task parse_error staging=%s: %s", staging_id, exc)
-            staging_svc.set_error(staging_id, str(exc))
-            db.commit()
-            send_message(
-                chat_id=chat_id,
-                text=f"⚠️ Could not read document: {exc}",
-                settings=settings,
-            )
+            except ParseError as exc:
+                logger.error("process_file_task parse_error staging=%s: %s", staging_id, exc)
+                staging_svc.set_error(staging_id, str(exc))
+                db.commit()
+                send_message(
+                    chat_id=chat_id,
+                    text=f"⚠️ Could not read document: {exc}",
+                    settings=settings,
+                )
 
-        except Exception:
-            logger.exception("process_file_task unexpected_error staging=%s", staging_id)
-            staging_svc.set_error(staging_id, "unexpected error during processing")
-            db.commit()
-            send_message(
-                chat_id=chat_id,
-                text="⚠️ Processing failed. Please try uploading again.",
-                settings=settings,
-            )
+            except Exception:
+                logger.exception("process_file_task unexpected_error staging=%s", staging_id)
+                staging_svc.set_error(staging_id, "unexpected error during processing")
+                db.commit()
+                send_message(
+                    chat_id=chat_id,
+                    text="⚠️ Processing failed. Please try uploading again.",
+                    settings=settings,
+                )
 
 
 # ---------------------------------------------------------------------------
 # Extraction helpers
 # ---------------------------------------------------------------------------
 
-def _extract(file_bytes: bytes, mime: str, document_type: str, settings) -> dict:
+def _extract(
+    file_bytes: bytes,
+    mime: str,
+    document_type: str,
+    settings,
+    on_llm_call=None,
+) -> dict:
     """Route to PDF or image extraction based on mime type."""
     is_pdf = "pdf" in mime.lower()
     if is_pdf:
-        return _extract_pdf(file_bytes, document_type, settings)
-    return _extract_image(file_bytes, document_type, settings)
+        return _extract_pdf(
+            file_bytes,
+            document_type,
+            settings,
+            on_llm_call=on_llm_call,
+        )
+    return _extract_image(
+        file_bytes,
+        document_type,
+        settings,
+        on_llm_call=on_llm_call,
+    )
 
 
-def _extract_pdf(file_bytes: bytes, document_type: str, settings) -> dict:
+def _extract_pdf(file_bytes: bytes, document_type: str, settings, on_llm_call=None) -> dict:
     """PDF: pdfplumber full text + camelot tables → combined LLM input.
     If < 5 items extracted, fall back to vision via pdf2image.
     """
@@ -229,7 +307,7 @@ def _extract_pdf(file_bytes: bytes, document_type: str, settings) -> dict:
     combined = "\n\n".join(combined_parts)
 
     parse_fn = parse_invoice if document_type == "invoice" else parse_price_list
-    result = parse_fn(settings, text=combined)
+    result = parse_fn(settings, text=combined, on_llm_call=on_llm_call)
 
     # Vision fallback if < 5 items
     if len(result.get("line_items", [])) < 5:
@@ -238,7 +316,12 @@ def _extract_pdf(file_bytes: bytes, document_type: str, settings) -> dict:
             len(result.get("line_items", [])),
         )
         try:
-            vision_result = _extract_pdf_vision(file_bytes, document_type, settings)
+            vision_result = _extract_pdf_vision(
+                file_bytes,
+                document_type,
+                settings,
+                on_llm_call=on_llm_call,
+            )
             if len(vision_result.get("line_items", [])) > len(result.get("line_items", [])):
                 logger.info("pdf: vision fallback produced more items, using it")
                 return vision_result
@@ -258,7 +341,12 @@ def _resize_for_ocr(img, max_side: int = 4000):
     return img.resize((int(w * scale), int(h * scale)), PILImage.Resampling.LANCZOS)
 
 
-def _extract_pdf_vision(file_bytes: bytes, document_type: str, settings) -> dict:
+def _extract_pdf_vision(
+    file_bytes: bytes,
+    document_type: str,
+    settings,
+    on_llm_call=None,
+) -> dict:
     """Convert PDF pages to images and parse via two-stage OCR → parse."""
     try:
         from pdf2image import convert_from_bytes
@@ -286,7 +374,12 @@ def _extract_pdf_vision(file_bytes: bytes, document_type: str, settings) -> dict
             resized.save(buf, format="JPEG")
             b64 = base64.b64encode(buf.getvalue()).decode()
             try:
-                md = ocr_page_to_markdown(settings, b64, image_mime="image/jpeg")
+                md = ocr_page_to_markdown(
+                    settings,
+                    b64,
+                    image_mime="image/jpeg",
+                    on_llm_call=on_llm_call,
+                )
                 page_markdowns.append(md)
             except Exception as exc:
                 logger.warning(
@@ -300,7 +393,11 @@ def _extract_pdf_vision(file_bytes: bytes, document_type: str, settings) -> dict
 
         combined_markdown = "\n\n---\n\n".join(page_markdowns)
         try:
-            chunk_result = parse_fn(settings, text=combined_markdown)
+            chunk_result = parse_fn(
+                settings,
+                text=combined_markdown,
+                on_llm_call=on_llm_call,
+            )
         except ParseError:
             continue
 
@@ -320,7 +417,7 @@ def _extract_pdf_vision(file_bytes: bytes, document_type: str, settings) -> dict
     return header
 
 
-def _extract_image(file_bytes: bytes, document_type: str, settings) -> dict:
+def _extract_image(file_bytes: bytes, document_type: str, settings, on_llm_call=None) -> dict:
     """Image: resize to 4000px max side → OCR markdown → JSON parse."""
     try:
         from PIL import Image as PILImage
@@ -334,10 +431,15 @@ def _extract_image(file_bytes: bytes, document_type: str, settings) -> dict:
     img.save(buf, format="JPEG")
     b64 = base64.b64encode(buf.getvalue()).decode()
 
-    markdown = ocr_page_to_markdown(settings, b64, image_mime="image/jpeg")
+    markdown = ocr_page_to_markdown(
+        settings,
+        b64,
+        image_mime="image/jpeg",
+        on_llm_call=on_llm_call,
+    )
 
     parse_fn = parse_invoice if document_type == "invoice" else parse_price_list
-    return parse_fn(settings, text=markdown)
+    return parse_fn(settings, text=markdown, on_llm_call=on_llm_call)
 
 
 # ---------------------------------------------------------------------------
@@ -539,28 +641,9 @@ def _send_with_keyboard(
     settings,
 ) -> int | None:
     """Send a message with an inline keyboard. Returns message_id or None."""
-    import httpx
-
-    if not settings.telegram_bot_token:
-        # Dev mode: fall back to plain send_message
-        logger.warning("send_with_keyboard: no bot token — falling back to plain send")
-        return send_message(chat_id=chat_id, text=text, settings=settings)
-
-    url = f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "reply_markup": reply_markup,
-    }
-    try:
-        resp = httpx.post(url, json=payload, timeout=10.0)
-        resp.raise_for_status()
-        data = resp.json()
-        if data.get("ok"):
-            msg_id = (data.get("result") or {}).get("message_id")
-            return int(msg_id) if msg_id else None
-        logger.error("send_with_keyboard failed: %s", data.get("description"))
-        return None
-    except Exception as exc:
-        logger.error("send_with_keyboard error: %s", exc)
-        return None
+    return send_message_with_keyboard(
+        chat_id=chat_id,
+        text=text,
+        reply_markup=reply_markup,
+        settings=settings,
+    )
