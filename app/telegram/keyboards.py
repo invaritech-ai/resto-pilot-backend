@@ -12,6 +12,7 @@ from typing import Any
 # Telegram inline keyboard button types
 InlineKeyboardButton = dict[str, Any]
 InlineKeyboardMarkup = dict[str, list[list[InlineKeyboardButton]]]
+_MAX_CALLBACK_BYTES = 64
 
 
 def uuid_to_hex(id: uuid.UUID) -> str:
@@ -27,6 +28,16 @@ def hex_to_uuid(hex_str: str) -> uuid.UUID:
 def make_button(text: str, callback_data: str) -> InlineKeyboardButton:
     """Create a single inline keyboard button."""
     return {"text": text, "callback_data": callback_data}
+
+
+def _ensure_callback_limit(callback_data: str) -> str:
+    """Guard Telegram callback_data hard limit."""
+    byte_len = len(callback_data.encode("utf-8"))
+    if byte_len > _MAX_CALLBACK_BYTES:
+        raise ValueError(
+            f"callback_data exceeds Telegram 64-byte limit: {byte_len} bytes ({callback_data})"
+        )
+    return callback_data
 
 
 # ---------------------------------------------------------------------------
@@ -64,14 +75,44 @@ def cb_resolve_handshake(handshake_id: uuid.UUID, answer: str) -> str:
     return f"res_h:{uuid_to_hex(handshake_id)}:{answer}"
 
 
-def cb_set_supplier(staging_id: uuid.UUID, supplier_id: uuid.UUID) -> str:
-    """Set supplier callback: set_sup:{staging_hex}:{supplier_hex}"""
-    return f"set_sup:{uuid_to_hex(staging_id)}:{uuid_to_hex(supplier_id)}"
+def cb_set_supplier(staging_id: uuid.UUID, supplier_ref: int | str) -> str:
+    """Set supplier callback: set_sup:{staging_hex}:{supplier_ref}.
+
+    supplier_ref is a short candidate index (preferred) to keep callback payload
+    below Telegram's 64-byte limit.
+    """
+    return _ensure_callback_limit(f"set_sup:{uuid_to_hex(staging_id)}:{supplier_ref}")
 
 
 def cb_new_supplier(staging_id: uuid.UUID) -> str:
     """Create new supplier callback: new_sup:{staging_hex}"""
     return f"new_sup:{uuid_to_hex(staging_id)}"
+
+
+def cb_doc_type(staging_id: uuid.UUID, doc_type: str) -> str:
+    """Document type selection: doc_type:{staging_hex}:{doc_type}"""
+    return f"doc_type:{uuid_to_hex(staging_id)}:{doc_type}"
+
+
+def cb_use_match(staging_id: uuid.UUID, idx: int, match_ref: int | str) -> str:
+    """Accept fuzzy match for line item: use_match:{staging_hex}:{idx}:{match_ref}.
+
+    match_ref is a short candidate index (preferred) to keep callback payload
+    below Telegram's 64-byte limit.
+    """
+    return _ensure_callback_limit(
+        f"use_match:{uuid_to_hex(staging_id)}:{idx}:{match_ref}"
+    )
+
+
+def cb_mk_item(staging_id: uuid.UUID, idx: int) -> str:
+    """Create new inventory item for line item: mk_item:{staging_hex}:{idx}"""
+    return f"mk_item:{uuid_to_hex(staging_id)}:{idx}"
+
+
+def cb_skip_item(staging_id: uuid.UUID, idx: int) -> str:
+    """Skip line item (don't add to inventory): skip_item:{staging_hex}:{idx}"""
+    return f"skip_item:{uuid_to_hex(staging_id)}:{idx}"
 
 
 # ---------------------------------------------------------------------------
@@ -146,12 +187,28 @@ def supplier_selection_keyboard(
     """
     keyboard = []
 
-    for supplier_id, name in suppliers[:5]:  # Max 5 suppliers
-        keyboard.append([make_button(name, cb_set_supplier(staging_id, supplier_id))])
+    for rank, (_supplier_id, name) in enumerate(suppliers[:5]):  # Max 5 suppliers
+        keyboard.append([make_button(name, cb_set_supplier(staging_id, rank))])
 
     keyboard.append([make_button("✨ Create New", cb_new_supplier(staging_id))])
 
     return {"inline_keyboard": keyboard}
+
+
+def doc_type_keyboard(staging_id: uuid.UUID) -> InlineKeyboardMarkup:
+    """Ask user what type of document they uploaded.
+
+    Layout:
+        [ 1️⃣ Invoice ]  [ 2️⃣ Price List ]
+    """
+    return {
+        "inline_keyboard": [
+            [
+                make_button("1️⃣ Invoice", cb_doc_type(staging_id, "invoice")),
+                make_button("2️⃣ Price List", cb_doc_type(staging_id, "price_list")),
+            ]
+        ]
+    }
 
 
 def handshake_keyboard(

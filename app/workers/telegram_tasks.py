@@ -189,13 +189,9 @@ def handle_telegram_update(update: dict) -> None:
                     return handler
 
                 def _handle_file(update: dict, ctx: RouteContext) -> None:
-                    """Stub for file upload handler (Phase 2)."""
-                    logger.info("file_handler_stub: file upload received")
-                    send_message(
-                        chat_id=ctx.user.chat_id,
-                        text="File received! Processing will be available in Phase 2.",
-                        settings=settings,
-                    )
+                    """Handle file/photo uploads — create staging + ask doc type."""
+                    from app.telegram.handlers.files import handle as handle_files
+                    handle_files(update, ctx.user, ctx.db, ctx_svc, settings)
 
                 def _handle_pattern(update: dict, ctx: RouteContext) -> None:
                     """Stub for pattern handler (#N, qty+unit)."""

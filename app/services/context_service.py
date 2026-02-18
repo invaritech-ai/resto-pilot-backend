@@ -27,7 +27,14 @@ from sqlalchemy.orm.attributes import flag_modified
 from app.db.models.user import User
 
 # Fields cleared by Global Reset (Priority 1).
-_NAV_FIELDS = ("last_list_type", "last_list_offset", "numbered_items", "active_staging_id")
+_NAV_FIELDS = (
+    "last_list_type",
+    "last_list_offset",
+    "numbered_items",
+    "active_staging_id",
+    "pending_item_resolutions",  # step 8: per-item resolution state during upload confirm
+    "review_message_id",         # step 8: Telegram message_id for edit-in-place review
+)
 
 
 class ContextService:

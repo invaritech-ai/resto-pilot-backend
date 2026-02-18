@@ -21,6 +21,7 @@ celery_app = Celery(
     backend=settings.celery_result_backend or None,
     include=[
         "app.workers.telegram_tasks",
+        "app.workers.ocr_tasks",
     ],
 )
 
