@@ -30,7 +30,7 @@ from app.db.models.user import User
 from app.services.context_service import ContextService
 from app.services.money import format_price
 from app.services.restaurant_service import RestaurantService
-from app.services.supplier_service import SupplierService
+from app.services.supplier_service import AlreadyLinkedError, SupplierService
 from app.telegram.bot_api import send_message
 
 
@@ -331,7 +331,7 @@ def handle(
             return
 
         svc = SupplierService(db)
-        matches = svc.fuzzy_search(args, threshold=0.6)
+        matches = svc.fuzzy_search_for_restaurant(args, restaurant_id=restaurant_id, threshold=0.6)
         if not matches:
             send_message(
                 chat_id=chat_id,
@@ -469,22 +469,36 @@ def handle(
             )
             return
 
-        # Check for existing suppliers with similar names
-        matches = SupplierService(db).fuzzy_search(args, threshold=0.75)
+        svc = SupplierService(db)
+
+        # Check for existing suppliers with similar names (global search for creation check).
+        # If a close match exists, link it deterministically rather than prompting yes/no.
+        matches = svc.fuzzy_search(args, threshold=0.75)
 
         if matches:
-            # Found potential matches - ask for confirmation
-            existing_supplier, score = matches[0]
-            send_message(
-                chat_id=chat_id,
-                text=f'Did you mean **{existing_supplier.name}**?\n\nReply "yes" to link them, or "no" to create a new supplier.',
-                settings=settings,
-            )
-            # TODO: Store pending state for handshake resolution
+            existing_supplier, _ = matches[0]
+            try:
+                svc.link(
+                    supplier_id=existing_supplier.id,
+                    restaurant_id=restaurant_id,
+                    user_id=user.id,
+                )
+                db.commit()
+                send_message(
+                    chat_id=chat_id,
+                    text=f"✅ Linked existing supplier: {existing_supplier.name}",
+                    settings=settings,
+                )
+            except AlreadyLinkedError:
+                send_message(
+                    chat_id=chat_id,
+                    text=f"ℹ️ {existing_supplier.name} is already linked to your restaurant.",
+                    settings=settings,
+                )
             return
 
-        # No match - create new supplier
-        supplier = SupplierService(db).create(
+        # No match — create new supplier
+        supplier = svc.create(
             name=args,
             user_id=user.id,
             restaurant_id=restaurant_id,

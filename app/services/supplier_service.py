@@ -206,6 +206,41 @@ class SupplierService:
         rows = self.session.execute(stmt).all()
         return [(row[0], float(row[1])) for row in rows]
 
+    def fuzzy_search_for_restaurant(
+        self,
+        name: str,
+        restaurant_id: uuid.UUID,
+        threshold: float = 0.6,
+    ) -> list[tuple[Supplier, float]]:
+        """Search suppliers linked to a specific restaurant by trigram similarity.
+
+        Unlike fuzzy_search(), this is scoped to suppliers actively linked to
+        the given restaurant. Use this for commands like /prices where a global
+        match could return a supplier the restaurant has never linked.
+
+        Args:
+            name:          Search query (lowercased internally).
+            restaurant_id: Restrict matches to this restaurant's active links.
+            threshold:     Minimum similarity score (0.0–1.0). Default 0.6.
+
+        Returns:
+            List of (Supplier, score) tuples, highest score first.
+        """
+        query_lower = name.strip().lower()
+        score = func.similarity(Supplier.name_lower, query_lower).label("score")
+        stmt = (
+            select(Supplier, score)
+            .join(RestaurantSupplier, RestaurantSupplier.supplier_id == Supplier.id)
+            .where(
+                RestaurantSupplier.restaurant_id == restaurant_id,
+                RestaurantSupplier.is_active == true(),
+                func.similarity(Supplier.name_lower, query_lower) >= threshold,
+            )
+            .order_by(score.desc())
+        )
+        rows = self.session.execute(stmt).all()
+        return [(row[0], float(row[1])) for row in rows]
+
     # ------------------------------------------------------------------
     # Price list queries (used by /products and /prices commands)
     # ------------------------------------------------------------------

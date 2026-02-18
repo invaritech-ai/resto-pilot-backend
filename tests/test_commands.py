@@ -394,6 +394,30 @@ class TestTeamCommand:
         assert "Page 1/2" in text
         assert "11 members total" in text
 
+    def test_team_stores_member_ids_in_context(self):
+        user = _make_user(RESTAURANT_ID)
+        ctx_svc = _make_ctx_svc(user)
+        db = _make_db()
+
+        restaurant = _mock_restaurant()
+        member_ids = [uuid.uuid4() for _ in range(3)]
+        members = []
+        for mid in member_ids:
+            u = MagicMock()
+            u.id = mid
+            u.full_name = f"User {mid}"
+            members.append((u, _mock_membership()))
+
+        with patch("app.telegram.handlers.commands.RestaurantService") as MockSvc, \
+             patch("app.telegram.handlers.commands.send_message"):
+            MockSvc.return_value.user_membership_exists.return_value = True
+            MockSvc.return_value.list_for_user.return_value = [(restaurant, _mock_membership())]
+            MockSvc.return_value.list_members.return_value = members
+            handle(_make_update("/team"), user, db, ctx_svc, _make_settings())
+
+        stored = user.context.get("numbered_items", [])
+        assert [uuid.UUID(s) for s in stored] == member_ids
+
 
 class TestInventoryStub:
     def test_inventory_stub_no_active_restaurant(self):
@@ -449,30 +473,6 @@ class TestBalanceStub:
 
         text = mock_send.call_args[1]["text"]
         assert "No inventory data yet" in text
-
-    def test_team_stores_member_ids_in_context(self):
-        user = _make_user(RESTAURANT_ID)
-        ctx_svc = _make_ctx_svc(user)
-        db = _make_db()
-
-        restaurant = _mock_restaurant()
-        member_ids = [uuid.uuid4() for _ in range(3)]
-        members = []
-        for mid in member_ids:
-            u = MagicMock()
-            u.id = mid
-            u.full_name = f"User {mid}"
-            members.append((u, _mock_membership()))
-
-        with patch("app.telegram.handlers.commands.RestaurantService") as MockSvc, \
-             patch("app.telegram.handlers.commands.send_message"):
-            MockSvc.return_value.user_membership_exists.return_value = True
-            MockSvc.return_value.list_for_user.return_value = [(restaurant, _mock_membership())]
-            MockSvc.return_value.list_members.return_value = members
-            handle(_make_update("/team"), user, db, ctx_svc, _make_settings())
-
-        stored = user.context.get("numbered_items", [])
-        assert [uuid.UUID(s) for s in stored] == member_ids
 
 
 # ---------------------------------------------------------------------------
@@ -758,7 +758,7 @@ class TestPricesCommand:
              patch("app.telegram.handlers.commands.SupplierService") as MockSvc2, \
              patch("app.telegram.handlers.commands.send_message") as mock_send:
             MockSvc.return_value.user_membership_exists.return_value = True
-            MockSvc2.return_value.fuzzy_search.return_value = []
+            MockSvc2.return_value.fuzzy_search_for_restaurant.return_value = []
             handle(_make_update("/prices UnknownCo"), user, db, ctx_svc, _make_settings())
 
         text = mock_send.call_args[1]["text"]
@@ -777,7 +777,7 @@ class TestPricesCommand:
              patch("app.telegram.handlers.commands.SupplierService") as MockSvc2, \
              patch("app.telegram.handlers.commands.send_message") as mock_send:
             MockSvc.return_value.user_membership_exists.return_value = True
-            MockSvc2.return_value.fuzzy_search.return_value = [(supplier, 0.9)]
+            MockSvc2.return_value.fuzzy_search_for_restaurant.return_value = [(supplier, 0.9)]
             MockSvc2.return_value.list_prices_for_supplier.return_value = []
             handle(_make_update("/prices ABC"), user, db, ctx_svc, _make_settings())
 
@@ -799,7 +799,7 @@ class TestPricesCommand:
              patch("app.telegram.handlers.commands.SupplierService") as MockSvc2, \
              patch("app.telegram.handlers.commands.send_message") as mock_send:
             MockSvc.return_value.user_membership_exists.return_value = True
-            MockSvc2.return_value.fuzzy_search.return_value = [(supplier, 0.9)]
+            MockSvc2.return_value.fuzzy_search_for_restaurant.return_value = [(supplier, 0.9)]
             MockSvc2.return_value.list_prices_for_supplier.return_value = [(price, eff_date)]
             MockSvc2.return_value.count_prices_for_supplier.return_value = 1
             handle(_make_update("/prices ABC"), user, db, ctx_svc, _make_settings())
@@ -825,7 +825,7 @@ class TestPricesCommand:
              patch("app.telegram.handlers.commands.SupplierService") as MockSvc2, \
              patch("app.telegram.handlers.commands.send_message") as mock_send:
             MockSvc.return_value.user_membership_exists.return_value = True
-            MockSvc2.return_value.fuzzy_search.return_value = [(supplier, 0.9)]
+            MockSvc2.return_value.fuzzy_search_for_restaurant.return_value = [(supplier, 0.9)]
             MockSvc2.return_value.list_prices_for_supplier.return_value = [(price, None)]
             MockSvc2.return_value.count_prices_for_supplier.return_value = 1
             handle(_make_update("/prices ABC"), user, db, ctx_svc, _make_settings())
@@ -848,10 +848,140 @@ class TestPricesCommand:
              patch("app.telegram.handlers.commands.SupplierService") as MockSvc2, \
              patch("app.telegram.handlers.commands.send_message") as mock_send:
             MockSvc.return_value.user_membership_exists.return_value = True
-            MockSvc2.return_value.fuzzy_search.return_value = [(supplier, 0.9)]
+            MockSvc2.return_value.fuzzy_search_for_restaurant.return_value = [(supplier, 0.9)]
             MockSvc2.return_value.list_prices_for_supplier.return_value = page
             MockSvc2.return_value.count_prices_for_supplier.return_value = 11
             handle(_make_update("/prices Big"), user, db, ctx_svc, _make_settings())
 
         text = mock_send.call_args[1]["text"]
         assert "Page 1/2" in text
+
+    def test_prices_uses_restaurant_scoped_search(self):
+        """Regression: /prices must use fuzzy_search_for_restaurant, not fuzzy_search.
+
+        A supplier that exists globally but is not linked to the active restaurant
+        must return "No supplier found", not leak prices from another restaurant.
+        """
+        user = _make_user(RESTAURANT_ID)
+        ctx_svc = _make_ctx_svc(user)
+        db = _make_db()
+
+        with patch("app.telegram.handlers.commands.RestaurantService") as MockSvc, \
+             patch("app.telegram.handlers.commands.SupplierService") as MockSvc2, \
+             patch("app.telegram.handlers.commands.send_message") as mock_send:
+            MockSvc.return_value.user_membership_exists.return_value = True
+            # Restaurant-scoped search finds nothing (supplier exists globally but not linked)
+            MockSvc2.return_value.fuzzy_search_for_restaurant.return_value = []
+            handle(_make_update("/prices GlobalOnlyCo"), user, db, ctx_svc, _make_settings())
+
+        text = mock_send.call_args[1]["text"]
+        assert "No supplier found" in text
+        # Global fuzzy_search must NOT have been called for /prices
+        MockSvc2.return_value.fuzzy_search.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# /add supplier
+# ---------------------------------------------------------------------------
+
+
+class TestAddSupplierCommand:
+    def test_add_supplier_no_active_restaurant(self):
+        user = _make_user(None)
+        ctx_svc = _make_ctx_svc(user)
+        db = _make_db()
+
+        with patch("app.telegram.handlers.commands.RestaurantService") as MockSvc, \
+             patch("app.telegram.handlers.commands.send_message") as mock_send:
+            MockSvc.return_value.list_for_user.return_value = []
+            handle(_make_update("/add supplier ABC"), user, db, ctx_svc, _make_settings())
+
+        text = mock_send.call_args[1]["text"]
+        assert "switch" in text.lower() or "no active" in text.lower()
+
+    def test_add_supplier_no_args_prompts_name(self):
+        user = _make_user(RESTAURANT_ID)
+        ctx_svc = _make_ctx_svc(user)
+        db = _make_db()
+
+        with patch("app.telegram.handlers.commands.RestaurantService") as MockSvc, \
+             patch("app.telegram.handlers.commands.send_message") as mock_send:
+            MockSvc.return_value.user_membership_exists.return_value = True
+            handle(_make_update("/add supplier"), user, db, ctx_svc, _make_settings())
+
+        text = mock_send.call_args[1]["text"]
+        assert "supplier name" in text.lower() or "example" in text.lower()
+
+    def test_add_supplier_no_match_creates_new(self):
+        user = _make_user(RESTAURANT_ID)
+        ctx_svc = _make_ctx_svc(user)
+        db = _make_db()
+
+        new_supplier = MagicMock()
+        new_supplier.name = "Brand New Co"
+
+        with patch("app.telegram.handlers.commands.RestaurantService") as MockSvc, \
+             patch("app.telegram.handlers.commands.SupplierService") as MockSvc2, \
+             patch("app.telegram.handlers.commands.send_message") as mock_send:
+            MockSvc.return_value.user_membership_exists.return_value = True
+            MockSvc2.return_value.fuzzy_search.return_value = []
+            MockSvc2.return_value.create.return_value = new_supplier
+            handle(_make_update("/add supplier Brand New Co"), user, db, ctx_svc, _make_settings())
+
+        text = mock_send.call_args[1]["text"]
+        assert "✅" in text
+        assert "Brand New Co" in text
+        db.commit.assert_called()
+
+    def test_add_supplier_fuzzy_match_links_existing(self):
+        """Regression P0: fuzzy match → link existing supplier, no yes/no prompt."""
+        user = _make_user(RESTAURANT_ID)
+        ctx_svc = _make_ctx_svc(user)
+        db = _make_db()
+
+        existing = MagicMock()
+        existing.id = uuid.uuid4()
+        existing.name = "ABC Wholesalers"
+
+        with patch("app.telegram.handlers.commands.RestaurantService") as MockSvc, \
+             patch("app.telegram.handlers.commands.SupplierService") as MockSvc2, \
+             patch("app.telegram.handlers.commands.send_message") as mock_send:
+            MockSvc.return_value.user_membership_exists.return_value = True
+            MockSvc2.return_value.fuzzy_search.return_value = [(existing, 0.88)]
+            handle(_make_update("/add supplier ABC Whol"), user, db, ctx_svc, _make_settings())
+
+        text = mock_send.call_args[1]["text"]
+        assert "✅" in text
+        assert "ABC Wholesalers" in text
+        # Must call link(), not create()
+        MockSvc2.return_value.link.assert_called_once_with(
+            supplier_id=existing.id,
+            restaurant_id=RESTAURANT_ID,
+            user_id=USER_ID,
+        )
+        MockSvc2.return_value.create.assert_not_called()
+        db.commit.assert_called()
+
+    def test_add_supplier_already_linked_shows_info_message(self):
+        """Regression P0: already-linked supplier → informative message, no error."""
+        from app.services.supplier_service import AlreadyLinkedError
+
+        user = _make_user(RESTAURANT_ID)
+        ctx_svc = _make_ctx_svc(user)
+        db = _make_db()
+
+        existing = MagicMock()
+        existing.id = uuid.uuid4()
+        existing.name = "ABC Wholesalers"
+
+        with patch("app.telegram.handlers.commands.RestaurantService") as MockSvc, \
+             patch("app.telegram.handlers.commands.SupplierService") as MockSvc2, \
+             patch("app.telegram.handlers.commands.send_message") as mock_send:
+            MockSvc.return_value.user_membership_exists.return_value = True
+            MockSvc2.return_value.fuzzy_search.return_value = [(existing, 0.88)]
+            MockSvc2.return_value.link.side_effect = AlreadyLinkedError("already linked")
+            handle(_make_update("/add supplier ABC"), user, db, ctx_svc, _make_settings())
+
+        text = mock_send.call_args[1]["text"]
+        assert "already linked" in text.lower() or "ℹ️" in text
+        db.commit.assert_not_called()
