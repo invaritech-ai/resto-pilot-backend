@@ -413,18 +413,20 @@ def _build_review_text(
         if document_type == "invoice":
             qty = item.get("qty", 0)
             unit = item.get("unit") or ""
-            price = item.get("unit_price", 0)
+            price = item.get("unit_price")
             amount = item.get("amount")
-            row = f"{i + 1}. {name}   {qty}{unit} × ${price:.2f}"
+            price_str = f"${price:.2f}" if price is not None else "?price"
+            row = f"{i + 1}. {name}   {qty}{unit} × {price_str}"
             if amount:
                 row += f" = ${amount:.2f}"
-                if abs(qty * price - amount) > 0.01:
+                if price is not None and abs(qty * price - amount) > 0.01:
                     row += " ⚠️"
             lines.append(row)
         else:
             unit = item.get("unit") or ""
-            price = item.get("unit_price", 0)
-            lines.append(f"{i + 1}. {name}   {unit} @ ${price:.2f}")
+            price = item.get("unit_price")
+            price_str = f"${price:.2f}" if price is not None else "?price"
+            lines.append(f"{i + 1}. {name}   {unit} @ {price_str}")
 
     if len(items) > 10:
         lines.append(f"… +{len(items) - 10} more items")

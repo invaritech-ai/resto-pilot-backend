@@ -184,7 +184,8 @@ class TestParseInvoiceText:
         assert len(result["line_items"]) == 1
         assert result["line_items"][0]["name"] == "Oil"
 
-    def test_skips_items_with_zero_unit_price(self):
+    def test_zero_unit_price_included_as_null(self):
+        """Items with zero/missing unit_price are kept with unit_price=None for user review."""
         settings = _make_settings()
         payload = dict(_INVOICE_PAYLOAD)
         payload["line_items"] = [
@@ -198,8 +199,9 @@ class TestParseInvoiceText:
             )
             result = parse_invoice(settings, text="Invoice text")
 
-        assert len(result["line_items"]) == 1
-        assert result["line_items"][0]["name"] == "Chicken"
+        assert len(result["line_items"]) == 2
+        sample = next(i for i in result["line_items"] if i["name"] == "Free Sample")
+        assert sample["unit_price"] is None
 
     def test_skips_items_with_no_name(self):
         settings = _make_settings()
@@ -297,7 +299,8 @@ class TestParsePriceListText:
         assert item["name"] == "Tomato"
         assert item["unit_price"] == 12.5
 
-    def test_skips_items_with_zero_unit_price(self):
+    def test_zero_unit_price_included_as_null(self):
+        """Items with zero/missing unit_price are kept with unit_price=None for user review."""
         settings = _make_settings()
         payload = dict(_PRICE_LIST_PAYLOAD)
         payload["line_items"] = [
@@ -311,8 +314,9 @@ class TestParsePriceListText:
             )
             result = parse_price_list(settings, text="Price list text")
 
-        assert len(result["line_items"]) == 1
-        assert result["line_items"][0]["name"] == "Basil"
+        assert len(result["line_items"]) == 2
+        seasonal = next(i for i in result["line_items"] if i["name"] == "Seasonal Item")
+        assert seasonal["unit_price"] is None
 
     def test_strips_markdown_fences(self):
         settings = _make_settings()

@@ -283,24 +283,44 @@ def _validate(raw: dict, document_type: str) -> dict:
             continue
 
         unit_price = _to_float(item.get("unit_price"))
-        if unit_price is None or unit_price <= 0:
-            logger.warning("item_parser: skip item %r — bad unit_price", name)
-            continue
-
-        row: dict = {
-            "name": name,
-            "unit": str(item["unit"]).strip() if item.get("unit") else None,
-            "unit_price": unit_price,
-        }
+        unit = str(item["unit"]).strip() if item.get("unit") else None
 
         if document_type == "invoice":
             qty = _to_float(item.get("qty"))
             if qty is None or qty <= 0:
                 logger.warning("item_parser: skip invoice item %r — bad qty", name)
                 continue
-            row["qty"] = qty
             amount = _to_float(item.get("amount"))
-            row["amount"] = amount if amount and amount > 0 else None
+
+            # Derive unit_price from amount/qty if not directly provided
+            if unit_price is None or unit_price <= 0:
+                if amount and amount > 0 and qty > 0:
+                    unit_price = round(amount / qty, 6)
+                    logger.info(
+                        "item_parser: derived unit_price for %r: amount=%s qty=%s → %s",
+                        name, amount, qty, unit_price,
+                    )
+                else:
+                    logger.warning("item_parser: unit_price missing for %r — including with null for user review", name)
+                    unit_price = None
+
+            row: dict = {
+                "name": name,
+                "unit": unit,
+                "unit_price": unit_price,
+                "qty": qty,
+                "amount": amount if amount and amount > 0 else None,
+            }
+
+        else:
+            if unit_price is None or unit_price <= 0:
+                logger.warning("item_parser: unit_price missing for %r — including with null for user review", name)
+                unit_price = None
+            row = {
+                "name": name,
+                "unit": unit,
+                "unit_price": unit_price,
+            }
 
         line_items.append(row)
 
