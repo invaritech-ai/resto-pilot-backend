@@ -92,11 +92,12 @@ class ContextService:
         return int(self.get(user).get("last_list_offset", 0))
 
     def get_fields(self, user: User) -> dict[str, Any]:
-        """Return the full context dict for reading multiple fields.
+        """Compatibility alias for get().
 
-        Used by item edit flow and other handlers that need to check
-        multiple context fields at once (e.g., editing_staging_id,
-        editing_item_idx, editing_field).
+        Some handlers call `get_fields()` when they need to read multiple context
+        keys at once (for example, item-edit state fields). Keeping this wrapper
+        avoids duplicate context-access patterns across call sites while preserving
+        the existing `get()` behavior and return shape.
         """
         return self.get(user)
 
