@@ -983,6 +983,7 @@ class TestPricesCommand:
             MockSvc2.return_value.fuzzy_search_for_restaurant.return_value = [(supplier, 0.9)]
             MockSvc2.return_value.list_prices_for_supplier.return_value = [(price, eff_date)]
             MockSvc2.return_value.count_prices_for_supplier.return_value = 1
+            MockSvc2.return_value.get_price_list_meta.return_value = (None, None)
             handle(_make_update("/prices ABC"), user, db, ctx_svc, _make_settings())
 
         text = mock_send.call_args[1]["text"]
@@ -1009,6 +1010,7 @@ class TestPricesCommand:
             MockSvc2.return_value.fuzzy_search_for_restaurant.return_value = [(supplier, 0.9)]
             MockSvc2.return_value.list_prices_for_supplier.return_value = [(price, None)]
             MockSvc2.return_value.count_prices_for_supplier.return_value = 1
+            MockSvc2.return_value.get_price_list_meta.return_value = (None, None)
             handle(_make_update("/prices ABC"), user, db, ctx_svc, _make_settings())
 
         text = mock_send.call_args[1]["text"]
@@ -1033,6 +1035,7 @@ class TestPricesCommand:
             MockSvc2.return_value.fuzzy_search_for_restaurant.return_value = [(supplier, 0.9)]
             MockSvc2.return_value.list_prices_for_supplier.return_value = page
             MockSvc2.return_value.count_prices_for_supplier.return_value = 11
+            MockSvc2.return_value.get_price_list_meta.return_value = (None, None)
             handle(_make_update("/prices Big"), user, db, ctx_svc, _make_settings())
 
         text = mock_send.call_args[1]["text"]

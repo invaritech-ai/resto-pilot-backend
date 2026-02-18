@@ -34,6 +34,7 @@ from __future__ import annotations
 from collections.abc import Callable
 import json
 import logging
+import time
 
 from openai import OpenAI
 
@@ -138,6 +139,7 @@ def ocr_page_to_markdown(
 
     logger.info("ocr_page_to_markdown model=%s", model)
 
+    t0 = time.monotonic()
     try:
         response = client.chat.completions.create(
             model=model,
@@ -154,24 +156,27 @@ def ocr_page_to_markdown(
             temperature=0.0,
         )
     except Exception as exc:
+        latency_ms = int((time.monotonic() - t0) * 1000)
         _emit_llm_call(
             on_llm_call=on_llm_call,
             payload={
                 "purpose": "ocr_page_to_markdown",
                 "model": model,
+                "latency_ms": latency_ms,
                 "error": str(exc),
             },
         )
         logger.error("ocr_page_to_markdown error: %s", exc)
         raise ParseError(f"OCR LLM call failed: {exc}") from exc
 
+    latency_ms = int((time.monotonic() - t0) * 1000)
     _emit_llm_call(
         on_llm_call=on_llm_call,
         payload={
             "purpose": "ocr_page_to_markdown",
             "model": model,
-            "upstream_id": getattr(response, "id", None),
-            "usage": _extract_usage_dict(response),
+            "latency_ms": latency_ms,
+            **_extract_response_meta(response),
         },
     )
     return (response.choices[0].message.content or "").strip()
@@ -249,6 +254,7 @@ def _call_parser(
         model,
     )
 
+    t0 = time.monotonic()
     try:
         response = client.chat.completions.create(
             model=model,
@@ -259,24 +265,27 @@ def _call_parser(
             temperature=0.0,
         )
     except Exception as exc:
+        latency_ms = int((time.monotonic() - t0) * 1000)
         _emit_llm_call(
             on_llm_call=on_llm_call,
             payload={
                 "purpose": f"parse_{document_type}",
                 "model": model,
+                "latency_ms": latency_ms,
                 "error": str(exc),
             },
         )
         logger.error("item_parser_llm_error doc_type=%s error=%s", document_type, exc)
         raise ParseError(f"LLM call failed: {exc}") from exc
 
+    latency_ms = int((time.monotonic() - t0) * 1000)
     _emit_llm_call(
         on_llm_call=on_llm_call,
         payload={
             "purpose": f"parse_{document_type}",
             "model": model,
-            "upstream_id": getattr(response, "id", None),
-            "usage": _extract_usage_dict(response),
+            "latency_ms": latency_ms,
+            **_extract_response_meta(response),
         },
     )
 
@@ -300,24 +309,76 @@ def _call_parser(
     return _validate(parsed, document_type)
 
 
-def _extract_usage_dict(response: object) -> dict[str, int] | None:
-    usage = getattr(response, "usage", None)
-    if usage is None:
-        return None
+def _extract_response_meta(response: object) -> dict[str, object]:
+    """Extract all telemetry fields from a chat completion response.
 
-    prompt_tokens = getattr(usage, "prompt_tokens", None)
-    completion_tokens = getattr(usage, "completion_tokens", None)
-    total_tokens = getattr(usage, "total_tokens", None)
+    Handles OpenRouter-specific extensions (cost, generation ID) and
+    falls back gracefully for standard OpenAI responses.
 
-    usage_dict: dict[str, int] = {}
-    if isinstance(prompt_tokens, int):
-        usage_dict["prompt_tokens"] = prompt_tokens
-    if isinstance(completion_tokens, int):
-        usage_dict["completion_tokens"] = completion_tokens
-    if isinstance(total_tokens, int):
-        usage_dict["total_tokens"] = total_tokens
+    Returns a dict suitable for spreading into an _emit_llm_call payload.
+    The dict always has keys:
+        openrouter_generation_id, upstream_id, usage,
+        total_cost_usd, upstream_inference_cost_usd
+    """
+    response_id: str | None = None
+    raw_id = getattr(response, "id", None)
+    if raw_id is not None:
+        response_id = str(raw_id)
 
-    return usage_dict or None
+    # OpenRouter generation IDs start with "gen-"; everything else is a provider ID.
+    openrouter_generation_id: str | None = None
+    upstream_id: str | None = None
+    if response_id:
+        if response_id.startswith("gen-"):
+            openrouter_generation_id = response_id
+        else:
+            upstream_id = response_id
+
+    # Token counts (standard across all providers)
+    usage_obj = getattr(response, "usage", None)
+    usage_dict: dict[str, int] | None = None
+    total_cost_usd: float | None = None
+    upstream_inference_cost_usd: float | None = None
+
+    if usage_obj is not None:
+        tokens: dict[str, int] = {}
+        pt = getattr(usage_obj, "prompt_tokens", None)
+        ct = getattr(usage_obj, "completion_tokens", None)
+        tt = getattr(usage_obj, "total_tokens", None)
+        if isinstance(pt, int):
+            tokens["prompt_tokens"] = pt
+        if isinstance(ct, int):
+            tokens["completion_tokens"] = ct
+        if isinstance(tt, int):
+            tokens["total_tokens"] = tt
+        if tokens:
+            usage_dict = tokens
+
+        # OpenRouter-specific: cost in USD, included in every response
+        cost_raw = getattr(usage_obj, "cost", None)
+        if cost_raw is not None:
+            try:
+                total_cost_usd = float(cost_raw)
+            except (TypeError, ValueError):
+                pass
+
+        # OpenRouter-specific: upstream provider cost (inside cost_details)
+        cost_details = getattr(usage_obj, "cost_details", None)
+        if cost_details is not None:
+            upstream_raw = getattr(cost_details, "upstream_inference_cost", None)
+            if upstream_raw is not None:
+                try:
+                    upstream_inference_cost_usd = float(upstream_raw)
+                except (TypeError, ValueError):
+                    pass
+
+    return {
+        "openrouter_generation_id": openrouter_generation_id,
+        "upstream_id": upstream_id,
+        "usage": usage_dict,
+        "total_cost_usd": total_cost_usd,
+        "upstream_inference_cost_usd": upstream_inference_cost_usd,
+    }
 
 
 def _emit_llm_call(

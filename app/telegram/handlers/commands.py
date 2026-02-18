@@ -380,11 +380,22 @@ def _render_prices_page(
         supplier = db.get(Supplier, supplier_id)
         supplier_name = supplier.name if supplier else "Supplier"
 
+    # Get last updated timestamp and uploader name
+    last_updated, uploader_name = svc.get_price_list_meta(restaurant_id, supplier_id)
+
     ctx_svc.set_numbered_items(user, [price.id for price, _ in prices])
     ctx_svc.set_list_state(user, "prices", offset)
     ctx_svc.set_fields(user, prices_supplier_id=str(supplier_id))
 
-    lines = [f"💰 Prices — {supplier_name}\n"]
+    lines = [f"💰 Prices — {supplier_name}"]
+    if last_updated:
+        # Format: 12 June 2026 5:35 AM
+        last_updated_str = last_updated.strftime('%-d %B %Y %-I:%M %p UTC')
+        lines.append(f"Last updated: {last_updated_str}")
+    if uploader_name:
+        lines.append(f"Updated by: {uploader_name}")
+    lines.append("")  # blank line before items
+
     for i, (price, effective_date) in enumerate(prices, offset + 1):
         price_str = format_price(price.price_minor, price.price_exp, price.currency)
         unit = f"/{price.unit}" if price.unit else ""

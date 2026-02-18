@@ -24,7 +24,7 @@ from __future__ import annotations
 import datetime as dt
 import uuid
 
-from sqlalchemy import case, func, or_, select, true
+from sqlalchemy import case, desc, func, or_, select, true
 from sqlalchemy.orm import Session
 
 from app.db.models.restaurant import Restaurant
@@ -32,6 +32,8 @@ from app.db.models.restaurant_suppliers import RestaurantSupplier
 from app.db.models.supplier_price_lists import SupplierPriceList
 from app.db.models.supplier_prices import SupplierPrice
 from app.db.models.suppliers import Supplier
+from app.db.models.file_processing_staging import FileProcessingStaging
+from app.db.models.user import User
 
 
 class SupplierNotFoundError(Exception):
@@ -363,3 +365,48 @@ class SupplierService:
             )
         )
         return self.session.scalar(stmt) or 0
+
+    def get_price_list_meta(
+        self,
+        restaurant_id: uuid.UUID,
+        supplier_id: uuid.UUID,
+    ) -> tuple[dt.datetime | None, str | None]:
+        """Get last updated timestamp and uploader name for a supplier's price list.
+
+        Returns:
+            Tuple of (last_updated, uploader_name)
+            - last_updated: most recent SupplierPriceList.created_at
+            - uploader_name: User.full_name of the most recent confirmed staging record
+        """
+        # 1. Most recent SupplierPriceList.created_at
+        price_list_stmt = (
+            select(SupplierPriceList.created_at)
+            .where(
+                SupplierPriceList.restaurant_id == restaurant_id,
+                SupplierPriceList.supplier_id == supplier_id,
+            )
+            .order_by(desc(SupplierPriceList.created_at))
+            .limit(1)
+        )
+        last_updated = self.session.scalar(price_list_stmt)
+
+        # 2. Most recent confirmed staging record's user
+        staging_stmt = (
+            select(User.full_name)
+            .join(
+                FileProcessingStaging,
+                FileProcessingStaging.uploaded_by == User.id,
+            )
+            .where(
+                FileProcessingStaging.restaurant_id == restaurant_id,
+                FileProcessingStaging.supplier_id == supplier_id,
+                FileProcessingStaging.status == "confirmed",
+                FileProcessingStaging.document_type == "price_list",
+            )
+            .order_by(desc(FileProcessingStaging.created_at))
+            .limit(1)
+        )
+        uploader_name = self.session.scalar(staging_stmt)
+
+        return last_updated, uploader_name
+

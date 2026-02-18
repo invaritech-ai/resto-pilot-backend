@@ -15,6 +15,7 @@ Interface under test:
         SupplierNotFoundError
 """
 
+import datetime
 import uuid
 from unittest.mock import MagicMock, call, patch
 
@@ -362,3 +363,42 @@ class TestListRestaurantsForSupplier:
         svc = SupplierService(session)
         svc.list_restaurants_for_supplier(S_ID)
         session.scalars.assert_called_once()
+
+
+# -------------------------------------------------------------------------
+# get_price_list_meta
+# -------------------------------------------------------------------------
+
+class TestGetPriceListMeta:
+    def test_returns_last_updated_and_uploader_name(self):
+        session = make_session()
+        # Mock the two scalar queries
+        last_updated = datetime.datetime(2026, 6, 12, 5, 35, 0, tzinfo=datetime.timezone.utc)
+        uploader_name = "Avishek"
+        session.scalar.side_effect = [last_updated, uploader_name]
+        svc = SupplierService(session)
+        result = svc.get_price_list_meta(R_ID, S_ID)
+        assert result == (last_updated, uploader_name)
+
+    def test_returns_none_when_no_price_list(self):
+        session = make_session()
+        session.scalar.side_effect = [None, None]
+        svc = SupplierService(session)
+        result = svc.get_price_list_meta(R_ID, S_ID)
+        assert result == (None, None)
+
+    def test_returns_only_last_updated_if_no_staging(self):
+        session = make_session()
+        last_updated = datetime.datetime(2026, 6, 12, 5, 35, 0, tzinfo=datetime.timezone.utc)
+        session.scalar.side_effect = [last_updated, None]
+        svc = SupplierService(session)
+        result = svc.get_price_list_meta(R_ID, S_ID)
+        assert result == (last_updated, None)
+
+    def test_returns_only_uploader_name_if_no_price_list_but_staging_exists(self):
+        session = make_session()
+        uploader_name = "Avishek"
+        session.scalar.side_effect = [None, uploader_name]
+        svc = SupplierService(session)
+        result = svc.get_price_list_meta(R_ID, S_ID)
+        assert result == (None, uploader_name)

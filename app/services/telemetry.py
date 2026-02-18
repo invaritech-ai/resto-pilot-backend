@@ -31,11 +31,19 @@ def record_llm_call(
     usage: Mapping[str, int] | None = None,
     latency_ms: int | None = None,
     total_cost_usd: float | None = None,
+    cache_discount_usd: float | None = None,
+    upstream_inference_cost_usd: float | None = None,
     cost_backfilled_at: dt.datetime | None = None,
     openrouter_generation_json: dict[str, Any] | None = None,
     error: str | None = None,
 ) -> uuid.UUID:
-    """Record an LLM call for telemetry."""
+    """Record an LLM call for telemetry.
+
+    For OpenRouter callers pass openrouter_generation_id (response.id starting with 'gen-')
+    and total_cost_usd (usage.cost from the response). upstream_inference_cost_usd comes
+    from usage.cost_details.upstream_inference_cost. latency_ms should be wall-clock ms
+    measured around the API call.
+    """
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
     total_tokens: int | None = None
@@ -47,9 +55,8 @@ def record_llm_call(
         completion_tokens = ct if isinstance(ct, int) else None
         total_tokens = tt if isinstance(tt, int) else None
 
-    total_cost_value = (
-        decimal.Decimal(str(total_cost_usd)) if total_cost_usd is not None else None
-    )
+    def _to_decimal(v: float | None) -> decimal.Decimal | None:
+        return decimal.Decimal(str(v)) if v is not None else None
 
     row = LLMCalls(
         session_id=session_id,
@@ -63,7 +70,9 @@ def record_llm_call(
         completion_tokens=completion_tokens,
         total_tokens=total_tokens,
         latency_ms=latency_ms,
-        total_cost_usd=total_cost_value,
+        total_cost_usd=_to_decimal(total_cost_usd),
+        cache_discount_usd=_to_decimal(cache_discount_usd),
+        upstream_inference_cost_usd=_to_decimal(upstream_inference_cost_usd),
         cost_backfilled_at=cost_backfilled_at,
         openrouter_generation_json=openrouter_generation_json,
         error=error,

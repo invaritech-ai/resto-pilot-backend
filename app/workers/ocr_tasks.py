@@ -191,12 +191,32 @@ def process_file_task(
             if not model:
                 return
             purpose = str(meta.get("purpose") or "ocr")
+
             usage_obj = meta.get("usage")
             usage = usage_obj if isinstance(usage_obj, dict) else None
+
+            # OpenRouter: generation ID (gen-xxx) vs generic upstream ID
+            or_gen_raw = meta.get("openrouter_generation_id")
+            openrouter_generation_id = str(or_gen_raw) if or_gen_raw is not None else None
             upstream_raw = meta.get("upstream_id")
             upstream_id = str(upstream_raw) if upstream_raw is not None else None
+
+            # Cost fields (OpenRouter only — None for other providers)
+            cost_raw = meta.get("total_cost_usd")
+            total_cost_usd = float(cost_raw) if isinstance(cost_raw, (int, float)) else None
+            cache_raw = meta.get("cache_discount_usd")
+            cache_discount_usd = float(cache_raw) if isinstance(cache_raw, (int, float)) else None
+            upstream_cost_raw = meta.get("upstream_inference_cost_usd")
+            upstream_inference_cost_usd = (
+                float(upstream_cost_raw) if isinstance(upstream_cost_raw, (int, float)) else None
+            )
+
+            latency_raw = meta.get("latency_ms")
+            latency_ms = int(latency_raw) if isinstance(latency_raw, int) else None
+
             error_raw = meta.get("error")
             error = str(error_raw) if error_raw is not None else None
+
             try:
                 record_llm_call(
                     db=db,
@@ -204,8 +224,13 @@ def process_file_task(
                     chat_id=chat_id,
                     purpose=purpose,
                     model=model,
+                    openrouter_generation_id=openrouter_generation_id,
                     upstream_id=upstream_id,
                     usage=usage,
+                    latency_ms=latency_ms,
+                    total_cost_usd=total_cost_usd,
+                    cache_discount_usd=cache_discount_usd,
+                    upstream_inference_cost_usd=upstream_inference_cost_usd,
                     error=error,
                 )
             except Exception:
