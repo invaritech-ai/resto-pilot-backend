@@ -437,6 +437,48 @@ def get_file_bytes(
         ) from None
 
 
+def send_message_with_keyboard(
+    chat_id: int,
+    text: str,
+    reply_markup: dict,
+    settings: Settings,
+) -> int | None:
+    """Send a message with an inline keyboard. Returns message_id or None.
+
+    Falls back to plain send_message when in dev/test sink mode.
+    """
+    sink = _OUTGOING_MESSAGE_SINK.get()
+    if sink is not None:
+        sink(chat_id, text)
+        return 1
+
+    if chat_id == 0:
+        print(text, flush=True)  # noqa: T201
+        return 1
+
+    if not settings.telegram_bot_token:
+        return send_message(chat_id=chat_id, text=text, settings=settings)
+
+    url = f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage"
+    payload: dict[str, Any] = {
+        "chat_id": chat_id,
+        "text": text,
+        "reply_markup": reply_markup,
+    }
+    try:
+        resp = httpx.post(url, json=payload, timeout=10.0)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("ok"):
+            msg_id = (data.get("result") or {}).get("message_id")
+            return int(msg_id) if msg_id else None
+        logger.error("send_message_with_keyboard failed: %s", data.get("description"))
+        return None
+    except Exception as exc:
+        logger.error("send_message_with_keyboard error: %s", exc)
+        return None
+
+
 def answer_callback_query(
     callback_id: str,
     text: str = "",

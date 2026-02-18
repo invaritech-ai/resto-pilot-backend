@@ -38,6 +38,7 @@ from app.telegram.keyboards import (
     cb_delete_upload,
     cb_edit_row,
     cb_new_supplier,
+    cb_pick_currency,
     cb_rev_page,
     cb_set_supplier,
     make_button,
@@ -411,8 +412,11 @@ def _build_review_text(
             meta.append(f"Effective: {extracted['effective_date']}")
         if extracted.get("lead_time"):
             meta.append(f"Lead: {extracted['lead_time']}")
-    if extracted.get("currency"):
-        meta.append(extracted["currency"])
+    currency = extracted.get("currency")
+    if currency:
+        meta.append(currency)
+    elif document_type == "price_list":
+        meta.append("💱 ?currency")
     if meta:
         lines.append("  ".join(meta))
 
@@ -444,9 +448,14 @@ def _build_review_text(
 
         lines.append(row)
 
+    warnings: list[str] = []
     if not auto_supplier:
+        warnings.append("⚠️ Supplier not confirmed — please set before confirming.")
+    if document_type == "price_list" and not extracted.get("currency"):
+        warnings.append("⚠️ Currency not set — required before confirming.")
+    if warnings:
         lines.append("")
-        lines.append("⚠️ Supplier not confirmed — please set before confirming.")
+        lines.extend(warnings)
 
     return "\n".join(lines)
 
@@ -477,6 +486,10 @@ def _build_review_keyboard(
     if sup_buttons:
         for btn in sup_buttons:
             keyboard.append([btn])
+
+    # Currency button for price lists when currency is not yet set
+    if staging.document_type == "price_list" and not extracted.get("currency"):
+        keyboard.append([make_button("💱 Set Currency", cb_pick_currency(staging_id))])
 
     # Navigation row (only when multiple pages exist)
     if total_pages > 1:

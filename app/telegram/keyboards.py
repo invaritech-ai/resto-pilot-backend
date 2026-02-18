@@ -120,6 +120,21 @@ def cb_skip_item(staging_id: uuid.UUID, idx: int) -> str:
     return f"skip_item:{uuid_to_hex(staging_id)}:{idx}"
 
 
+def cb_open_upload(staging_id: uuid.UUID) -> str:
+    """Re-open a pending_review staging record: open_u:{staging_hex}"""
+    return _ensure_callback_limit(f"open_u:{uuid_to_hex(staging_id)}")
+
+
+def cb_pick_currency(staging_id: uuid.UUID) -> str:
+    """Show currency picker for a staging record: pick_cur:{staging_hex}"""
+    return _ensure_callback_limit(f"pick_cur:{uuid_to_hex(staging_id)}")
+
+
+def cb_set_currency(staging_id: uuid.UUID, code: str) -> str:
+    """Set currency on a staging record: set_cur:{staging_hex}:{code}"""
+    return _ensure_callback_limit(f"set_cur:{uuid_to_hex(staging_id)}:{code}")
+
+
 # ---------------------------------------------------------------------------
 # Keyboard builders
 # ---------------------------------------------------------------------------

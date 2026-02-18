@@ -586,12 +586,64 @@ def handle(
 
     # --- /uploads ---
     if command == "uploads":
-        # TODO: Implement when staging service is ready
-        send_message(
-            chat_id=chat_id,
-            text="No pending uploads.",
-            settings=settings,
-        )
+        restaurant_id = _require_active_restaurant(user, ctx_svc, db, settings)
+        if restaurant_id is None:
+            return
+
+        from sqlalchemy import desc, select
+        from app.db.models.file_processing_staging import FileProcessingStaging
+        from app.db.models.suppliers import Supplier
+        from app.telegram.bot_api import send_message_with_keyboard
+        from app.telegram.keyboards import cb_open_upload, make_button
+
+        records = db.scalars(
+            select(FileProcessingStaging)
+            .where(FileProcessingStaging.restaurant_id == restaurant_id)
+            .where(FileProcessingStaging.status.in_(["processing", "pending_review", "error"]))
+            .order_by(desc(FileProcessingStaging.created_at))
+            .limit(10)
+        ).all()
+
+        if not records:
+            send_message(chat_id=chat_id, text="No pending uploads.", settings=settings)
+            return
+
+        _STATUS_LABEL = {
+            "processing":    "⏳ Extracting",
+            "pending_review": "👁 Awaiting review",
+            "error":         "⚠️ Failed",
+        }
+        lines = ["📂 Pending uploads:\n"]
+        keyboard_rows: list = []
+        for r in records:
+            label = _STATUS_LABEL.get(r.status, r.status)
+            doc = (r.document_type or "?").replace("_", " ")
+            date_str = r.created_at.strftime("%d %b %H:%M") if r.created_at else "?"
+            supplier_name = ""
+            if r.supplier_id:
+                sup = db.get(Supplier, r.supplier_id)
+                if sup:
+                    supplier_name = f" — {sup.name}"
+            err = f"\n   ↳ {r.error_message}" if r.status == "error" and r.error_message else ""
+            lines.append(f"{label}  {doc} · {date_str}{supplier_name}{err}")
+            if r.status == "pending_review":
+                keyboard_rows.append([
+                    make_button(
+                        f"📂 Open {doc} · {date_str}{supplier_name}",
+                        cb_open_upload(r.id),
+                    )
+                ])
+
+        text = "\n".join(lines)
+        if keyboard_rows:
+            send_message_with_keyboard(
+                chat_id=chat_id,
+                text=text,
+                reply_markup={"inline_keyboard": keyboard_rows},
+                settings=settings,
+            )
+        else:
+            send_message(chat_id=chat_id, text=text, settings=settings)
         return
 
     # Unknown command

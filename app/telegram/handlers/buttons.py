@@ -51,10 +51,13 @@ from app.services.price_service import PriceService
 from app.services.restaurant_service import RestaurantService
 from app.services.staging_service import StagingService
 from app.services.supplier_service import SupplierService
-from app.telegram.bot_api import answer_callback_query, edit_message_text, send_message
+from app.telegram.bot_api import answer_callback_query, edit_message_text, send_message, send_message_with_keyboard
 from app.telegram.keyboards import (
     cb_delete_upload,
     cb_mk_item,
+    cb_open_upload,
+    cb_pick_currency,
+    cb_set_currency,
     cb_skip_item,
     cb_use_match,
     hex_to_uuid,
@@ -104,6 +107,9 @@ def handle(
         "mk_item":   _handle_mk_item,
         "skip_item": _handle_skip_item,
         "rev_p":     _handle_rev_page,
+        "open_u":    _handle_open_u,
+        "pick_cur":  _handle_pick_cur,
+        "set_cur":   _handle_set_cur,
     }
 
     handler = dispatch.get(action)
@@ -240,6 +246,17 @@ def _handle_conf_u(*, params, user, db, ctx_svc, settings, callback_id, chat_id,
 
     # Price list: direct confirm
     if staging.document_type == "price_list":
+        # Gate 2: currency must be set (handwritten invoices never have it printed)
+        extracted_data = staging.extracted_data_json or {}
+        if not extracted_data.get("currency"):
+            answer_callback_query(
+                callback_id=callback_id,
+                text="⚠️ Please set the currency before confirming.",
+                show_alert=True,
+                settings=settings,
+            )
+            return
+
         try:
             count = PriceService(db).confirm_price_list(
                 staging_id=staging_id,
@@ -908,6 +925,147 @@ def _build_resolution_hub(
 # ---------------------------------------------------------------------------
 # Review message update helpers
 # ---------------------------------------------------------------------------
+
+
+_COMMON_CURRENCIES = ["HKD", "SGD", "USD", "EUR", "GBP", "AUD", "THB", "CNY"]
+
+
+def _handle_open_u(*, params, user, db, ctx_svc, settings, callback_id, chat_id, message_id):
+    """Re-open a pending_review staging record and re-send its review message."""
+    if not params:
+        answer_callback_query(callback_id=callback_id, text="Invalid.", settings=settings)
+        return
+
+    try:
+        staging_id = hex_to_uuid(params[0])
+    except ValueError:
+        answer_callback_query(callback_id=callback_id, text="Invalid ID.", settings=settings)
+        return
+
+    staging = db.get(FileProcessingStaging, staging_id)
+    if staging is None:
+        answer_callback_query(callback_id=callback_id, text="Upload not found.", settings=settings)
+        return
+
+    if staging.status != "pending_review":
+        answer_callback_query(
+            callback_id=callback_id,
+            text="This upload is no longer awaiting review.",
+            show_alert=True,
+            settings=settings,
+        )
+        return
+
+    supplier = None
+    if staging.supplier_id:
+        from sqlalchemy import select
+        from app.db.models.suppliers import Supplier
+        supplier = db.scalar(select(Supplier).where(Supplier.id == staging.supplier_id))
+
+    extracted = staging.extracted_data_json or {}
+    doc_type = staging.document_type or "invoice"
+
+    from app.workers.ocr_tasks import _build_review_keyboard, _build_review_text
+    text = _build_review_text(staging, extracted, supplier, doc_type, page=0)
+    keyboard = _build_review_keyboard(staging, extracted, sup_buttons=None, page=0)
+
+    msg_id = send_message_with_keyboard(
+        chat_id=chat_id,
+        text=text,
+        reply_markup=keyboard,
+        settings=settings,
+    )
+
+    # Update context so confirm/edit buttons know the active staging + message
+    ctx_svc.set_fields(user, active_staging_id=staging.id, review_message_id=msg_id)
+    db.commit()
+
+    answer_callback_query(callback_id=callback_id, text="", settings=settings)
+
+
+def _handle_pick_cur(*, params, user, db, ctx_svc, settings, callback_id, chat_id, message_id):
+    """Show currency picker — edit the review message to show currency options."""
+    if not params:
+        answer_callback_query(callback_id=callback_id, text="Invalid.", settings=settings)
+        return
+
+    try:
+        staging_id = hex_to_uuid(params[0])
+    except ValueError:
+        answer_callback_query(callback_id=callback_id, text="Invalid ID.", settings=settings)
+        return
+
+    staging = db.get(FileProcessingStaging, staging_id)
+    if staging is None:
+        answer_callback_query(callback_id=callback_id, text="Upload not found.", settings=settings)
+        return
+
+    # Build currency picker keyboard (2 per row)
+    buttons = [
+        make_button(code, cb_set_currency(staging_id, code))
+        for code in _COMMON_CURRENCIES
+    ]
+    rows = [buttons[i : i + 4] for i in range(0, len(buttons), 4)]
+    rows.append([make_button("❌ Cancel", cb_delete_upload(staging_id))])
+
+    if message_id:
+        edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text="💱 Select currency for this document:",
+            settings=settings,
+            reply_markup={"inline_keyboard": rows},
+        )
+    answer_callback_query(callback_id=callback_id, text="", settings=settings)
+
+
+def _handle_set_cur(*, params, user, db, ctx_svc, settings, callback_id, chat_id, message_id):
+    """Set currency on staging.extracted_data_json, then re-render review."""
+    if len(params) < 2:
+        answer_callback_query(callback_id=callback_id, text="Invalid.", settings=settings)
+        return
+
+    try:
+        staging_id = hex_to_uuid(params[0])
+    except ValueError:
+        answer_callback_query(callback_id=callback_id, text="Invalid ID.", settings=settings)
+        return
+
+    currency_code = params[1].upper()
+    staging = db.get(FileProcessingStaging, staging_id)
+    if staging is None:
+        answer_callback_query(callback_id=callback_id, text="Upload not found.", settings=settings)
+        return
+
+    # Write currency into extracted JSON
+    data = dict(staging.extracted_data_json or {})
+    data["currency"] = currency_code
+    staging.extracted_data_json = data
+    db.commit()
+
+    # Re-render review message
+    supplier = None
+    if staging.supplier_id:
+        from sqlalchemy import select
+        from app.db.models.suppliers import Supplier
+        supplier = db.scalar(select(Supplier).where(Supplier.id == staging.supplier_id))
+
+    doc_type = staging.document_type or "invoice"
+    from app.workers.ocr_tasks import _build_review_keyboard, _build_review_text
+    text = _build_review_text(staging, data, supplier, doc_type, page=0)
+    keyboard = _build_review_keyboard(staging, data, sup_buttons=None, page=0)
+
+    if message_id:
+        edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+            settings=settings,
+            reply_markup=keyboard,
+        )
+    answer_callback_query(
+        callback_id=callback_id, text=f"Currency set: {currency_code}", settings=settings
+    )
 
 
 def _handle_rev_page(*, params, user, db, ctx_svc, settings, callback_id, chat_id, message_id):
