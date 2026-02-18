@@ -1,0 +1,26 @@
+filters:
+  and:
+    - 'file.hasTag("qa")'
+    - 'file.hasTag("step8")'
+
+formulas:
+  updated: 'file.mtime.format("YYYY-MM-DD HH:mm")'
+
+properties:
+  file.name:
+    displayName: "Note"
+  file.folder:
+    displayName: "Folder"
+  formula.updated:
+    displayName: "Updated"
+
+views:
+  - type: table
+    name: "Step8 QA Notes"
+    order:
+      - file.name
+      - formula.updated
+      - file.folder
+    groupBy:
+      property: file.folder
+      direction: ASC
