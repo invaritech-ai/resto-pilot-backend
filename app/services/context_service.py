@@ -34,6 +34,9 @@ _NAV_FIELDS = (
     "active_staging_id",
     "pending_item_resolutions",  # step 8: per-item resolution state during upload confirm
     "review_message_id",         # step 8: Telegram message_id for edit-in-place review
+    "editing_staging_id",        # step 8: staging_id being edited (item edit flow)
+    "editing_item_idx",          # step 8: 0-based item index being edited
+    "editing_field",             # step 8: field name being edited (name/qty/unit/price)
 )
 
 

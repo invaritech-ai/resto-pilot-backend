@@ -30,8 +30,14 @@ Implemented actions:
   skip_item:{staging_hex}:{idx}
       Skip item[idx] (not added to inventory) → update resolution hub
 
+  ed_row:{staging_hex}:{idx}
+      Show field picker for item[idx] (name/qty/unit/price buttons)
+
+  ed_fld:{staging_hex}:{idx}:{field}
+      Store editing state in context, prompt user to type new value
+
 Stubs (not yet implemented):
-  ed_row, list_p, res_h
+  list_p, res_h
 """
 
 from __future__ import annotations
@@ -53,7 +59,9 @@ from app.services.staging_service import StagingService
 from app.services.supplier_service import SupplierService
 from app.telegram.bot_api import answer_callback_query, edit_message_text, send_message, send_message_with_keyboard
 from app.telegram.keyboards import (
+    cb_confirm_upload,
     cb_delete_upload,
+    cb_edit_field,
     cb_mk_item,
     cb_open_upload,
     cb_pick_currency,
@@ -110,6 +118,8 @@ def handle(
         "open_u":    _handle_open_u,
         "pick_cur":  _handle_pick_cur,
         "set_cur":   _handle_set_cur,
+        "ed_row":    _handle_ed_row,
+        "ed_fld":    _handle_ed_fld,
     }
 
     handler = dispatch.get(action)
@@ -129,10 +139,6 @@ def handle(
     # Stubs
     if action == "rev_u":
         answer_callback_query(callback_id=callback_id, text="", settings=settings)
-    elif action == "ed_row":
-        answer_callback_query(
-            callback_id=callback_id, text="Item editing coming soon.", settings=settings
-        )
     elif action in ("list_p", "res_h"):
         answer_callback_query(callback_id=callback_id, text="", settings=settings)
     else:
@@ -1139,3 +1145,233 @@ def _edit_supplier_in_review(
         settings=settings,
         reply_markup=keyboard,
     )
+
+
+# ---------------------------------------------------------------------------
+# Item edit handlers
+# ---------------------------------------------------------------------------
+
+_FIELD_LABELS = {
+    "name":  "Name",
+    "qty":   "Quantity",
+    "unit":  "Unit",
+    "price": "Unit price",
+}
+
+
+def _handle_ed_row(*, params, user, db, ctx_svc, settings, callback_id, chat_id, message_id):
+    """Show a field-picker keyboard for editing a specific line item."""
+    if len(params) < 2:
+        answer_callback_query(callback_id=callback_id, text="Invalid.", settings=settings)
+        return
+    try:
+        staging_id = hex_to_uuid(params[0])
+        item_idx = int(params[1])
+    except (ValueError, IndexError):
+        answer_callback_query(callback_id=callback_id, text="Invalid.", settings=settings)
+        return
+
+    staging = db.get(FileProcessingStaging, staging_id)
+    if staging is None or staging.status not in ("pending_review", "processing"):
+        answer_callback_query(
+            callback_id=callback_id, text="Upload not available for editing.", settings=settings
+        )
+        return
+
+    items = (staging.extracted_data_json or {}).get("line_items", [])
+    if item_idx >= len(items):
+        answer_callback_query(callback_id=callback_id, text="Item not found.", settings=settings)
+        return
+
+    item = items[item_idx]
+    doc_type = staging.document_type or "invoice"
+
+    # Current values summary
+    name = item.get("name", "?")
+    unit = item.get("unit") or "—"
+    price = item.get("unit_price")
+    price_str = f"${price:.2f}" if price is not None else "—"
+    summary_lines = [
+        f"✏️ Editing item #{item_idx + 1}: {name}",
+        f"Unit: {unit}   Price: {price_str}",
+    ]
+    if doc_type == "invoice":
+        qty = item.get("qty")
+        summary_lines.insert(1, f"Qty: {qty if qty is not None else '—'}   Unit: {unit}   Price: {price_str}")
+        summary_lines.pop()  # remove duplicate unit/price line
+
+    # Field buttons
+    fields = ["name", "qty", "unit", "price"] if doc_type == "invoice" else ["name", "unit", "price"]
+    field_buttons = [
+        make_button(_FIELD_LABELS[f], cb_edit_field(staging_id, item_idx, f))
+        for f in fields
+    ]
+    # Two per row
+    rows = [field_buttons[i : i + 2] for i in range(0, len(field_buttons), 2)]
+    rows.append([make_button("❌ Cancel", cb_confirm_upload(staging_id))])
+
+    if message_id:
+        edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text="\n".join(summary_lines) + "\n\nWhat do you want to change?",
+            settings=settings,
+            reply_markup={"inline_keyboard": rows},
+        )
+    answer_callback_query(callback_id=callback_id, text="", settings=settings)
+
+
+def _handle_ed_fld(*, params, user, db, ctx_svc, settings, callback_id, chat_id, message_id):
+    """Store editing state in context and ask user to type the new value."""
+    if len(params) < 3:
+        answer_callback_query(callback_id=callback_id, text="Invalid.", settings=settings)
+        return
+    try:
+        staging_id = hex_to_uuid(params[0])
+        item_idx = int(params[1])
+    except (ValueError, IndexError):
+        answer_callback_query(callback_id=callback_id, text="Invalid.", settings=settings)
+        return
+
+    field = params[2]
+    if field not in _FIELD_LABELS:
+        answer_callback_query(callback_id=callback_id, text="Unknown field.", settings=settings)
+        return
+
+    staging = db.get(FileProcessingStaging, staging_id)
+    if staging is None:
+        answer_callback_query(callback_id=callback_id, text="Upload not found.", settings=settings)
+        return
+
+    # Store editing state in context
+    ctx_svc.set_fields(
+        user,
+        editing_staging_id=str(staging_id),
+        editing_item_idx=item_idx,
+        editing_field=field,
+    )
+    db.commit()
+
+    label = _FIELD_LABELS[field]
+    hint = "a number (e.g. 3.5)" if field in ("qty", "price") else "text"
+    send_message(
+        chat_id=chat_id,
+        text=f"Enter new {label} for item #{item_idx + 1} ({hint}):\n\nSend /cancel to abort.",
+        settings=settings,
+    )
+    answer_callback_query(callback_id=callback_id, text="", settings=settings)
+
+
+def handle_item_edit_input(
+    update: dict,
+    user: User,
+    db: Session,
+    ctx_svc: ContextService,
+    settings: Settings,
+) -> None:
+    """Handle free-text input when the user is in item-edit mode.
+
+    Called from telegram_tasks._handle_llm when editing_staging_id is set in context.
+    Updates line_items[idx][field] in extracted_data_json, clears editing state,
+    re-renders the review message.
+    """
+    msg = update.get("message", {})
+    text = (msg.get("text", "") or "").strip()
+    chat_id = user.chat_id
+
+    ctx_fields = ctx_svc.get_fields(user)
+    staging_id_str = ctx_fields.get("editing_staging_id")
+    item_idx = ctx_fields.get("editing_item_idx")
+    field = ctx_fields.get("editing_field")
+
+    if not staging_id_str or item_idx is None or not field:
+        return  # stale state; ignore
+
+    if not text:
+        send_message(chat_id=chat_id, text="Please send a non-empty value.", settings=settings)
+        return
+
+    try:
+        staging_id = _uuid_mod.UUID(staging_id_str)
+    except ValueError:
+        ctx_svc.set_fields(user, editing_staging_id=None, editing_item_idx=None, editing_field=None)
+        db.commit()
+        return
+
+    staging = db.get(FileProcessingStaging, staging_id)
+    if staging is None or staging.status not in ("pending_review", "processing"):
+        ctx_svc.set_fields(user, editing_staging_id=None, editing_item_idx=None, editing_field=None)
+        db.commit()
+        send_message(chat_id=chat_id, text="Upload no longer available for editing.", settings=settings)
+        return
+
+    data = dict(staging.extracted_data_json or {})
+    items = list(data.get("line_items", []))
+
+    if item_idx >= len(items):
+        ctx_svc.set_fields(user, editing_staging_id=None, editing_item_idx=None, editing_field=None)
+        db.commit()
+        send_message(chat_id=chat_id, text="Item no longer exists.", settings=settings)
+        return
+
+    item = dict(items[item_idx])
+
+    # Parse and apply the new value
+    json_key = "unit_price" if field == "price" else field
+    if field in ("qty", "price"):
+        try:
+            value = float(text.replace(",", "").strip())
+        except ValueError:
+            send_message(
+                chat_id=chat_id,
+                text=f"Invalid number: {text!r}. Please enter a numeric value.",
+                settings=settings,
+            )
+            return
+        item[json_key] = value
+    else:
+        item[json_key] = text
+
+    items[item_idx] = item
+    data["line_items"] = items
+    staging.extracted_data_json = data
+
+    # Clear editing state
+    ctx_svc.set_fields(user, editing_staging_id=None, editing_item_idx=None, editing_field=None)
+    db.commit()
+
+    # Re-render review message
+    review_message_id = ctx_fields.get("review_message_id")
+    supplier = None
+    if staging.supplier_id:
+        from sqlalchemy import select
+        from app.db.models.suppliers import Supplier
+        supplier = db.scalar(select(Supplier).where(Supplier.id == staging.supplier_id))
+
+    doc_type = staging.document_type or "invoice"
+    from app.workers.ocr_tasks import _build_review_keyboard, _build_review_text
+    review_text = _build_review_text(staging, data, supplier, doc_type, page=0)
+    review_keyboard = _build_review_keyboard(staging, data, sup_buttons=None, page=0)
+
+    label = _FIELD_LABELS.get(field, field)
+    send_message(chat_id=chat_id, text=f"✅ {label} updated.", settings=settings)
+
+    if review_message_id:
+        edit_message_text(
+            chat_id=chat_id,
+            message_id=review_message_id,
+            text=review_text,
+            settings=settings,
+            reply_markup=review_keyboard,
+        )
+    else:
+        # No tracked review message — send fresh one
+        new_msg_id = send_message_with_keyboard(
+            chat_id=chat_id,
+            text=review_text,
+            reply_markup=review_keyboard,
+            settings=settings,
+        )
+        if new_msg_id:
+            ctx_svc.set_fields(user, review_message_id=new_msg_id)
+            db.commit()

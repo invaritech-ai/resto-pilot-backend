@@ -120,6 +120,11 @@ def cb_skip_item(staging_id: uuid.UUID, idx: int) -> str:
     return f"skip_item:{uuid_to_hex(staging_id)}:{idx}"
 
 
+def cb_edit_field(staging_id: uuid.UUID, idx: int, field: str) -> str:
+    """Edit a specific field of a line item: ed_fld:{staging_hex}:{idx}:{field}"""
+    return _ensure_callback_limit(f"ed_fld:{uuid_to_hex(staging_id)}:{idx}:{field}")
+
+
 def cb_open_upload(staging_id: uuid.UUID) -> str:
     """Re-open a pending_review staging record: open_u:{staging_hex}"""
     return _ensure_callback_limit(f"open_u:{uuid_to_hex(staging_id)}")

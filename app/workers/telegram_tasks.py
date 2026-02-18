@@ -205,7 +205,18 @@ def handle_telegram_update(update: dict) -> None:
                     )
 
                 def _handle_llm(update: dict, ctx: RouteContext) -> None:
-                    """Stub for LLM fallback handler (Phase 2)."""
+                    """LLM fallback — intercepts item-edit text input if editing context is active."""
+                    # Check for active item-edit flow before falling through to LLM stub
+                    edit_ctx = ctx_svc.get_fields(ctx.user)
+                    if (
+                        edit_ctx.get("editing_staging_id") is not None
+                        and edit_ctx.get("editing_item_idx") is not None
+                        and edit_ctx.get("editing_field") is not None
+                    ):
+                        from app.telegram.handlers.buttons import handle_item_edit_input
+                        handle_item_edit_input(update, ctx.user, ctx.db, ctx_svc, settings)
+                        return
+
                     logger.info("llm_handler_stub: falling back to LLM")
                     send_message(
                         chat_id=ctx.user.chat_id,
