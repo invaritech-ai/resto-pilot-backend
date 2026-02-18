@@ -166,7 +166,8 @@ class TestParseInvoiceText:
             with pytest.raises(ParseError, match="line_items"):
                 parse_invoice(settings, text="Invoice text")
 
-    def test_skips_items_with_missing_qty(self):
+    def test_missing_qty_included_as_null(self):
+        """Items with missing qty are kept with qty=None for user review."""
         settings = _make_settings()
         payload = dict(_INVOICE_PAYLOAD)
         payload["line_items"] = [
@@ -180,9 +181,9 @@ class TestParseInvoiceText:
             )
             result = parse_invoice(settings, text="Invoice text")
 
-        # Only Oil should survive (Chicken has no qty)
-        assert len(result["line_items"]) == 1
-        assert result["line_items"][0]["name"] == "Oil"
+        assert len(result["line_items"]) == 2
+        chicken = next(i for i in result["line_items"] if i["name"] == "Chicken")
+        assert chicken["qty"] is None
 
     def test_zero_unit_price_included_as_null(self):
         """Items with zero/missing unit_price are kept with unit_price=None for user review."""

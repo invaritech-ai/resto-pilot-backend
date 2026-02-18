@@ -287,14 +287,15 @@ def _validate(raw: dict, document_type: str) -> dict:
 
         if document_type == "invoice":
             qty = _to_float(item.get("qty"))
-            if qty is None or qty <= 0:
-                logger.warning("item_parser: skip invoice item %r — bad qty", name)
-                continue
+            if qty is not None and qty <= 0:
+                qty = None  # treat zero/negative as missing
+            if qty is None:
+                logger.warning("item_parser: qty missing for %r — including with null for user review", name)
             amount = _to_float(item.get("amount"))
 
             # Derive unit_price from amount/qty if not directly provided
             if unit_price is None or unit_price <= 0:
-                if amount and amount > 0 and qty > 0:
+                if amount and amount > 0 and qty is not None and qty > 0:
                     unit_price = round(amount / qty, 6)
                     logger.info(
                         "item_parser: derived unit_price for %r: amount=%s qty=%s → %s",

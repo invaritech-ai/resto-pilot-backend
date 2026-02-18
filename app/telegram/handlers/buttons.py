@@ -103,6 +103,7 @@ def handle(
         "use_match": _handle_use_match,
         "mk_item":   _handle_mk_item,
         "skip_item": _handle_skip_item,
+        "rev_p":     _handle_rev_page,
     }
 
     handler = dispatch.get(action)
@@ -495,7 +496,7 @@ def _handle_set_sup(*, params, user, db, ctx_svc, settings, callback_id, chat_id
             chat_id=chat_id,
             message_id=message_id,
             staging=staging,
-            supplier_name=supplier.name,
+            supplier=supplier,
             settings=settings,
         )
     answer_callback_query(
@@ -546,7 +547,7 @@ def _handle_new_sup(*, params, user, db, ctx_svc, settings, callback_id, chat_id
             chat_id=chat_id,
             message_id=message_id,
             staging=staging,
-            supplier_name=supplier.name,
+            supplier=supplier,
             settings=settings,
         )
     answer_callback_query(
@@ -909,75 +910,67 @@ def _build_resolution_hub(
 # ---------------------------------------------------------------------------
 
 
+def _handle_rev_page(*, params, user, db, ctx_svc, settings, callback_id, chat_id, message_id):
+    """Navigate to a different page of the review message."""
+    if len(params) < 2:
+        answer_callback_query(callback_id=callback_id, text="", settings=settings)
+        return
+    try:
+        staging_id = hex_to_uuid(params[0])
+        page = int(params[1])
+    except (ValueError, IndexError):
+        answer_callback_query(callback_id=callback_id, text="Invalid.", settings=settings)
+        return
+
+    staging = db.get(FileProcessingStaging, staging_id)
+    if staging is None:
+        answer_callback_query(callback_id=callback_id, text="Upload not found.", settings=settings)
+        return
+
+    supplier = None
+    if staging.supplier_id:
+        from sqlalchemy import select
+        from app.db.models.suppliers import Supplier
+        supplier = db.scalar(select(Supplier).where(Supplier.id == staging.supplier_id))
+
+    extracted = staging.extracted_data_json or {}
+    doc_type = staging.document_type or "invoice"
+
+    from app.workers.ocr_tasks import _build_review_keyboard, _build_review_text
+    text = _build_review_text(staging, extracted, supplier, doc_type, page=page)
+    keyboard = _build_review_keyboard(staging, extracted, sup_buttons=None, page=page)
+
+    if message_id:
+        edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+            settings=settings,
+            reply_markup=keyboard,
+        )
+    answer_callback_query(callback_id=callback_id, text="", settings=settings)
+
+
 def _edit_supplier_in_review(
     *,
     chat_id: int,
     message_id: int,
     staging: FileProcessingStaging,
-    supplier_name: str,
+    supplier,
     settings: Settings,
 ) -> None:
-    """Re-render the review message header after supplier is confirmed."""
+    """Re-render the full review message (page 0) after supplier is confirmed."""
+    from app.workers.ocr_tasks import _build_review_keyboard, _build_review_text
+
     extracted = staging.extracted_data_json or {}
     doc_type = staging.document_type or "invoice"
-    doc_emoji = "📄" if doc_type == "invoice" else "📋"
-    doc_label = "Invoice" if doc_type == "invoice" else "Price List"
-
-    lines = [f"{doc_emoji} {doc_label} — {supplier_name} ✅"]
-
-    meta: list[str] = []
-    if doc_type == "invoice":
-        if extracted.get("invoice_date"):
-            meta.append(f"Date: {extracted['invoice_date']}")
-        if extracted.get("invoice_number"):
-            meta.append(f"#{extracted['invoice_number']}")
-    else:
-        if extracted.get("effective_date"):
-            meta.append(f"Effective: {extracted['effective_date']}")
-        if extracted.get("lead_time"):
-            meta.append(f"Lead: {extracted['lead_time']}")
-    if extracted.get("currency"):
-        meta.append(extracted["currency"])
-    if meta:
-        lines.append("  ".join(meta))
-
-    lines.append("")
-
-    items = extracted.get("line_items", [])
-    for i, item in enumerate(items[:10]):
-        name = item.get("name", "?")
-        if doc_type == "invoice":
-            qty = item.get("qty", 0)
-            unit = item.get("unit") or ""
-            price = item.get("unit_price", 0)
-            lines.append(f"{i + 1}. {name}   {qty}{unit} × ${price:.2f}")
-        else:
-            unit = item.get("unit") or ""
-            price = item.get("unit_price", 0)
-            lines.append(f"{i + 1}. {name}   {unit} @ ${price:.2f}")
-    if len(items) > 10:
-        lines.append(f"… +{len(items) - 10} more")
-
-    # Rebuild keyboard without supplier buttons
-    from app.telegram.keyboards import cb_confirm_upload, cb_delete_upload, cb_edit_row
-
-    keyboard: list[list[dict]] = [
-        [
-            make_button("✅ Confirm All", cb_confirm_upload(staging.id)),
-            make_button("❌ Cancel", cb_delete_upload(staging.id)),
-        ]
-    ]
-    edit_buttons = [
-        make_button(f"✏️ #{i + 1}", cb_edit_row(staging.id, i))
-        for i in range(min(len(items), 8))
-    ]
-    for i in range(0, len(edit_buttons), 4):
-        keyboard.append(edit_buttons[i : i + 4])
+    text = _build_review_text(staging, extracted, supplier, doc_type, page=0)
+    keyboard = _build_review_keyboard(staging, extracted, sup_buttons=None, page=0)
 
     edit_message_text(
         chat_id=chat_id,
         message_id=message_id,
-        text="\n".join(lines),
+        text=text,
         settings=settings,
-        reply_markup={"inline_keyboard": keyboard},
+        reply_markup=keyboard,
     )

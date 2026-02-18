@@ -18,6 +18,7 @@ from __future__ import annotations
 import base64
 import io
 import logging
+import math
 import uuid
 
 from app.core.config import get_settings
@@ -37,6 +38,7 @@ from app.telegram.keyboards import (
     cb_delete_upload,
     cb_edit_row,
     cb_new_supplier,
+    cb_rev_page,
     cb_set_supplier,
     make_button,
     uuid_to_hex,
@@ -371,13 +373,23 @@ def _resolve_supplier(
 # Review message builders
 # ---------------------------------------------------------------------------
 
+_REVIEW_PAGE_SIZE = 8  # items visible per page in the review message
+
+
 def _build_review_text(
     staging: FileProcessingStaging,
     extracted: dict,
     auto_supplier,
     document_type: str,
+    page: int = 0,
 ) -> str:
-    """Build the review message text."""
+    """Build the review message text for the given page (0-indexed)."""
+    items = extracted.get("line_items", [])
+    total = len(items)
+    total_pages = max(1, math.ceil(total / _REVIEW_PAGE_SIZE))
+    start = page * _REVIEW_PAGE_SIZE
+    end = min(start + _REVIEW_PAGE_SIZE, total)
+
     lines: list[str] = []
 
     # Header
@@ -404,32 +416,33 @@ def _build_review_text(
     if meta:
         lines.append("  ".join(meta))
 
+    # Page indicator (only when there are multiple pages)
+    if total_pages > 1:
+        lines.append(f"Items {start + 1}–{end} of {total}")
+
     lines.append("")
 
-    # Line items
-    items = extracted.get("line_items", [])
-    for i, item in enumerate(items[:10]):
+    # Items for the current page (1-indexed display uses absolute position)
+    for i, item in enumerate(items[start:end]):
+        abs_i = start + i
         name = item.get("name", "?")
+        unit = item.get("unit") or ""
+        price = item.get("unit_price")
+        price_str = f"${price:.2f}" if price is not None else "⚠️?price"
+
         if document_type == "invoice":
-            qty = item.get("qty", 0)
-            unit = item.get("unit") or ""
-            price = item.get("unit_price")
+            qty = item.get("qty")
+            qty_str = f"{qty}" if qty is not None else "⚠️?"
             amount = item.get("amount")
-            price_str = f"${price:.2f}" if price is not None else "?price"
-            row = f"{i + 1}. {name}   {qty}{unit} × {price_str}"
+            row = f"{abs_i + 1}. {name}   {qty_str}{unit} × {price_str}"
             if amount:
                 row += f" = ${amount:.2f}"
-                if price is not None and abs(qty * price - amount) > 0.01:
+                if price is not None and qty is not None and abs(qty * price - amount) > 0.01:
                     row += " ⚠️"
-            lines.append(row)
         else:
-            unit = item.get("unit") or ""
-            price = item.get("unit_price")
-            price_str = f"${price:.2f}" if price is not None else "?price"
-            lines.append(f"{i + 1}. {name}   {unit} @ {price_str}")
+            row = f"{abs_i + 1}. {name}   {unit} @ {price_str}"
 
-    if len(items) > 10:
-        lines.append(f"… +{len(items) - 10} more items")
+        lines.append(row)
 
     if not auto_supplier:
         lines.append("")
@@ -442,11 +455,15 @@ def _build_review_keyboard(
     staging: FileProcessingStaging,
     extracted: dict,
     sup_buttons: list[dict] | None,
+    page: int = 0,
 ) -> dict:
-    """Build the inline keyboard for the review message."""
+    """Build the inline keyboard for the review message (paginated)."""
     staging_id = staging.id
     items = extracted.get("line_items", [])
-    item_count = len(items)
+    total = len(items)
+    total_pages = max(1, math.ceil(total / _REVIEW_PAGE_SIZE))
+    start = page * _REVIEW_PAGE_SIZE
+    end = min(start + _REVIEW_PAGE_SIZE, total)
 
     keyboard: list[list[dict]] = []
 
@@ -456,19 +473,28 @@ def _build_review_keyboard(
         make_button("❌ Cancel", cb_delete_upload(staging_id)),
     ])
 
-    # Row 2+: Supplier buttons if needed
+    # Supplier buttons if needed
     if sup_buttons:
         for btn in sup_buttons:
             keyboard.append([btn])
 
-    # Edit buttons (max 8 items, 4 per row)
-    if item_count > 0:
-        edit_buttons = [
-            make_button(f"✏️ #{i + 1}", cb_edit_row(staging_id, i))
-            for i in range(min(item_count, 8))
-        ]
-        for i in range(0, len(edit_buttons), 4):
-            keyboard.append(edit_buttons[i : i + 4])
+    # Navigation row (only when multiple pages exist)
+    if total_pages > 1:
+        nav_row: list[dict] = []
+        if page > 0:
+            nav_row.append(make_button(f"← {page}/{total_pages}", cb_rev_page(staging_id, page - 1)))
+        if page < total_pages - 1:
+            nav_row.append(make_button(f"{page + 2}/{total_pages} →", cb_rev_page(staging_id, page + 1)))
+        if nav_row:
+            keyboard.append(nav_row)
+
+    # Edit buttons for every item on the current page (4 per row)
+    edit_buttons = [
+        make_button(f"✏️ #{start + i + 1}", cb_edit_row(staging_id, start + i))
+        for i in range(end - start)
+    ]
+    for i in range(0, len(edit_buttons), 4):
+        keyboard.append(edit_buttons[i : i + 4])
 
     return {"inline_keyboard": keyboard}
 
