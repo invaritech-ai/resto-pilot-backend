@@ -117,3 +117,12 @@ class TestDedupService:
 
         assert result is False
         session.rollback.assert_called_once()
+
+    def test_delete_by_update_id_executes_delete(self):
+        """delete_by_update_id issues a DELETE so failed updates can be retried."""
+        session = MagicMock()
+
+        svc = DedupService(session)
+        svc.delete_by_update_id(99999)
+
+        session.execute.assert_called_once()

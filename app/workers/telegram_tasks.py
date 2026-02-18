@@ -76,23 +76,30 @@ def handle_telegram_update(update: dict) -> None:
     task_id = _get_task_id()
     settings = get_settings()
 
+    update_id = update.get("update_id") if isinstance(update, dict) else None
+    callback_query = (update.get("callback_query") or {}) if isinstance(update, dict) else {}
     message = (
         (update.get("message") or update.get("edited_message") or {})
         if isinstance(update, dict)
         else {}
     )
-    chat_id = (
-        (message.get("chat") or {}).get("id") if isinstance(message, dict) else None
-    )
-    update_id = update.get("update_id") if isinstance(update, dict) else None
 
-    from_data = (message.get("from") or {}) if isinstance(message, dict) else {}
-    telegram_id: int | None = from_data.get("id") or chat_id
-    username: str | None = from_data.get("username")
-    message_id: int | None = (
-        message.get("message_id") if isinstance(message, dict) else None
-    )
-    text: str | None = message.get("text") if isinstance(message, dict) else None
+    if callback_query:
+        # Button click: identity and context live inside callback_query, not top-level message.
+        cq_from = callback_query.get("from") or {}
+        cq_message = callback_query.get("message") or {}
+        telegram_id: int | None = cq_from.get("id")
+        username: str | None = cq_from.get("username")
+        chat_id = (cq_message.get("chat") or {}).get("id") or telegram_id
+        message_id: int | None = cq_message.get("message_id")
+        text: str | None = callback_query.get("data")  # stored for audit, not routing
+    else:
+        from_data = (message.get("from") or {}) if isinstance(message, dict) else {}
+        telegram_id = from_data.get("id") or (message.get("chat") or {}).get("id")
+        username = from_data.get("username")
+        chat_id = (message.get("chat") or {}).get("id") if isinstance(message, dict) else None
+        message_id = message.get("message_id") if isinstance(message, dict) else None
+        text = message.get("text") if isinstance(message, dict) else None
 
     logger.info(
         "celery_task_started name=handle_telegram_update task_id=%s update_id=%s chat_id=%s",
@@ -150,74 +157,90 @@ def handle_telegram_update(update: dict) -> None:
         user_svc.update_last_interaction(user)
         db.commit()  # Commit user creation + dedup record before onboarding
 
-        # Now process onboarding with a fresh transaction context
-        # Onboarding handlers manage their own commits
-        if needs_onboarding(user):
-            ctx_svc = ContextService(db)
-            handle_onboarding(update, user, db, ctx_svc, settings)
-        else:
-            # Wire Router for onboarded users
-            from app.telegram.router import Handlers, Router, RouteContext
-            from app.telegram.handlers.reset import handle as handle_reset
-            from app.telegram.handlers.commands import handle as handle_command
-            from app.telegram.handlers.buttons import handle as handle_button
-            from app.telegram.bot_api import send_message
+        # Process the update. On any exception (including send_message failures),
+        # delete the dedup record so Celery can retry and re-send the message.
+        try:
+            if needs_onboarding(user):
+                ctx_svc = ContextService(db)
+                handle_onboarding(update, user, db, ctx_svc, settings)
+            else:
+                # Wire Router for onboarded users
+                from app.telegram.router import Handlers, Router, RouteContext
+                from app.telegram.handlers.reset import handle as handle_reset
+                from app.telegram.handlers.commands import handle as handle_command
+                from app.telegram.handlers.buttons import handle as handle_button
+                from app.telegram.bot_api import send_message
 
-            ctx_svc = ContextService(db)
+                ctx_svc = ContextService(db)
 
-            def _make_reset_handler():
-                def handler(update: dict, ctx: RouteContext) -> None:
-                    handle_reset(update, ctx.user, ctx.db, ctx_svc, settings)
-                return handler
+                def _make_reset_handler():
+                    def handler(update: dict, ctx: RouteContext) -> None:
+                        handle_reset(update, ctx.user, ctx.db, ctx_svc, settings)
+                    return handler
 
-            def _make_button_handler():
-                def handler(update: dict, ctx: RouteContext) -> None:
-                    handle_button(update, ctx.user, ctx.db, ctx_svc, settings)
-                return handler
+                def _make_button_handler():
+                    def handler(update: dict, ctx: RouteContext) -> None:
+                        handle_button(update, ctx.user, ctx.db, ctx_svc, settings)
+                    return handler
 
-            def _make_command_handler():
-                def handler(update: dict, ctx: RouteContext) -> None:
-                    handle_command(update, ctx.user, ctx.db, ctx_svc, settings)
-                return handler
+                def _make_command_handler():
+                    def handler(update: dict, ctx: RouteContext) -> None:
+                        handle_command(update, ctx.user, ctx.db, ctx_svc, settings)
+                    return handler
 
-            def _handle_file(update: dict, ctx: RouteContext) -> None:
-                """Stub for file upload handler (Phase 2)."""
-                logger.info("file_handler_stub: file upload received")
-                send_message(
-                    chat_id=ctx.user.chat_id,
-                    text="File received! Processing will be available in Phase 2.",
-                    settings=settings,
+                def _handle_file(update: dict, ctx: RouteContext) -> None:
+                    """Stub for file upload handler (Phase 2)."""
+                    logger.info("file_handler_stub: file upload received")
+                    send_message(
+                        chat_id=ctx.user.chat_id,
+                        text="File received! Processing will be available in Phase 2.",
+                        settings=settings,
+                    )
+
+                def _handle_pattern(update: dict, ctx: RouteContext) -> None:
+                    """Stub for pattern handler (#N, qty+unit)."""
+                    msg = update.get("message", {})
+                    text = msg.get("text", "")
+                    logger.info("pattern_handler_stub: pattern=%s", text)
+                    send_message(
+                        chat_id=ctx.user.chat_id,
+                        text=f"Pattern recognized: {text}",
+                        settings=settings,
+                    )
+
+                def _handle_llm(update: dict, ctx: RouteContext) -> None:
+                    """Stub for LLM fallback handler (Phase 2)."""
+                    logger.info("llm_handler_stub: falling back to LLM")
+                    send_message(
+                        chat_id=ctx.user.chat_id,
+                        text="I'm not sure how to help with that. Try /help for available commands.",
+                        settings=settings,
+                    )
+
+                handlers = Handlers(
+                    reset=_make_reset_handler(),
+                    button=_make_button_handler(),
+                    command=_make_command_handler(),
+                    file=_handle_file,
+                    pattern=_handle_pattern,
+                    llm=_handle_llm,
                 )
 
-            def _handle_pattern(update: dict, ctx: RouteContext) -> None:
-                """Stub for pattern handler (#N, qty+unit)."""
-                msg = update.get("message", {})
-                text = msg.get("text", "")
-                logger.info("pattern_handler_stub: pattern=%s", text)
-                send_message(
-                    chat_id=ctx.user.chat_id,
-                    text=f"Pattern recognized: {text}",
-                    settings=settings,
+                router = Router(handlers)
+                route_ctx = RouteContext(db=db, user=user)
+                router.route(update, route_ctx)
+
+        except Exception:
+            # Roll back any uncommitted handler state, then delete the dedup record
+            # so Celery's retry can reprocess (re-send) this update.
+            try:
+                db.rollback()
+                dedup_svc.delete_by_update_id(update_id)
+                db.commit()
+            except Exception:
+                logger.exception(
+                    "handle_telegram_update: failed to remove dedup for retry "
+                    "update_id=%s",
+                    update_id,
                 )
-
-            def _handle_llm(update: dict, ctx: RouteContext) -> None:
-                """Stub for LLM fallback handler (Phase 2)."""
-                logger.info("llm_handler_stub: falling back to LLM")
-                send_message(
-                    chat_id=ctx.user.chat_id,
-                    text="I'm not sure how to help with that. Try /help for available commands.",
-                    settings=settings,
-                )
-
-            handlers = Handlers(
-                reset=_make_reset_handler(),
-                button=_make_button_handler(),
-                command=_make_command_handler(),
-                file=_handle_file,
-                pattern=_handle_pattern,
-                llm=_handle_llm,
-            )
-
-            router = Router(handlers)
-            route_ctx = RouteContext(db=db, user=user)
-            router.route(update, route_ctx)
+            raise

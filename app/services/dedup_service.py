@@ -18,7 +18,7 @@ from __future__ import annotations
 import datetime as dt
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import delete as sql_delete, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -102,6 +102,17 @@ class DedupService:
                 return None
             # Different integrity error - re-raise to surface bugs
             raise
+
+    def delete_by_update_id(self, update_id: int) -> None:
+        """Delete the dedup record for update_id, allowing a failed update to be retried.
+
+        Called in the exception path when a handler raises (e.g., send_message fails)
+        so Celery retries can re-run the handler and re-send the message.
+        Caller must commit after this call.
+        """
+        self.session.execute(
+            sql_delete(TelegramMessages).where(TelegramMessages.update_id == update_id)
+        )
 
     def record_if_new(
         self,
