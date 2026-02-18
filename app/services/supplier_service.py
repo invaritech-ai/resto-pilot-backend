@@ -24,7 +24,7 @@ from __future__ import annotations
 import datetime as dt
 import uuid
 
-from sqlalchemy import func, select, true
+from sqlalchemy import case, func, or_, select, true
 from sqlalchemy.orm import Session
 
 from app.db.models.restaurant import Restaurant
@@ -210,6 +210,8 @@ class SupplierService:
             List of (Supplier, score) tuples, highest score first.
         """
         query_lower = name.strip().lower()
+        if not query_lower:
+            return []
         score = func.similarity(Supplier.name_lower, query_lower).label("score")
         stmt = (
             select(Supplier, score)
@@ -240,19 +242,45 @@ class SupplierService:
             List of (Supplier, score) tuples, highest score first.
         """
         query_lower = name.strip().lower()
-        score = func.similarity(Supplier.name_lower, query_lower).label("score")
+        if not query_lower:
+            return []
+
+        escaped = self._escape_like(query_lower)
+        exact_match = Supplier.name_lower == query_lower
+        prefix_match = Supplier.name_lower.like(f"{escaped}%", escape="\\")
+        contains_match = Supplier.name_lower.like(f"%{escaped}%", escape="\\")
+
+        score_expr = func.similarity(Supplier.name_lower, query_lower)
+        score = score_expr.label("score")
+        match_rank = case(
+            (exact_match, 0),
+            (prefix_match, 1),
+            (contains_match, 2),
+            else_=3,
+        ).label("match_rank")
+
         stmt = (
-            select(Supplier, score)
+            select(Supplier, score, match_rank)
             .join(RestaurantSupplier, RestaurantSupplier.supplier_id == Supplier.id)
             .where(
                 RestaurantSupplier.restaurant_id == restaurant_id,
                 RestaurantSupplier.is_active == true(),
-                func.similarity(Supplier.name_lower, query_lower) >= threshold,
+                or_(
+                    exact_match,
+                    prefix_match,
+                    contains_match,
+                    score_expr >= threshold,
+                ),
             )
-            .order_by(score.desc())
+            .order_by(match_rank.asc(), score.desc(), Supplier.name_lower)
         )
         rows = self.session.execute(stmt).all()
         return [(row[0], float(row[1])) for row in rows]
+
+    @staticmethod
+    def _escape_like(value: str) -> str:
+        """Escape wildcard chars for SQL LIKE/ILIKE patterns."""
+        return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
     # ------------------------------------------------------------------
     # Price list queries (used by /products and /prices commands)

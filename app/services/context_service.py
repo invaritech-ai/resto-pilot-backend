@@ -31,6 +31,7 @@ _NAV_FIELDS = (
     "last_list_type",
     "last_list_offset",
     "numbered_items",
+    "active_list_message_id",    # active paginated-list message id (invalidate old buttons)
     "active_staging_id",
     "pending_item_resolutions",  # step 8: per-item resolution state during upload confirm
     "review_message_id",         # step 8: Telegram message_id for edit-in-place review
@@ -89,6 +90,15 @@ class ContextService:
 
     def get_last_list_offset(self, user: User) -> int:
         return int(self.get(user).get("last_list_offset", 0))
+
+    def get_fields(self, user: User) -> dict[str, Any]:
+        """Return the full context dict for reading multiple fields.
+
+        Used by item edit flow and other handlers that need to check
+        multiple context fields at once (e.g., editing_staging_id,
+        editing_item_idx, editing_field).
+        """
+        return self.get(user)
 
     # ------------------------------------------------------------------
     # Write helpers

@@ -79,3 +79,21 @@ def test_list_page_value_error_shows_alert() -> None:
 
     assert mock_answer.call_args.kwargs["show_alert"] is True
     assert "Expired list" in mock_answer.call_args.kwargs["text"]
+
+
+def test_list_page_from_stale_message_is_rejected() -> None:
+    user = _make_user()
+    db = MagicMock()
+    ctx_svc = MagicMock()
+    ctx_svc.get.return_value = {"active_list_message_id": 99}
+    settings = MagicMock()
+
+    with (
+        patch("app.telegram.handlers.buttons.answer_callback_query") as mock_answer,
+        patch("app.telegram.handlers.commands.build_list_page") as mock_build,
+    ):
+        handle(_make_update("list_p:products:1"), user, db, ctx_svc, settings)
+
+    mock_build.assert_not_called()
+    assert mock_answer.call_args.kwargs["show_alert"] is True
+    assert "expired" in mock_answer.call_args.kwargs["text"].lower()

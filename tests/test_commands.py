@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import datetime
 import uuid
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
@@ -812,6 +812,37 @@ class TestProductsCommand:
         text = mock_send.call_args[1]["text"]
         assert "Page 1/2" in text
 
+    def test_products_new_list_disables_old_list_keyboard(self):
+        user = _make_user(RESTAURANT_ID)
+        user.context["active_list_message_id"] = 111
+        ctx_svc = _make_ctx_svc(user)
+        db = _make_db()
+
+        supplier = MagicMock()
+        supplier.name = "Big Supplier"
+        page = [(supplier, _mock_price(f"Item {i}")) for i in range(10)]
+
+        with (
+            patch("app.telegram.handlers.commands.RestaurantService") as MockSvc,
+            patch("app.telegram.handlers.commands.SupplierService") as MockSvc2,
+            patch("app.telegram.handlers.commands.send_message_with_keyboard") as mock_send_kb,
+            patch("app.telegram.handlers.commands.edit_message_reply_markup") as mock_edit_markup,
+            patch("app.telegram.handlers.commands.send_message"),
+        ):
+            MockSvc.return_value.user_membership_exists.return_value = True
+            MockSvc2.return_value.list_products_for_restaurant.return_value = page
+            MockSvc2.return_value.count_products_for_restaurant.return_value = 11
+            mock_send_kb.return_value = 222
+            handle(_make_update("/products"), user, db, ctx_svc, _make_settings())
+
+        mock_edit_markup.assert_called_once_with(
+            chat_id=user.chat_id,
+            message_id=111,
+            reply_markup={"inline_keyboard": []},
+            settings=ANY,
+        )
+        assert user.context.get("active_list_message_id") == 222
+
     def test_products_stores_price_ids_in_context(self):
         user = _make_user(RESTAURANT_ID)
         ctx_svc = _make_ctx_svc(user)
@@ -885,6 +916,33 @@ class TestPricesCommand:
 
         text = mock_send.call_args[1]["text"]
         assert "No supplier found" in text
+
+    def test_prices_no_match_shows_did_you_mean_suggestions(self):
+        user = _make_user(RESTAURANT_ID)
+        ctx_svc = _make_ctx_svc(user)
+        db = _make_db()
+
+        suggestion_1 = MagicMock()
+        suggestion_1.name = "SoHaVegetables"
+        suggestion_2 = MagicMock()
+        suggestion_2.name = "Soho Greens"
+
+        with (
+            patch("app.telegram.handlers.commands.RestaurantService") as MockSvc,
+            patch("app.telegram.handlers.commands.SupplierService") as MockSvc2,
+            patch("app.telegram.handlers.commands.send_message") as mock_send,
+        ):
+            MockSvc.return_value.user_membership_exists.return_value = True
+            MockSvc2.return_value.fuzzy_search_for_restaurant.side_effect = [
+                [],
+                [(suggestion_1, 0.33), (suggestion_2, 0.27)],
+            ]
+            handle(_make_update("/prices Soha"), user, db, ctx_svc, _make_settings())
+
+        text = mock_send.call_args[1]["text"]
+        assert "Did you mean" in text
+        assert "SoHaVegetables" in text
+        assert "Soho Greens" in text
 
     def test_prices_supplier_found_no_prices(self):
         user = _make_user(RESTAURANT_ID)

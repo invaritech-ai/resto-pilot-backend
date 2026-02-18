@@ -621,6 +621,55 @@ def answer_callback_query(
         return False
 
 
+def edit_message_reply_markup(
+    chat_id: int,
+    message_id: int,
+    reply_markup: dict | None,
+    settings: Settings,
+) -> bool:
+    """Edit only an existing message's inline keyboard markup."""
+    if not settings.telegram_bot_token:
+        logger.warning("edit_message_reply_markup_skipped: no bot token")
+        return False
+
+    url = f"https://api.telegram.org/bot{settings.telegram_bot_token}/editMessageReplyMarkup"
+    payload: dict[str, Any] = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "reply_markup": reply_markup,
+    }
+
+    try:
+        response = httpx.post(url, json=payload, timeout=10.0)
+        response.raise_for_status()
+        result = response.json()
+        if result.get("ok"):
+            logger.debug(
+                "message_reply_markup_edited",
+                extra={"chat_id": chat_id, "message_id": message_id},
+            )
+            return True
+        logger.warning(
+            "edit_message_reply_markup_failed",
+            extra={
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "error": result.get("description"),
+            },
+        )
+        return False
+    except httpx.HTTPError as e:
+        logger.error(
+            "edit_message_reply_markup_http_error",
+            extra={
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "error": type(e).__name__,
+            },
+        )
+        return False
+
+
 def edit_message_text(
     chat_id: int,
     message_id: int,

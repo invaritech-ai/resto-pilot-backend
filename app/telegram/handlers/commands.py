@@ -31,7 +31,11 @@ from app.services.inventory_service import InventoryService
 from app.services.money import format_price
 from app.services.restaurant_service import RestaurantService
 from app.services.supplier_service import AlreadyLinkedError, SupplierService
-from app.telegram.bot_api import send_message, send_message_with_keyboard
+from app.telegram.bot_api import (
+    edit_message_reply_markup,
+    send_message,
+    send_message_with_keyboard,
+)
 from app.telegram.keyboards import pagination_keyboard
 
 
@@ -154,16 +158,71 @@ def _send_with_optional_keyboard(
     text: str,
     reply_markup: dict | None,
     settings: Settings,
-) -> None:
+) -> int | None:
     if reply_markup and reply_markup.get("inline_keyboard"):
-        send_message_with_keyboard(
+        return send_message_with_keyboard(
             chat_id=chat_id,
             text=text,
             reply_markup=reply_markup,
             settings=settings,
         )
+    return send_message(chat_id=chat_id, text=text, settings=settings)
+
+
+def _parse_message_id(raw: object) -> int | None:
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, str):
+        try:
+            return int(raw)
+        except ValueError:
+            return None
+    return None
+
+
+def _publish_list_message(
+    *,
+    user: User,
+    db: Session,
+    ctx_svc: ContextService,
+    chat_id: int,
+    text: str,
+    reply_markup: dict | None,
+    settings: Settings,
+) -> None:
+    """Send a list response and keep only the latest list keyboard active."""
+    raw_ctx = ctx_svc.get(user)
+    if isinstance(raw_ctx, dict):
+        ctx = raw_ctx
+    elif isinstance(user.context, dict):
+        ctx = user.context
+    else:
+        ctx = {}
+    previous_message_id = _parse_message_id(ctx.get("active_list_message_id"))
+
+    sent_message_id = _send_with_optional_keyboard(
+        chat_id=chat_id,
+        text=text,
+        reply_markup=reply_markup,
+        settings=settings,
+    )
+    if sent_message_id is None:
         return
-    send_message(chat_id=chat_id, text=text, settings=settings)
+
+    if previous_message_id is not None and previous_message_id != sent_message_id:
+        edit_message_reply_markup(
+            chat_id=chat_id,
+            message_id=previous_message_id,
+            reply_markup={"inline_keyboard": []},
+            settings=settings,
+        )
+
+    has_keyboard = bool(reply_markup and reply_markup.get("inline_keyboard"))
+    ctx_svc.set_fields(
+        user,
+        active_list_message_id=(sent_message_id if has_keyboard else None),
+    )
+    db.commit()
 
 
 def _safe_page(page: int, total_items: int) -> int:
@@ -576,7 +635,10 @@ def handle(
             return
 
         db.commit()
-        _send_with_optional_keyboard(
+        _publish_list_message(
+            user=user,
+            db=db,
+            ctx_svc=ctx_svc,
             chat_id=chat_id,
             text=text_out,
             reply_markup=keyboard,
@@ -622,7 +684,10 @@ def handle(
             return
 
         db.commit()
-        _send_with_optional_keyboard(
+        _publish_list_message(
+            user=user,
+            db=db,
+            ctx_svc=ctx_svc,
             chat_id=chat_id,
             text=text_out,
             reply_markup=keyboard,
@@ -650,8 +715,37 @@ def handle(
             return
 
         svc = SupplierService(db)
-        matches = svc.fuzzy_search_for_restaurant(args, restaurant_id=restaurant_id, threshold=0.6)
+        matches = svc.fuzzy_search_for_restaurant(
+            args,
+            restaurant_id=restaurant_id,
+            threshold=0.6,
+        )
         if not matches:
+            suggestions = svc.fuzzy_search_for_restaurant(
+                args,
+                restaurant_id=restaurant_id,
+                threshold=0.2,
+            )
+            if suggestions:
+                unique_names: list[str] = []
+                for candidate, _score in suggestions:
+                    if candidate.name in unique_names:
+                        continue
+                    unique_names.append(candidate.name)
+                    if len(unique_names) >= 3:
+                        break
+                suggestion_lines = [f"• {name}" for name in unique_names]
+                send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f'No supplier found matching "{args}".\n\n'
+                        "Did you mean:\n"
+                        f"{'\n'.join(suggestion_lines)}\n\n"
+                        "Use /prices <supplier name> or /list suppliers."
+                    ),
+                    settings=settings,
+                )
+                return
             send_message(
                 chat_id=chat_id,
                 text=f'No supplier found matching "{args}". Use /list suppliers to see your suppliers.',
@@ -675,7 +769,10 @@ def handle(
             return
 
         db.commit()
-        _send_with_optional_keyboard(
+        _publish_list_message(
+            user=user,
+            db=db,
+            ctx_svc=ctx_svc,
             chat_id=chat_id,
             text=text_out,
             reply_markup=keyboard,
@@ -699,7 +796,10 @@ def handle(
             return
 
         db.commit()
-        _send_with_optional_keyboard(
+        _publish_list_message(
+            user=user,
+            db=db,
+            ctx_svc=ctx_svc,
             chat_id=chat_id,
             text=text_out,
             reply_markup=keyboard,
@@ -778,7 +878,10 @@ def handle(
             return
 
         db.commit()
-        _send_with_optional_keyboard(
+        _publish_list_message(
+            user=user,
+            db=db,
+            ctx_svc=ctx_svc,
             chat_id=chat_id,
             text=text_out,
             reply_markup=keyboard,

@@ -1152,6 +1152,31 @@ def _handle_list_page(*, params, user, db, ctx_svc, settings, callback_id, chat_
         answer_callback_query(callback_id=callback_id, text="Invalid.", settings=settings)
         return
 
+    raw_ctx = ctx_svc.get(user)
+    ctx = raw_ctx if isinstance(raw_ctx, dict) else {}
+    raw_active_id = ctx.get("active_list_message_id")
+    active_message_id: int | None = None
+    if isinstance(raw_active_id, int):
+        active_message_id = raw_active_id
+    elif isinstance(raw_active_id, str):
+        try:
+            active_message_id = int(raw_active_id)
+        except ValueError:
+            active_message_id = None
+
+    if (
+        active_message_id is not None
+        and message_id is not None
+        and message_id != active_message_id
+    ):
+        answer_callback_query(
+            callback_id=callback_id,
+            text="This list has expired. Run the command again.",
+            show_alert=True,
+            settings=settings,
+        )
+        return
+
     try:
         from app.telegram.handlers.commands import build_list_page
 
