@@ -1,76 +1,50 @@
-# LLM Contract Specification (Phase 1)
+# OCR / Parser LLM Contract
 
-## Role
-The LLM acts as a **structured parser plugin**. It translates messy user text into precise operations against the database staging area or requests clarification.
+This project uses LLMs in the file-ingestion pipeline only.
 
----
+## Two-stage extraction
+1. Vision OCR stage (`ocr_page_to_markdown`)
+   - input: image bytes/base64
+   - output: markdown text
+2. Parser stage (`parse_invoice` or `parse_price_list`)
+   - input: markdown text
+   - output: normalized JSON payload
 
-## Input Schema (LLM Context)
-The worker provides the following JSON to the LLM:
+## Parser outputs
+### Invoice
+Top-level fields include:
+- `supplier`
+- `supplier_contact_name`
+- `supplier_phone`
+- `supplier_email`
+- `invoice_date`
+- `invoice_number`
+- `currency`
+- `line_items[]` with `name`, `qty`, `unit`, `unit_price`, `amount`
 
-```json
-{
-  "user_message": "string",
-  "recent_history": [
-    {"role": "user|bot", "content": "string"}
-  ],
-  "restaurant_context": {
-    "name": "string",
-    "suppliers": ["name1", "name2"]
-  },
-  "pending_state": {
-    "uploads": [
-      {"id": "uuid", "supplier": "string", "item_count": 5, "last_items": ["..."]}
-    ]
-  },
-  "allowed_operations": ["patch_staging", "ask_clarification", "execute_command"]
-}
-```
+### Price list
+Top-level fields include:
+- `supplier`
+- `supplier_contact_name`
+- `supplier_phone`
+- `supplier_email`
+- `lead_time`
+- `effective_date`
+- `currency`
+- `line_items[]` with `name`, `unit`, `unit_price`
 
----
+## Validation behavior
+- Missing/invalid numeric fields are normalized to `None` instead of crashing.
+- Empty item names are dropped.
+- Invoice items with missing `qty`/`unit_price` are retained for user review.
+- JSON parsing failures raise `ParseError`.
 
-## Output Schema (Strict JSON)
-The LLM MUST return a single JSON object.
+## Telemetry callback contract
+LLM calls may emit callback payloads:
+- `purpose` (e.g. `ocr_page_to_markdown`, `parse_invoice`)
+- `model`
+- `upstream_id` (if available)
+- `usage` (`prompt_tokens`, `completion_tokens`, `total_tokens`)
+- `error` (for failed calls)
 
-### 1. Patch Operation
-Used when intent is clearly a modification to a pending record.
-```json
-{
-  "action": "patch_staging",
-  "staging_id": "uuid",
-  "patches": [
-    { "op": "replace", "path": "/items/0/price_minor", "value": 500 }
-  ],
-  "reasoning": "User asked to change tomato price to $5"
-}
-```
-
-### 2. Clarification
-Used when intent is ambiguous or missing required data.
-```json
-{
-  "action": "ask_clarification",
-  "question": "Which supplier's price list are you referring to? ABC or XYZ?",
-  "options": ["ABC", "XYZ"]
-}
-```
-
----
-
-## Safety & Validation
-All LLM outputs are piped through a **Validator Worker** before application:
-1. **Schema Check**: Validates against the JSONPatch RFC 6902 structure.
-2. **Whitelist Paths**: Only specific paths in the staging JSON are patchable:
-   - `/items/*/price_minor`
-   - `/items/*/name`
-   - `/items/*/unit`
-3. **Value Sanitization**: Prices must be integers; currencies must be valid ISO codes.
-4. **Staging Lock**: Patches only apply to `file_processing_staging.extracted_data_json`. Direct writes to final production tables are FORBIDDEN via LLM.
-
----
-
-## Intent Mapping
-- **"Tomato to 5"** -> `patch_staging`
-- **"What did I upload?"** -> `execute_command` (`/uploads`)
-- **"Add ABC"** -> `execute_command` (`/add supplier ABC`)
-- **"Huh?"** -> `ask_clarification`
+Worker tasks persist these into `llm_calls` when session context is available.

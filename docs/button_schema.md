@@ -1,55 +1,33 @@
-# Button Schema Specification (Phase 1)
+# Button Callback Schema
 
-## Wire Format: `action:id:param`
-Telegram `callback_query.data` has a **64-byte limit**. We use use a compact, colon-delimited string format.
+Telegram callback payload format is colon-delimited with strict 64-byte constraints.
 
-- `action`: Fixed mnemonic (3-6 chars)
-- `id`: UUID (hex without dashes to save space) or short index
-- `param`: Optional modifier
+## Wire format
+`action:param1:param2:...`
 
----
+UUIDs are encoded as 32-char hex without dashes to stay compact.
 
-## Action Registry
+## Active callback actions
+- `doc_type:{staging_hex}:{invoice|price_list}`
+- `conf_u:{staging_hex}`
+- `del_u:{staging_hex}`
+- `set_sup:{staging_hex}:{supplier_ref}`
+  - `supplier_ref` may be UUID hex (legacy) or ranked index (compact)
+- `new_sup:{staging_hex}`
+- `use_match:{staging_hex}:{idx}:{match_ref}`
+  - `match_ref` may be UUID hex (legacy) or ranked index (compact)
+- `mk_item:{staging_hex}:{idx}`
+- `skip_item:{staging_hex}:{idx}`
+- `rev_p:{staging_hex}:{page}`
+- `list_p:{list_type}:{page}`
+- `ed_row:{staging_hex}:{idx}`
+- `ed_fld:{staging_hex}:{idx}:{field}`
+- `open_u:{staging_hex}`
+- `pick_cur:{staging_hex}`
+- `set_cur:{staging_hex}:{currency}`
 
-| Action Key | Payload Example | Meaning |
-| :--- | :--- | :--- |
-| `rev_u` | `rev_u:uuid` | Review Upload (displays staging items) |
-| `conf_u` | `conf_u:uuid` | Confirm Upload (final DB write) |
-| `del_u` | `del_u:uuid` | Delete Pending Upload |
-| `ed_row` | `ed_row:uuid:idx`| Edit Row (triggers edit flow for specific index) |
-| `list_p` | `list_p:page:2` | List Pagination (target page) |
-| `res_h` | `res_h:uuid:yes` | Resolve Handshake (e.g., confirm unit conversion) |
-
----
-
-## Common Layouts
-
-### 1. Pending Upload List
-Shown when user runs `/uploads` or starts a new upload with pending items.
-```text
-[ 📄 Review: ABC Supplier ] -> callback: `rev_u:uuid_abc`
-[ 📄 Review: XYZ Supplier ] -> callback: `rev_u:uuid_xyz`
-```
-
-### 2. Upload Review Summary
-Shown after OCR or manually via "Review".
-```text
-[ ✅ Confirm All ] -> callback: `conf_u:uuid`
-[ ❌ Delete This ] -> callback: `del_u:uuid`
-[ ✏️ Edit Item #1 ] -> callback: `ed_row:uuid:1`
-[ ✏️ Edit Item #2 ] -> callback: `ed_row:uuid:2`
-```
-
-### 3. Handshake Question
-```text
-Question: Is "case" for Tomatoes equal to 10kg?
-[ ✅ Yes ] -> callback: `res_h:uuid:yes`
-[ ❌ No  ] -> callback: `res_h:uuid:no`
-```
-
----
-
-## Implementation Rules
-1. **Deterministic Execution**: Button handlers are strictly deterministic. They MUST NOT call LLMs.
-2. **Expired ID Handling**: If a button references an ID already deleted, the handler responds with an alert: "This item no longer exists."
-3. **State Updates**: After a button action (e.g., `conf_u`), the bot should edit the original message to reflect the new state (e.g., "✅ Upload Confirmed") to prevent double-clicks.
+## Behavioral guardrails
+1. Button handlers are deterministic and do not invoke LLMs directly.
+2. Unknown/expired references return callback alerts instead of hard failures.
+3. For paginated command lists, only the latest list message is considered active.
+4. Compact callback payloads are preferred where UUID-rich payloads risk Telegram size limits.

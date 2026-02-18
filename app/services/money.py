@@ -1,7 +1,7 @@
 """
 Decimal ↔ integer minor-unit conversion helpers.
 
-Conversion boundary rule (from phase1_spec.md):
+Conversion boundary rule:
   - LLMs always speak in human-readable decimals.
   - Storage (DB + staging JSONB) is always integers: price_minor + price_exp.
   - to_minor() is called immediately after LLM output is validated (inbound).

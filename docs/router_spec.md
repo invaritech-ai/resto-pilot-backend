@@ -1,48 +1,24 @@
-# Router Specification (Phase 1)
+# Telegram Router Spec
 
-## Principle: Stateless-per-Message
-The system operates as a stateless engine where each incoming message is interpreted based on its content and the current state of the database (e.g., pending uploads), rather than an ephemeral "active flow" that blocks other commands.
+The router is deterministic and evaluates each incoming update in strict priority order (first match wins):
 
-## Message Routing Precedence
-Every message is evaluated in order. The first match wins.
+1. Global reset words (`home`, `menu`, `cancel`, `exit`, `/start`)
+2. Button callbacks (`callback_query`)
+3. Slash commands (`/` prefix)
+4. File uploads (`document` or `photo`)
+5. Structured patterns (`#N`, qty+unit regex)
+6. Fallback handler
 
-| Priority | Matcher | Handler | Purpose |
-| :--- | :--- | :--- | :--- |
-| 1 | **Global Reset** | `reset_handler` | `home`, `cancel`, `start` - Clears transient UX state. |
-| 2 | **Button Callback** | `button_router` | Handles Telegram `callback_query` from inline buttons. |
-| 3 | **Slash Command** | `command_router` | `/list`, `/add`, `/uploads` - Standard functional entry points. |
-| 4 | **File Upload** | `file_router` | Handles `document` or `photo` objects. Checks DB for pending items. |
-| 5 | **Structured Pattern** | `regex_router` | Matches "5kg tomato" or "#2" - High-speed deterministic parsing. |
-| 6 | **Free-form Text** | `llm_router` | Fallback to LLM for intent extraction and patching. |
+## Design intent
+- Keep high-confidence intents in deterministic handlers.
+- Avoid blocking state machines: users can run commands even while uploads are pending.
+- Persist critical process state in DB rather than ephemeral in-memory flows.
 
----
+## Error handling rules
+- Handler exceptions bubble up to worker retry path.
+- Dedup records are removed on failed worker execution to allow retry.
+- Callback handlers return user-facing alerts for stale/invalid payloads where possible.
 
-## Handler Details
-
-### 1. Global Reset
-Matches literal text (case-insensitive): `home`, `menu`, `cancel`, `exit`, `/start`.
-- **Action**: Clears `telegram_sessions.context_json`.
-- **Response**: Main Menu or standard greeting.
-
-### 2. Button Router
-Parses `callback_query.data`. 
-- Data format: `action:id:param` (e.g., `confirm_upld:uuid-123`).
-- **Constraint**: Buttons must always be valid unless the resource they point to (e.g., staging record) is deleted.
-
-### 3. File Router
-When a file is received:
-1. Query `file_processing_staging` for `status='pending_review'`.
-2. If records exist: Prompt user to resolve pending items or start new.
-3. If none: Trigger `document_worker` for OCR/Parsing.
-
-### 4. LLM Router (Fallback)
-If no deterministic match is found:
-1. Pull context: User info, last 10 messages, list of relevant pending DB records.
-2. Prompt LLM to classify intent or propose a patch for a pending record.
-3. **Safety**: LLM results are validated against schema before any staging write. Never writes directly to final tables.
-
----
-
-## UX Guardrails
-- **No Blocking**: A user mid-upload review can still run `/list suppliers`. The result is shown, and the upload remains "pending" in the DB, accessible via `/uploads` or buttons.
-- **Disambiguation**: If an input is ambiguous (e.g., "delete it"), the system responds with numbered options based on the message history.
+## Security/tenant intent
+- Routing does not grant access by itself.
+- Service/handler layers must validate restaurant membership and ownership for mutating operations.
