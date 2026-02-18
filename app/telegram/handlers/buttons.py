@@ -314,7 +314,9 @@ def _handle_conf_u(*, params, user, db, ctx_svc, settings, callback_id, chat_id,
     inv_svc = InventoryService(db)
 
     if not resolutions:
-        # First time: compute fuzzy matches for all items
+        # First time: compute fuzzy matches for all items.
+        # Items beyond _MAX_HUB_ITEMS cannot be shown/resolved by the user,
+        # so auto-resolve them: use a strong match (>=0.8) or create new.
         for i, li in enumerate(items):
             name = li.get("name", "")
             matches = inv_svc.fuzzy_match_item(
@@ -324,10 +326,15 @@ def _handle_conf_u(*, params, user, db, ctx_svc, settings, callback_id, chat_id,
                 best, score = matches[0]
                 if score >= 0.8:
                     resolutions[str(i)] = str(best.id)  # auto-resolved
+                elif i < _MAX_HUB_ITEMS:
+                    resolutions[str(i)] = None  # needs user input in hub
                 else:
-                    resolutions[str(i)] = None  # needs user input
+                    resolutions[str(i)] = "new"  # beyond hub cap → auto-create
             else:
-                resolutions[str(i)] = None  # no match
+                if i < _MAX_HUB_ITEMS:
+                    resolutions[str(i)] = None  # needs user input in hub
+                else:
+                    resolutions[str(i)] = "new"  # beyond hub cap → auto-create
 
         ctx_svc.set_fields(user, pending_item_resolutions=resolutions)
         db.flush()
