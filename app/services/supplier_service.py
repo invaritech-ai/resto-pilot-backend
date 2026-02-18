@@ -76,6 +76,7 @@ class SupplierService:
             **kwargs,
         )
         self.session.add(supplier)
+        self.session.flush()  # populate supplier.id before using it as FK
 
         link = RestaurantSupplier(
             restaurant_id=restaurant_id,
