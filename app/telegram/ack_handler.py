@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import Settings
 from app.db.models.telegram_session import TelegramSessions
-from app.telegram.bot_api import send_message
+from app.telegram.bot_api import bind_outlet_badge, send_message
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +82,8 @@ def send_instant_ack(
 
     if chat_id != 0 and not console_mode:
         try:
-            send_message(chat_id=chat_id, text=ack_text, settings=settings)
+            with bind_outlet_badge("-"):
+                send_message(chat_id=chat_id, text=ack_text, settings=settings)
             logger.info("ack_sent chat_id=%s", chat_id)
         except Exception as exc:
             logger.warning("ack_send_failed chat_id=%s error=%r", chat_id, exc)

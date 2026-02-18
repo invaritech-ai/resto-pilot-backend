@@ -14,6 +14,8 @@ UUIDs are encoded as 32-char hex without dashes to stay compact.
 - `set_sup:{staging_hex}:{supplier_ref}`
   - `supplier_ref` may be UUID hex (legacy) or ranked index (compact)
 - `new_sup:{staging_hex}`
+- `type_sup:{staging_hex}`
+  - prompts free-text supplier input for the active staging review
 - `use_match:{staging_hex}:{idx}:{match_ref}`
   - `match_ref` may be UUID hex (legacy) or ranked index (compact)
 - `mk_item:{staging_hex}:{idx}`
@@ -31,3 +33,4 @@ UUIDs are encoded as 32-char hex without dashes to stay compact.
 2. Unknown/expired references return callback alerts instead of hard failures.
 3. For paginated command lists, only the latest list message is considered active.
 4. Compact callback payloads are preferred where UUID-rich payloads risk Telegram size limits.
+5. Supplier-selection callbacks are `set_sup` (select existing), `type_sup` (type supplier name), and `new_sup` (create supplier).

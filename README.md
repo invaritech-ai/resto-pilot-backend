@@ -12,7 +12,9 @@ Telegram-first backend for restaurant supplier, pricing, and inventory workflows
   - `/products`, `/prices <supplier>`, `/inventory`, `/balance`
 - Upload pipeline for invoices and price lists:
   - file upload -> document type selection -> OCR -> review -> confirm
-  - supplier resolution gate and invoice item resolution gate
+  - informative staged progress updates during OCR (step/status/elapsed/ETA)
+  - supplier resolution options: choose existing / type name / create new
+  - invoice item resolution gate before inventory writes
 - Paginated list UX with inline buttons (latest list message only; stale buttons are rejected).
 - Telemetry:
   - incoming message/session dedup tracking

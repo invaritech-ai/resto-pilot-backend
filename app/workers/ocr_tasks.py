@@ -34,6 +34,7 @@ from app.services.telemetry import record_llm_call, record_outgoing_message
 from app.telegram.bot_api import (
     TelegramFileExpiredError,
     bind_current_session,
+    bind_outlet_badge,
     bind_outgoing_db_logger,
     edit_message_text,
     get_file_bytes,
@@ -93,6 +94,20 @@ def process_file_task(
 
         staging_svc = StagingService(db)
         session_id = staging.session_id
+        outlet_badge_label: str | None = None
+        try:
+            from app.db.models.restaurant import Restaurant
+
+            restaurant = db.get(Restaurant, staging.restaurant_id)
+            if restaurant is not None:
+                outlet_badge_label = restaurant.name
+        except Exception:
+            logger.exception(
+                "ocr_outlet_badge_resolve_failed staging=%s",
+                staging_id,
+            )
+        if not outlet_badge_label:
+            outlet_badge_label = "-"
         started_at = time.monotonic()
         last_progress_emit = 0.0
 
@@ -260,7 +275,11 @@ def process_file_task(
                 force=force,
             )
 
-        with bind_current_session(session_id), bind_outgoing_db_logger(_outgoing_db_logger):
+        with (
+            bind_current_session(session_id),
+            bind_outgoing_db_logger(_outgoing_db_logger),
+            bind_outlet_badge(outlet_badge_label),
+        ):
             try:
                 # 1. Download file bytes
                 _emit_progress(

@@ -25,9 +25,11 @@ uv run pytest tests/test_telegram_tasks.py tests/test_files_handler.py
 2. Send `/start`, complete onboarding.
 3. Run `/help` and verify all listed commands are usable.
 4. Upload invoice and price-list sample files.
-5. Validate review, edit, pagination, and confirm flows.
-6. Validate `/products`, `/prices <supplier>`, `/inventory`, `/balance` outputs.
-7. Validate stale pagination buttons are rejected after a newer list is sent.
+5. Validate upload progress-stage message updates (step/status/elapsed/ETA) during OCR.
+6. Validate review, edit, pagination, supplier resolution (choose/type/create), and confirm flows.
+7. Validate first-page header supplier recovery on a PDF where table/text extraction misses supplier.
+8. Validate `/products`, `/prices <supplier>`, `/inventory`, `/balance` outputs.
+9. Validate stale pagination buttons are rejected after a newer list is sent.
 
 ## Regression areas to always include
 - Supplier matching (`/prices`) with exact + partial names.

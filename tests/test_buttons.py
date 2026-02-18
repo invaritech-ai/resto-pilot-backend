@@ -86,6 +86,7 @@ def _make_staging(
     staging = MagicMock()
     staging.id = STAGING_ID
     staging.restaurant_id = RESTAURANT_ID
+    staging.uploaded_by = USER_ID
     staging.status = status
     staging.document_type = document_type
     staging.extracted_data_json = {
@@ -234,11 +235,11 @@ class TestConfirmUploadValidation:
             )
 
         mock_acq.assert_called_once()
-        assert "not authorized" in mock_acq.call_args[1]["text"].lower()
+        assert "action unavailable" in mock_acq.call_args[1]["text"].lower()
         db.commit.assert_not_called()
 
-    def test_owner_bypasses_membership_check(self):
-        """uploaded_by == user.id should pass auth even if membership returns False."""
+    def test_membership_required_even_for_uploader(self):
+        """Membership-first policy: uploader alone cannot confirm without membership."""
         user = _make_user()
         db = _make_db()
         staging = _make_staging(line_items=[])  # empty → early exit after auth
@@ -256,9 +257,7 @@ class TestConfirmUploadValidation:
                 _make_settings(),
             )
 
-        # Auth passed; empty line items → "no valid line items" (not "not authorized")
-        assert "not authorized" not in mock_acq.call_args[1]["text"].lower()
-        assert "no valid line items" in mock_acq.call_args[1]["text"].lower()
+        assert "action unavailable" in mock_acq.call_args[1]["text"].lower()
 
     def test_malformed_line_items_filtered_out(self):
         """Rows missing qty or with zero/negative qty are skipped."""
@@ -739,4 +738,4 @@ class TestConfirmUploadIntegration:
         pg_session.refresh(staging)
         assert staging.status == "pending_review"
 
-        assert "not authorized" in mock_acq.call_args[1]["text"].lower()
+        assert "action unavailable" in mock_acq.call_args[1]["text"].lower()

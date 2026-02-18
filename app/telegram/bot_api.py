@@ -17,6 +17,9 @@ from app.core.config import Settings
 logger = logging.getLogger(__name__)
 
 TELEGRAM_MAX_MESSAGE_LEN = 4096
+_OUTLET_LABEL_MAX_CHARS = 12
+_OUTLET_BADGE_FALLBACK = "-"
+_OUTLET_BADGE_EMOJI = "🏬"
 
 _OUTGOING_MESSAGE_SINK: ContextVar[Callable[[int, str], None] | None] = ContextVar(
     "_OUTGOING_MESSAGE_SINK",
@@ -28,6 +31,10 @@ _OUTGOING_DB_LOGGER: ContextVar[Callable[[int, str, int | None], None] | None] =
 )
 _CURRENT_SESSION_ID: ContextVar[uuid.UUID | None] = ContextVar(
     "_CURRENT_SESSION_ID",
+    default=None,
+)
+_OUTLET_BADGE_LABEL: ContextVar[str | None] = ContextVar(
+    "_OUTLET_BADGE_LABEL",
     default=None,
 )
 
@@ -93,6 +100,42 @@ def _split_telegram_message_text(
     return parts or [text[:limit]]
 
 
+def _format_outlet_label(raw_label: str | None) -> str:
+    label = (raw_label or "").strip()
+    if not label:
+        return _OUTLET_BADGE_FALLBACK
+    if len(label) <= _OUTLET_LABEL_MAX_CHARS:
+        return label
+    return f"{label[:_OUTLET_LABEL_MAX_CHARS - 1]}…"
+
+
+def _decorate_with_outlet_badge(text: str) -> str:
+    if not isinstance(text, str) or not text.strip():
+        return text
+
+    label_raw = _OUTLET_BADGE_LABEL.get()
+    if label_raw is None:
+        return text
+
+    # Avoid duplicating the badge if callers already provided it.
+    if text.startswith(f"{_OUTLET_BADGE_EMOJI} ") or text.startswith(
+        f"{_OUTLET_BADGE_EMOJI}\n"
+    ):
+        return text
+
+    label = _format_outlet_label(label_raw)
+    full_badge = f"{_OUTLET_BADGE_EMOJI} {label}"
+    decorated = f"{full_badge}\n{text}"
+    if len(decorated) <= TELEGRAM_MAX_MESSAGE_LEN:
+        return decorated
+
+    compact_badge = f"{_OUTLET_BADGE_EMOJI}\n{text}"
+    if len(compact_badge) <= TELEGRAM_MAX_MESSAGE_LEN:
+        return compact_badge
+
+    return decorated
+
+
 def _log_outgoing_message(
     *,
     chat_id: int,
@@ -132,12 +175,18 @@ def send_message(chat_id: int, text: str, settings: Settings) -> int | None:
         httpx.HTTPError: If the API request fails
         ValueError: If the bot token is not configured
     """
+    if not isinstance(text, str) or not text.strip():
+        logger.warning(
+            "telegram_send_message_skipped_empty", extra={"chat_id": chat_id}
+        )
+        return None
+
+    text_out = _decorate_with_outlet_badge(text)
+
     sink = _OUTGOING_MESSAGE_SINK.get()
     if sink is not None:
-        if not isinstance(text, str) or not text.strip():
-            return None
         for part in _split_telegram_message_text(
-            text=text, limit=TELEGRAM_MAX_MESSAGE_LEN
+            text=text_out, limit=TELEGRAM_MAX_MESSAGE_LEN
         ):
             sink(chat_id, part)
             _log_outgoing_message(
@@ -151,10 +200,8 @@ def send_message(chat_id: int, text: str, settings: Settings) -> int | None:
     # Console sink for local/dev testing: chat_id=0 prints instead of calling Telegram.
     # Telegram chat IDs are never 0, so this is safe and explicit.
     if chat_id == 0:
-        if not isinstance(text, str) or not text.strip():
-            return None
         for part in _split_telegram_message_text(
-            text=text, limit=TELEGRAM_MAX_MESSAGE_LEN
+            text=text_out, limit=TELEGRAM_MAX_MESSAGE_LEN
         ):
             print(part, flush=True)  # noqa: T201
             _log_outgoing_message(
@@ -167,16 +214,12 @@ def send_message(chat_id: int, text: str, settings: Settings) -> int | None:
     if not settings.telegram_bot_token:
         raise ValueError("Telegram bot token is not configured")
 
-    if not isinstance(text, str) or not text.strip():
-        logger.warning(
-            "telegram_send_message_skipped_empty", extra={"chat_id": chat_id}
-        )
-        return None
-
     url = f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage"
 
     message_id: int | None = None
-    for part in _split_telegram_message_text(text=text, limit=TELEGRAM_MAX_MESSAGE_LEN):
+    for part in _split_telegram_message_text(
+        text=text_out, limit=TELEGRAM_MAX_MESSAGE_LEN
+    ):
         payload: dict[str, Any] = {
             "chat_id": chat_id,
             "text": part,
@@ -299,6 +342,16 @@ def bind_current_session(session_id: uuid.UUID | None) -> Any:
         yield
     finally:
         _CURRENT_SESSION_ID.reset(token)
+
+
+@contextmanager
+def bind_outlet_badge(label: str | None) -> Any:
+    """Bind outlet label for outgoing message decoration in this context."""
+    token = _OUTLET_BADGE_LABEL.set(label)
+    try:
+        yield
+    finally:
+        _OUTLET_BADGE_LABEL.reset(token)
 
 
 def get_current_session_id() -> uuid.UUID | None:
@@ -522,24 +575,33 @@ def send_message_with_keyboard(
 
     Falls back to plain send_message when in dev/test sink mode.
     """
+    if not isinstance(text, str) or not text.strip():
+        logger.warning(
+            "telegram_send_message_with_keyboard_skipped_empty",
+            extra={"chat_id": chat_id},
+        )
+        return None
+
+    text_out = _decorate_with_outlet_badge(text)
+
     sink = _OUTGOING_MESSAGE_SINK.get()
     if sink is not None:
-        sink(chat_id, text)
-        _log_outgoing_message(chat_id=chat_id, text=text, telegram_message_id=None)
+        sink(chat_id, text_out)
+        _log_outgoing_message(chat_id=chat_id, text=text_out, telegram_message_id=None)
         return 1
 
     if chat_id == 0:
-        print(text, flush=True)  # noqa: T201
-        _log_outgoing_message(chat_id=chat_id, text=text, telegram_message_id=None)
+        print(text_out, flush=True)  # noqa: T201
+        _log_outgoing_message(chat_id=chat_id, text=text_out, telegram_message_id=None)
         return 1
 
     if not settings.telegram_bot_token:
-        return send_message(chat_id=chat_id, text=text, settings=settings)
+        return send_message(chat_id=chat_id, text=text_out, settings=settings)
 
     url = f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage"
     payload: dict[str, Any] = {
         "chat_id": chat_id,
-        "text": text,
+        "text": text_out,
         "reply_markup": reply_markup,
     }
     try:
@@ -551,7 +613,7 @@ def send_message_with_keyboard(
             telegram_message_id = int(msg_id) if msg_id else None
             _log_outgoing_message(
                 chat_id=chat_id,
-                text=text,
+                text=text_out,
                 telegram_message_id=telegram_message_id,
             )
             return telegram_message_id
@@ -696,12 +758,14 @@ def edit_message_text(
         logger.warning("edit_message_text_skipped_empty", extra={"chat_id": chat_id})
         return False
 
+    text_out = _decorate_with_outlet_badge(text)
+
     url = f"https://api.telegram.org/bot{settings.telegram_bot_token}/editMessageText"
 
     payload: dict[str, Any] = {
         "chat_id": chat_id,
         "message_id": message_id,
-        "text": text,
+        "text": text_out,
     }
     if reply_markup:
         payload["reply_markup"] = reply_markup

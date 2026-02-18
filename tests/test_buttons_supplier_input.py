@@ -53,6 +53,7 @@ class TestSupplierInputFlow:
         staging.extracted_data_json = {"line_items": [{"name": "Tomato", "qty": 2.0}]}
 
         user = _make_user()
+        staging.uploaded_by = user.id
         db = MagicMock()
         db.get.return_value = staging
         ctx_svc = MagicMock()
@@ -80,8 +81,9 @@ class TestSupplierInputFlow:
 
     def test_typed_supplier_resolve_mode_autosets_supplier(self):
         staging_id = uuid.uuid4()
-        staging = _make_staging(staging_id)
         user = _make_user()
+        staging = _make_staging(staging_id)
+        staging.uploaded_by = user.id
         db = MagicMock()
         db.get.return_value = staging
 
@@ -121,8 +123,9 @@ class TestSupplierInputFlow:
 
     def test_typed_supplier_create_mode_creates_and_links(self):
         staging_id = uuid.uuid4()
-        staging = _make_staging(staging_id)
         user = _make_user()
+        staging = _make_staging(staging_id)
+        staging.uploaded_by = user.id
         db = MagicMock()
         db.get.return_value = staging
 

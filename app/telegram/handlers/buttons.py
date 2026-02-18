@@ -49,10 +49,12 @@ import logging
 import uuid as _uuid_mod
 
 import httpx
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
 from app.db.models.file_processing_staging import FileProcessingStaging
+from app.db.models.restaurant_user import RestaurantUser
 from app.db.models.user import User
 from app.services.context_service import ContextService
 from app.services.inventory_service import InventoryService
@@ -78,6 +80,75 @@ from app.telegram.keyboards import (
 logger = logging.getLogger(__name__)
 
 _MAX_HUB_ITEMS = 10  # show at most 10 pending items in resolution hub
+_AUTHZ_DENIED_TEXT = "Action unavailable."
+
+
+def _deny_callback_authz(*, callback_id: str, settings: Settings) -> None:
+    answer_callback_query(
+        callback_id=callback_id,
+        text=_AUTHZ_DENIED_TEXT,
+        show_alert=True,
+        settings=settings,
+    )
+
+
+def _membership_flags(*, db: Session, restaurant_id, user_id) -> tuple[bool, bool]:
+    is_member = RestaurantService(db).user_membership_exists(
+        restaurant_id=restaurant_id,
+        user_id=user_id,
+    )
+    if not is_member:
+        return False, False
+
+    owner_flag = db.scalar(
+        select(RestaurantUser.is_owner).where(
+            RestaurantUser.restaurant_id == restaurant_id,
+            RestaurantUser.user_id == user_id,
+            RestaurantUser.is_active.is_(True),
+        )
+    )
+    is_owner = owner_flag if isinstance(owner_flag, bool) else False
+    return True, is_owner
+
+
+def _is_authorized_for_staging(
+    *,
+    db: Session,
+    staging: FileProcessingStaging,
+    user: User,
+    require_uploader_or_owner: bool,
+) -> bool:
+    is_member, is_owner = _membership_flags(
+        db=db,
+        restaurant_id=staging.restaurant_id,
+        user_id=user.id,
+    )
+    if not is_member:
+        return False
+    if not require_uploader_or_owner:
+        return True
+    return bool(is_owner or staging.uploaded_by == user.id)
+
+
+def _authorize_staging_callback(
+    *,
+    db: Session,
+    staging: FileProcessingStaging,
+    user: User,
+    callback_id: str,
+    settings: Settings,
+    require_uploader_or_owner: bool,
+) -> bool:
+    allowed = _is_authorized_for_staging(
+        db=db,
+        staging=staging,
+        user=user,
+        require_uploader_or_owner=require_uploader_or_owner,
+    )
+    if allowed:
+        return True
+    _deny_callback_authz(callback_id=callback_id, settings=settings)
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +248,16 @@ def _handle_doc_type(*, params, user, db, ctx_svc, settings, callback_id, chat_i
         answer_callback_query(callback_id=callback_id, text="Upload not found.", settings=settings)
         return
 
+    if not _authorize_staging_callback(
+        db=db,
+        staging=staging,
+        user=user,
+        callback_id=callback_id,
+        settings=settings,
+        require_uploader_or_owner=True,
+    ):
+        return
+
     if staging.status != "processing":
         answer_callback_query(
             callback_id=callback_id,
@@ -227,13 +308,14 @@ def _handle_conf_u(*, params, user, db, ctx_svc, settings, callback_id, chat_id,
         answer_callback_query(callback_id=callback_id, text="Upload not found.", settings=settings)
         return
 
-    # Auth check
-    is_owner = staging.uploaded_by == user.id
-    is_member = RestaurantService(db).user_membership_exists(
-        restaurant_id=staging.restaurant_id, user_id=user.id
-    )
-    if not (is_owner or is_member):
-        answer_callback_query(callback_id=callback_id, text="Not authorized.", settings=settings)
+    if not _authorize_staging_callback(
+        db=db,
+        staging=staging,
+        user=user,
+        callback_id=callback_id,
+        settings=settings,
+        require_uploader_or_owner=True,
+    ):
         return
 
     if staging.status != "pending_review":
@@ -415,6 +497,16 @@ def _handle_del_u(*, params, user, db, ctx_svc, settings, callback_id, chat_id, 
         answer_callback_query(callback_id=callback_id, text="", settings=settings)
         return
 
+    if not _authorize_staging_callback(
+        db=db,
+        staging=staging,
+        user=user,
+        callback_id=callback_id,
+        settings=settings,
+        require_uploader_or_owner=True,
+    ):
+        return
+
     if staging.status in ("confirmed", "cancelled"):
         answer_callback_query(
             callback_id=callback_id,
@@ -461,6 +553,16 @@ def _handle_set_sup(*, params, user, db, ctx_svc, settings, callback_id, chat_id
     staging = db.get(FileProcessingStaging, staging_id)
     if staging is None:
         answer_callback_query(callback_id=callback_id, text="Upload not found.", settings=settings)
+        return
+
+    if not _authorize_staging_callback(
+        db=db,
+        staging=staging,
+        user=user,
+        callback_id=callback_id,
+        settings=settings,
+        require_uploader_or_owner=True,
+    ):
         return
 
     supplier_id = None
@@ -566,6 +668,16 @@ def _handle_new_sup(*, params, user, db, ctx_svc, settings, callback_id, chat_id
         answer_callback_query(callback_id=callback_id, text="Upload not found.", settings=settings)
         return
 
+    if not _authorize_staging_callback(
+        db=db,
+        staging=staging,
+        user=user,
+        callback_id=callback_id,
+        settings=settings,
+        require_uploader_or_owner=True,
+    ):
+        return
+
     # Get supplier name from extracted data
     extracted = staging.extracted_data_json or {}
     supplier_name = (extracted.get("supplier") or "").strip()
@@ -627,6 +739,16 @@ def _handle_type_sup(*, params, user, db, ctx_svc, settings, callback_id, chat_i
     staging = db.get(FileProcessingStaging, staging_id)
     if staging is None:
         answer_callback_query(callback_id=callback_id, text="Upload not found.", settings=settings)
+        return
+
+    if not _authorize_staging_callback(
+        db=db,
+        staging=staging,
+        user=user,
+        callback_id=callback_id,
+        settings=settings,
+        require_uploader_or_owner=True,
+    ):
         return
 
     if staging.status != "pending_review":
@@ -692,6 +814,16 @@ def _handle_use_match(*, params, user, db, ctx_svc, settings, callback_id, chat_
         staging = db.get(FileProcessingStaging, staging_id)
         if staging is None:
             answer_callback_query(callback_id=callback_id, text="Upload not found.", settings=settings)
+            return
+
+        if not _authorize_staging_callback(
+            db=db,
+            staging=staging,
+            user=user,
+            callback_id=callback_id,
+            settings=settings,
+            require_uploader_or_owner=True,
+        ):
             return
 
         extracted = staging.extracted_data_json or {}
@@ -809,6 +941,16 @@ def _update_resolution(
     staging = db.get(FileProcessingStaging, staging_id)
     if staging is None:
         answer_callback_query(callback_id=callback_id, text="Upload not found.", settings=settings)
+        return
+
+    if not _authorize_staging_callback(
+        db=db,
+        staging=staging,
+        user=user,
+        callback_id=callback_id,
+        settings=settings,
+        require_uploader_or_owner=True,
+    ):
         return
 
     if staging.status != "pending_review":
@@ -1028,6 +1170,16 @@ def _handle_open_u(*, params, user, db, ctx_svc, settings, callback_id, chat_id,
         answer_callback_query(callback_id=callback_id, text="Upload not found.", settings=settings)
         return
 
+    if not _authorize_staging_callback(
+        db=db,
+        staging=staging,
+        user=user,
+        callback_id=callback_id,
+        settings=settings,
+        require_uploader_or_owner=True,
+    ):
+        return
+
     if staging.status != "pending_review":
         answer_callback_query(
             callback_id=callback_id,
@@ -1081,6 +1233,16 @@ def _handle_pick_cur(*, params, user, db, ctx_svc, settings, callback_id, chat_i
         answer_callback_query(callback_id=callback_id, text="Upload not found.", settings=settings)
         return
 
+    if not _authorize_staging_callback(
+        db=db,
+        staging=staging,
+        user=user,
+        callback_id=callback_id,
+        settings=settings,
+        require_uploader_or_owner=True,
+    ):
+        return
+
     # Build currency picker keyboard (2 per row)
     buttons = [
         make_button(code, cb_set_currency(staging_id, code))
@@ -1116,6 +1278,16 @@ def _handle_set_cur(*, params, user, db, ctx_svc, settings, callback_id, chat_id
     staging = db.get(FileProcessingStaging, staging_id)
     if staging is None:
         answer_callback_query(callback_id=callback_id, text="Upload not found.", settings=settings)
+        return
+
+    if not _authorize_staging_callback(
+        db=db,
+        staging=staging,
+        user=user,
+        callback_id=callback_id,
+        settings=settings,
+        require_uploader_or_owner=True,
+    ):
         return
 
     # Write currency into extracted JSON
@@ -1164,6 +1336,16 @@ def _handle_rev_page(*, params, user, db, ctx_svc, settings, callback_id, chat_i
     staging = db.get(FileProcessingStaging, staging_id)
     if staging is None:
         answer_callback_query(callback_id=callback_id, text="Upload not found.", settings=settings)
+        return
+
+    if not _authorize_staging_callback(
+        db=db,
+        staging=staging,
+        user=user,
+        callback_id=callback_id,
+        settings=settings,
+        require_uploader_or_owner=True,
+    ):
         return
 
     supplier = None
@@ -1365,6 +1547,21 @@ def handle_supplier_name_input(
         )
         return
 
+    if not _is_authorized_for_staging(
+        db=db,
+        staging=staging,
+        user=user,
+        require_uploader_or_owner=True,
+    ):
+        ctx_svc.set_fields(
+            user,
+            supplier_input_staging_id=None,
+            supplier_input_mode=None,
+        )
+        db.commit()
+        send_message(chat_id=chat_id, text=_AUTHZ_DENIED_TEXT, settings=settings)
+        return
+
     extracted = dict(staging.extracted_data_json or {})
     extracted["supplier"] = text
     staging.extracted_data_json = extracted
@@ -1511,6 +1708,16 @@ def _handle_ed_row(*, params, user, db, ctx_svc, settings, callback_id, chat_id,
         )
         return
 
+    if not _authorize_staging_callback(
+        db=db,
+        staging=staging,
+        user=user,
+        callback_id=callback_id,
+        settings=settings,
+        require_uploader_or_owner=True,
+    ):
+        return
+
     items = (staging.extracted_data_json or {}).get("line_items", [])
     if item_idx >= len(items):
         answer_callback_query(callback_id=callback_id, text="Item not found.", settings=settings)
@@ -1576,6 +1783,16 @@ def _handle_ed_fld(*, params, user, db, ctx_svc, settings, callback_id, chat_id,
         answer_callback_query(callback_id=callback_id, text="Upload not found.", settings=settings)
         return
 
+    if not _authorize_staging_callback(
+        db=db,
+        staging=staging,
+        user=user,
+        callback_id=callback_id,
+        settings=settings,
+        require_uploader_or_owner=True,
+    ):
+        return
+
     # Store editing state in context
     ctx_svc.set_fields(
         user,
@@ -1636,6 +1853,17 @@ def handle_item_edit_input(
         ctx_svc.set_fields(user, editing_staging_id=None, editing_item_idx=None, editing_field=None)
         db.commit()
         send_message(chat_id=chat_id, text="Upload no longer available for editing.", settings=settings)
+        return
+
+    if not _is_authorized_for_staging(
+        db=db,
+        staging=staging,
+        user=user,
+        require_uploader_or_owner=True,
+    ):
+        ctx_svc.set_fields(user, editing_staging_id=None, editing_item_idx=None, editing_field=None)
+        db.commit()
+        send_message(chat_id=chat_id, text=_AUTHZ_DENIED_TEXT, settings=settings)
         return
 
     data = dict(staging.extracted_data_json or {})

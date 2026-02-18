@@ -43,6 +43,8 @@ Common fields:
 - `editing_staging_id`
 - `editing_item_idx`
 - `editing_field`
+- `supplier_input_staging_id`
+- `supplier_input_mode` (`resolve` or `create`)
 - `prices_supplier_id`
 - `last_list_type`
 - `last_list_offset`
@@ -52,11 +54,13 @@ Common fields:
 ## Upload flow summary
 1. File arrives -> staging row created (`processing`).
 2. User picks document type (`invoice` or `price_list`).
-3. OCR/parser task extracts structured JSON.
-4. Supplier gate resolves/asks for supplier.
-5. Review message sent (`pending_review`).
-6. User edits/resolves items and confirms.
-7. Final writes happen, staging set to `confirmed`.
+3. Processing message is edited with OCR progress stages (step/status/elapsed/ETA).
+4. OCR/parser task extracts structured JSON.
+5. If PDF text/tables do not yield a supplier, first-page vision header fallback attempts supplier extraction.
+6. Supplier gate resolves automatically or presents choose/type/create options.
+7. Review message sent (`pending_review`).
+8. User edits/resolves items and confirms.
+9. Final writes happen, staging set to `confirmed`.
 
 ## Pagination behavior
 Command list pagination is context-stable:

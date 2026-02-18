@@ -45,8 +45,6 @@ HELP_TEXT = """Available commands:
 /team              — Staff & invites
 /list suppliers    — Show your linked suppliers
 /add supplier <name> — Add a new supplier
-/link supplier <name> — Link an existing supplier
-/outlets           — Your restaurant
 /products          — Supplier product catalog
 /prices <name>     — Prices from a supplier
 /inventory         — Stock levels
@@ -1013,15 +1011,31 @@ def handle(
 
         from sqlalchemy import desc, select
         from app.db.models.file_processing_staging import FileProcessingStaging
+        from app.db.models.restaurant_user import RestaurantUser
         from app.db.models.suppliers import Supplier
         from app.telegram.keyboards import cb_open_upload, make_button
 
-        records = db.scalars(
+        membership = db.scalar(
+            select(RestaurantUser).where(
+                RestaurantUser.restaurant_id == restaurant_id,
+                RestaurantUser.user_id == user.id,
+                RestaurantUser.is_active.is_(True),
+            )
+        )
+        if membership is None:
+            send_message(chat_id=chat_id, text="Action unavailable.", settings=settings)
+            return
+
+        records_stmt = (
             select(FileProcessingStaging)
             .where(FileProcessingStaging.restaurant_id == restaurant_id)
             .where(FileProcessingStaging.status.in_(["processing", "pending_review", "error"]))
-            .order_by(desc(FileProcessingStaging.created_at))
-            .limit(10)
+        )
+        if not membership.is_owner:
+            records_stmt = records_stmt.where(FileProcessingStaging.uploaded_by == user.id)
+
+        records = db.scalars(
+            records_stmt.order_by(desc(FileProcessingStaging.created_at)).limit(10)
         ).all()
 
         if not records:

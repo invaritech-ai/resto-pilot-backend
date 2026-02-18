@@ -14,6 +14,7 @@ import uuid
 from app.core.config import get_settings
 from app.services.context_service import ContextService
 from app.services.dedup_service import DedupService
+from app.services.restaurant_service import RestaurantService
 from app.services.user_service import UserService
 from app.telegram.handlers.onboarding import (
     handle as handle_onboarding,
@@ -137,7 +138,11 @@ def handle_telegram_update(update: dict) -> None:
         if session_id is None:
             session_id = _get_or_create_session(db, chat_id)
 
-        from app.telegram.bot_api import bind_current_session, bind_outgoing_db_logger
+        from app.telegram.bot_api import (
+            bind_current_session,
+            bind_outgoing_db_logger,
+            bind_outlet_badge,
+        )
         from app.services.telemetry import record_outgoing_message
 
         def _outgoing_db_logger(
@@ -196,9 +201,38 @@ def handle_telegram_update(update: dict) -> None:
         user_svc.update_last_interaction(user)
         db.commit()  # Commit user creation + dedup record before onboarding
 
+        outlet_badge_label: str | None = None
+        try:
+            from app.db.models.restaurant import Restaurant
+
+            ctx_probe = ContextService(db)
+            active_restaurant_id = ctx_probe.get_active_restaurant_id(user)
+            if active_restaurant_id and RestaurantService(db).user_membership_exists(
+                restaurant_id=active_restaurant_id,
+                user_id=user.id,
+            ):
+                active_restaurant = db.get(Restaurant, active_restaurant_id)
+                if active_restaurant is not None:
+                    outlet_badge_label = active_restaurant.name
+            if outlet_badge_label is None:
+                memberships = RestaurantService(db).list_for_user(user_id=user.id)
+                if len(memberships) == 1:
+                    outlet_badge_label = memberships[0][0].name
+        except Exception:
+            logger.exception(
+                "telegram_outlet_badge_resolve_failed user_id=%s",
+                user.id,
+            )
+        if not outlet_badge_label:
+            outlet_badge_label = "-"
+
         # Process the update. On any exception (including send_message failures),
         # delete the dedup record so Celery can retry and re-send the message.
-        with bind_current_session(session_id), bind_outgoing_db_logger(_outgoing_db_logger):
+        with (
+            bind_current_session(session_id),
+            bind_outgoing_db_logger(_outgoing_db_logger),
+            bind_outlet_badge(outlet_badge_label),
+        ):
             try:
                 if needs_onboarding(user):
                     ctx_svc = ContextService(db)
