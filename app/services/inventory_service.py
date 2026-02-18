@@ -16,8 +16,9 @@ Invariants:
     - Negative balances are permitted (returns, corrections). Not blocked, flagged in summary.
     - Quantities are NUMERIC(12,3) in display (decimal) space — not integer minor units.
 
-Callers own the commit. This service only flushes within the caller's transaction,
-EXCEPT record_transaction() which commits internally (atomicity requirement).
+Callers own the commit. This service only flushes within the caller's transaction.
+record_transaction() flushes (to get txn.id for the balance FK) but does not commit;
+the balance update runs atomically via INSERT ... ON CONFLICT DO UPDATE.
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ import uuid
 from dataclasses import dataclass
 
 from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from app.db.models.inventory_balances import InventoryBalance
@@ -134,14 +136,20 @@ class InventoryService:
     ) -> InventoryTransaction:
         """Insert ledger row + update balance within the caller's transaction.
 
+        Validates that item_id belongs to restaurant_id before writing.
+        Uses an atomic upsert (INSERT ... ON CONFLICT DO UPDATE) for the balance
+        row so concurrent first-writes cannot race on the unique constraint.
         Flushes to get txn.id for the balance FK, but does NOT commit.
-        Caller must commit after all related work is done (e.g., after a full
-        batch of line items in confirm_invoice).
+        Caller must commit after all related work is done.
 
         Args:
             txn_type: 'credit' or 'debit'
             quantity: Always positive. Sign determined by txn_type.
             source:   'invoice' or 'manual'
+
+        Raises:
+            ValueError: txn_type or quantity invalid, or item_id does not
+                        belong to restaurant_id.
 
         Returns:
             The newly created InventoryTransaction (not yet committed).
@@ -150,6 +158,18 @@ class InventoryService:
             raise ValueError(f"txn_type must be 'credit' or 'debit', got {txn_type!r}")
         if quantity <= 0:
             raise ValueError(f"quantity must be positive, got {quantity}")
+
+        # Ownership guard: reject cross-tenant writes at the service boundary.
+        item = self.session.scalar(
+            select(InventoryItem).where(
+                InventoryItem.id == item_id,
+                InventoryItem.restaurant_id == restaurant_id,
+            )
+        )
+        if item is None:
+            raise ValueError(
+                f"item_id {item_id} does not belong to restaurant {restaurant_id}"
+            )
 
         txn = InventoryTransaction(
             restaurant_id=restaurant_id,
@@ -169,27 +189,28 @@ class InventoryService:
         delta = float(quantity) if txn_type == "credit" else -float(quantity)
         now = dt.datetime.now(tz=dt.timezone.utc)
 
-        balance = self.session.scalar(
-            select(InventoryBalance)
-            .where(
-                InventoryBalance.restaurant_id == restaurant_id,
-                InventoryBalance.item_id == item_id,
-            )
-            .with_for_update()
-        )
-        if balance is not None:
-            balance.balance = float(balance.balance) + delta
-            balance.last_txn_id = txn.id
-            balance.updated_at = now
-        else:
-            balance = InventoryBalance(
+        # Atomic upsert: avoids the SELECT-then-INSERT race on the first write
+        # for a given (restaurant_id, item_id). ON CONFLICT DO UPDATE acquires
+        # a row lock on the conflicting row, so concurrent updates are safe too.
+        upsert_stmt = (
+            pg_insert(InventoryBalance)
+            .values(
                 restaurant_id=restaurant_id,
                 item_id=item_id,
                 balance=delta,
                 last_txn_id=txn.id,
                 updated_at=now,
             )
-            self.session.add(balance)
+            .on_conflict_do_update(
+                constraint="uq_inventory_balances_restaurant_item",
+                set_={
+                    "balance": InventoryBalance.balance + delta,
+                    "last_txn_id": txn.id,
+                    "updated_at": now,
+                },
+            )
+        )
+        self.session.execute(upsert_stmt)
 
         return txn
 
@@ -290,7 +311,10 @@ class InventoryService:
             raise ItemNotFoundError(f"InventoryItem {item_id} not found")
 
         balance = self.session.scalar(
-            select(InventoryBalance).where(InventoryBalance.item_id == item_id)
+            select(InventoryBalance).where(
+                InventoryBalance.item_id == item_id,
+                InventoryBalance.restaurant_id == item.restaurant_id,
+            )
         )
         last_txn: InventoryTransaction | None = None
         if balance and balance.last_txn_id:

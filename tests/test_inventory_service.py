@@ -113,20 +113,16 @@ class TestGetOrCreateItem:
 
 
 class TestRecordTransaction:
-    def _setup_new_balance(self, session: MagicMock) -> MagicMock:
-        """Configure session so no existing balance is found."""
+    def _setup(self, session: MagicMock) -> None:
+        """Configure session so ownership check passes."""
         session.flush = MagicMock()
         session.commit = MagicMock()
-        txn = _make_txn()
+        # scalar: ownership check → valid item in this restaurant
+        session.scalar.return_value = _make_item()
 
-        # scalar: first call for InventoryBalance → None (new balance)
-        session.scalar.return_value = None
-
-        return txn
-
-    def test_credit_creates_balance_when_none_exists(self):
+    def test_credit_creates_transaction_and_upserts_balance(self):
         session = _make_session()
-        self._setup_new_balance(session)
+        self._setup(session)
 
         svc = InventoryService(session)
         svc.record_transaction(
@@ -137,18 +133,17 @@ class TestRecordTransaction:
             created_by=USER_ID,
         )
 
-        # Two adds: txn + new balance
-        assert session.add.call_count == 2
+        # Only one add: the transaction (balance handled via execute/upsert)
+        assert session.add.call_count == 1
         txn_obj = session.add.call_args_list[0][0][0]
-        balance_obj = session.add.call_args_list[1][0][0]
         assert txn_obj.txn_type == "credit"
         assert float(txn_obj.quantity) == 5.0
-        assert float(balance_obj.balance) == 5.0
+        session.execute.assert_called_once()  # balance upsert
         session.commit.assert_not_called()
 
-    def test_debit_creates_negative_balance_when_none_exists(self):
+    def test_debit_creates_transaction_and_upserts_balance(self):
         session = _make_session()
-        self._setup_new_balance(session)
+        self._setup(session)
 
         svc = InventoryService(session)
         svc.record_transaction(
@@ -159,16 +154,16 @@ class TestRecordTransaction:
             created_by=USER_ID,
         )
 
-        balance_obj = session.add.call_args_list[1][0][0]
-        assert float(balance_obj.balance) == -3.0
+        assert session.add.call_count == 1
+        txn_obj = session.add.call_args_list[0][0][0]
+        assert txn_obj.txn_type == "debit"
+        assert float(txn_obj.quantity) == 3.0
+        session.execute.assert_called_once()
+        session.commit.assert_not_called()
 
-    def test_credit_increments_existing_balance(self):
+    def test_credit_executes_upsert(self):
         session = _make_session()
-        session.flush = MagicMock()
-        session.commit = MagicMock()
-
-        existing_balance = _make_balance(balance_val=10.0)
-        session.scalar.return_value = existing_balance
+        self._setup(session)
 
         svc = InventoryService(session)
         svc.record_transaction(
@@ -179,16 +174,13 @@ class TestRecordTransaction:
             created_by=USER_ID,
         )
 
-        assert float(existing_balance.balance) == 15.0
+        # Balance is written atomically via upsert, not via session.add
+        session.execute.assert_called_once()
         session.commit.assert_not_called()
 
-    def test_debit_decrements_existing_balance(self):
+    def test_debit_executes_upsert(self):
         session = _make_session()
-        session.flush = MagicMock()
-        session.commit = MagicMock()
-
-        existing_balance = _make_balance(balance_val=10.0)
-        session.scalar.return_value = existing_balance
+        self._setup(session)
 
         svc = InventoryService(session)
         svc.record_transaction(
@@ -199,26 +191,45 @@ class TestRecordTransaction:
             created_by=USER_ID,
         )
 
-        assert float(existing_balance.balance) == 6.0
+        session.execute.assert_called_once()
+        session.commit.assert_not_called()
 
-    def test_debit_allows_negative_balance(self):
+    def test_debit_does_not_block_on_negative_result(self):
+        """Service never blocks negative balances — that is a read-layer concern."""
         session = _make_session()
-        session.flush = MagicMock()
-        session.commit = MagicMock()
-
-        existing_balance = _make_balance(balance_val=2.0)
-        session.scalar.return_value = existing_balance
+        self._setup(session)
 
         svc = InventoryService(session)
+        # Should not raise even with a quantity larger than any conceivable stock
         svc.record_transaction(
             restaurant_id=RESTAURANT_ID,
             item_id=ITEM_ID,
             txn_type="debit",
-            quantity=5.0,
+            quantity=9999.0,
             created_by=USER_ID,
         )
 
-        assert float(existing_balance.balance) == -3.0
+        session.execute.assert_called_once()
+
+    def test_cross_tenant_item_rejected(self):
+        """item_id that does not belong to restaurant_id must raise ValueError."""
+        session = _make_session()
+        session.flush = MagicMock()
+        # Ownership check: item not found for this restaurant
+        session.scalar.return_value = None
+
+        svc = InventoryService(session)
+        with pytest.raises(ValueError, match="does not belong to restaurant"):
+            svc.record_transaction(
+                restaurant_id=RESTAURANT_ID,
+                item_id=ITEM_ID,
+                txn_type="credit",
+                quantity=5.0,
+                created_by=USER_ID,
+            )
+
+        session.add.assert_not_called()
+        session.execute.assert_not_called()
 
     def test_invalid_txn_type_raises(self):
         session = _make_session()
@@ -263,7 +274,7 @@ class TestRecordTransaction:
         session = _make_session()
         session.flush = MagicMock()
         session.commit = MagicMock()
-        session.scalar.return_value = None
+        session.scalar.return_value = _make_item()  # ownership check passes
 
         staging_id = uuid.uuid4()
 
@@ -468,8 +479,8 @@ class TestConfirmInvoice:
         session = _make_session()
         session.flush = MagicMock()
         session.commit = MagicMock()
-        # scalar returns None → new balance created each time
-        session.scalar.return_value = None
+        # scalar returns valid item → ownership check passes for each line item
+        session.scalar.return_value = _make_item()
         return session
 
     def test_credits_all_resolved_items(self):
@@ -496,8 +507,9 @@ class TestConfirmInvoice:
         )
 
         assert count == 2
-        # Each record_transaction adds 2 objects (txn + balance) → 4 total
-        assert session.add.call_count == 4
+        # Each record_transaction adds 1 txn (balance via execute); 2 items → 2 adds
+        assert session.add.call_count == 2
+        assert session.execute.call_count == 2  # one upsert per item
         session.commit.assert_not_called()  # caller owns commit
 
     def test_skips_items_mapped_to_none(self):
@@ -523,8 +535,9 @@ class TestConfirmInvoice:
         )
 
         assert count == 1
-        # Only one record_transaction called → 2 adds (txn + balance)
-        assert session.add.call_count == 2
+        # Only one record_transaction → 1 add (txn only, balance via execute)
+        assert session.add.call_count == 1
+        assert session.execute.call_count == 1
 
     def test_returns_zero_when_all_skipped(self):
         session = self._make_session_for_confirm()
