@@ -23,7 +23,7 @@ import uuid
 from app.core.config import get_settings
 from app.db.models.file_processing_staging import FileProcessingStaging
 from app.db.models.user import User
-from app.llm.item_parser import ParseError, parse_invoice, parse_price_list
+from app.llm.item_parser import ParseError, ocr_page_to_markdown, parse_invoice, parse_price_list
 from app.services.context_service import ContextService
 from app.services.staging_service import StagingService
 from app.services.supplier_service import SupplierService
@@ -171,7 +171,7 @@ def _extract(file_bytes: bytes, mime: str, document_type: str, settings) -> dict
     is_pdf = "pdf" in mime.lower()
     if is_pdf:
         return _extract_pdf(file_bytes, document_type, settings)
-    return _extract_image(file_bytes, mime, document_type, settings)
+    return _extract_image(file_bytes, document_type, settings)
 
 
 def _extract_pdf(file_bytes: bytes, document_type: str, settings) -> dict:
@@ -197,16 +197,16 @@ def _extract_pdf(file_bytes: bytes, document_type: str, settings) -> dict:
     try:
         import camelot
 
-        tables = camelot.read_pdf(
-            io.BytesIO(file_bytes), pages="all", flavor="lattice"
-        )
+        tables = camelot.read_pdf(  # type: ignore[attr-defined]
+                io.BytesIO(file_bytes), pages="all", flavor="lattice"
+            )
         for i, tbl in enumerate(tables):
             table_parts.append(f"[Table {i + 1}]\n{tbl.df.to_string()}")
     except Exception:
         try:
             import camelot
 
-            tables = camelot.read_pdf(
+            tables = camelot.read_pdf(  # type: ignore[attr-defined]
                 io.BytesIO(file_bytes), pages="all", flavor="stream"
             )
             for i, tbl in enumerate(tables):
@@ -245,8 +245,18 @@ def _extract_pdf(file_bytes: bytes, document_type: str, settings) -> dict:
     return result
 
 
+def _resize_for_ocr(img, max_side: int = 4000):
+    """Resize a PIL image so its larger side equals max_side (no upscaling)."""
+    from PIL import Image as PILImage
+    w, h = img.size
+    scale = max_side / max(w, h)
+    if scale >= 1:
+        return img
+    return img.resize((int(w * scale), int(h * scale)), PILImage.Resampling.LANCZOS)
+
+
 def _extract_pdf_vision(file_bytes: bytes, document_type: str, settings) -> dict:
-    """Convert PDF pages to images and parse via vision model."""
+    """Convert PDF pages to images and parse via two-stage OCR → parse."""
     try:
         from pdf2image import convert_from_bytes
     except ImportError:
@@ -264,14 +274,15 @@ def _extract_pdf_vision(file_bytes: bytes, document_type: str, settings) -> dict
 
     for chunk_start in range(0, len(images), chunk_size):
         batch = images[chunk_start : chunk_start + chunk_size]
-        # Use first image of each batch for now (simplest, avoids multi-image API variance)
-        img = batch[0]
+        # Use first image of each batch; resize before OCR
+        img = _resize_for_ocr(batch[0])
         buf = io.BytesIO()
         img.save(buf, format="JPEG")
         b64 = base64.b64encode(buf.getvalue()).decode()
 
         try:
-            chunk_result = parse_fn(settings, image_b64=b64, image_mime="image/jpeg")
+            markdown = ocr_page_to_markdown(settings, b64, image_mime="image/jpeg")
+            chunk_result = parse_fn(settings, text=markdown)
         except ParseError:
             continue
 
@@ -290,12 +301,24 @@ def _extract_pdf_vision(file_bytes: bytes, document_type: str, settings) -> dict
     return header
 
 
-def _extract_image(file_bytes: bytes, mime: str, document_type: str, settings) -> dict:
-    """Image: base64-encode and call vision model."""
-    b64 = base64.b64encode(file_bytes).decode()
-    image_mime = mime if mime.startswith("image/") else "image/jpeg"
+def _extract_image(file_bytes: bytes, document_type: str, settings) -> dict:
+    """Image: resize to 4000px max side → OCR markdown → JSON parse."""
+    try:
+        from PIL import Image as PILImage
+    except ImportError:
+        raise ParseError("Pillow not installed")
+
+    img = PILImage.open(io.BytesIO(file_bytes))
+    img = _resize_for_ocr(img)
+
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG")
+    b64 = base64.b64encode(buf.getvalue()).decode()
+
+    markdown = ocr_page_to_markdown(settings, b64, image_mime="image/jpeg")
+
     parse_fn = parse_invoice if document_type == "invoice" else parse_price_list
-    return parse_fn(settings, image_b64=b64, image_mime=image_mime)
+    return parse_fn(settings, text=markdown)
 
 
 # ---------------------------------------------------------------------------

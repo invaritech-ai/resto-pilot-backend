@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from app.llm.item_parser import ParseError, parse_invoice, parse_price_list
+from app.llm.item_parser import ParseError, ocr_page_to_markdown, parse_invoice, parse_price_list
 
 
 # ---------------------------------------------------------------------------
@@ -27,6 +27,9 @@ def _make_settings(
     openai_model: str = "gpt-4o",
     openai_timeout_seconds: float = 30.0,
     openai_max_retries: int = 2,
+    parser_model: str = "",
+    parser_api_key: str = "",
+    parser_base_url: str = "",
 ) -> MagicMock:
     s = MagicMock()
     s.vision_api_key = vision_api_key
@@ -37,6 +40,9 @@ def _make_settings(
     s.openai_model = openai_model
     s.openai_timeout_seconds = openai_timeout_seconds
     s.openai_max_retries = openai_max_retries
+    s.parser_model = parser_model
+    s.parser_api_key = parser_api_key
+    s.parser_base_url = parser_base_url
     return s
 
 
@@ -212,16 +218,6 @@ class TestParseInvoiceText:
         assert len(result["line_items"]) == 1
         assert result["line_items"][0]["name"] == "Tomato"
 
-    def test_raises_value_error_when_both_inputs_given(self):
-        settings = _make_settings()
-        with pytest.raises(ValueError, match="not both"):
-            parse_invoice(settings, text="some text", image_b64="abc123")
-
-    def test_raises_value_error_when_no_inputs_given(self):
-        settings = _make_settings()
-        with pytest.raises(ValueError):
-            parse_invoice(settings)
-
     def test_raises_parse_error_on_llm_exception(self):
         settings = _make_settings()
         with patch("app.llm.item_parser.OpenAI") as MockOpenAI:
@@ -340,51 +336,78 @@ class TestParsePriceListText:
 
 
 # ---------------------------------------------------------------------------
-# Image input
+# ocr_page_to_markdown — stage 1 vision OCR
 # ---------------------------------------------------------------------------
 
 
-class TestImageInput:
-    def test_parse_invoice_with_image(self):
+class TestOcrPageToMarkdown:
+    def test_returns_markdown_string(self):
         settings = _make_settings()
+        with patch("app.llm.item_parser.OpenAI") as MockOpenAI:
+            client = MockOpenAI.return_value
+            client.chat.completions.create.return_value = _mock_llm_response(
+                "## Invoice\n| Item | Price |\n|------|-------|\n| Chicken | 45.00 |"
+            )
+            result = ocr_page_to_markdown(settings, image_b64="base64data==")
+
+        assert isinstance(result, str)
+        assert "Chicken" in result
+
+    def test_sends_image_url_content(self):
+        """Vision call should include an image_url content block."""
+        settings = _make_settings()
+        with patch("app.llm.item_parser.OpenAI") as MockOpenAI:
+            client = MockOpenAI.return_value
+            client.chat.completions.create.return_value = _mock_llm_response("markdown")
+            ocr_page_to_markdown(settings, image_b64="abc==", image_mime="image/png")
+
+        call_args = client.chat.completions.create.call_args
+        messages = call_args.kwargs.get("messages") or call_args[0][0]
+        content = messages[0]["content"]
+        assert isinstance(content, list)
+        types = [p["type"] for p in content]
+        assert "image_url" in types
+        image_part = next(p for p in content if p["type"] == "image_url")
+        assert "image/png" in image_part["image_url"]["url"]
+
+    def test_raises_parse_error_on_llm_failure(self):
+        settings = _make_settings()
+        with patch("app.llm.item_parser.OpenAI") as MockOpenAI:
+            client = MockOpenAI.return_value
+            client.chat.completions.create.side_effect = RuntimeError("timeout")
+            with pytest.raises(ParseError, match="OCR LLM call failed"):
+                ocr_page_to_markdown(settings, image_b64="abc==")
+
+    def test_uses_vision_model(self):
+        settings = _make_settings(vision_model="gemini-2.0-flash")
+        with patch("app.llm.item_parser.OpenAI") as MockOpenAI:
+            client = MockOpenAI.return_value
+            client.chat.completions.create.return_value = _mock_llm_response("text")
+            ocr_page_to_markdown(settings, image_b64="abc==")
+
+        call_args = client.chat.completions.create.call_args
+        model = call_args.kwargs.get("model") or call_args[0][0]
+        assert model == "gemini-2.0-flash"
+
+    def test_parser_uses_separate_model(self):
+        """parse_invoice stage 2 should use parser_model, not vision_model."""
+        settings = _make_settings(
+            vision_model="expensive-vision-model",
+            parser_model="cheap-text-model",
+        )
         with patch("app.llm.item_parser.OpenAI") as MockOpenAI:
             client = MockOpenAI.return_value
             client.chat.completions.create.return_value = _mock_llm_response(
                 json.dumps(_INVOICE_PAYLOAD)
             )
-            result = parse_invoice(
-                settings, image_b64="base64encodeddata==", image_mime="image/jpeg"
-            )
+            parse_invoice(settings, text="invoice text")
 
-        assert result["supplier"] == "ACME Foods"
-        # Verify message content was a list (image format)
         call_args = client.chat.completions.create.call_args
-        messages = call_args.kwargs.get("messages") or call_args[1].get("messages") or call_args[0][1]
-        content = messages[0]["content"]
-        assert isinstance(content, list), "Image input should send list content"
-        types = [part["type"] for part in content]
-        assert "image_url" in types
+        model = call_args.kwargs.get("model") or call_args[0][0]
+        assert model == "cheap-text-model"
 
-    def test_parse_price_list_with_image(self):
-        settings = _make_settings()
-        with patch("app.llm.item_parser.OpenAI") as MockOpenAI:
-            client = MockOpenAI.return_value
-            client.chat.completions.create.return_value = _mock_llm_response(
-                json.dumps(_PRICE_LIST_PAYLOAD)
-            )
-            result = parse_price_list(
-                settings, image_b64="base64encodeddata==", image_mime="image/png"
-            )
-
-        assert result["supplier"] == "Fresh Farms"
-        # Verify image_url includes correct mime
-        call_args = client.chat.completions.create.call_args
-        messages = call_args.kwargs.get("messages") or call_args[0][1]
-        content = messages[0]["content"]
-        image_part = next(p for p in content if p["type"] == "image_url")
-        assert "image/png" in image_part["image_url"]["url"]
-
-    def test_text_input_sends_string_content(self):
+    def test_parser_text_in_user_message(self):
+        """Text content should appear in the user message (not system)."""
         settings = _make_settings()
         with patch("app.llm.item_parser.OpenAI") as MockOpenAI:
             client = MockOpenAI.return_value
@@ -394,10 +417,9 @@ class TestImageInput:
             parse_invoice(settings, text="Raw invoice text")
 
         call_args = client.chat.completions.create.call_args
-        messages = call_args.kwargs.get("messages") or call_args[0][1]
-        content = messages[0]["content"]
-        assert isinstance(content, str), "Text input should send string content"
-        assert "Raw invoice text" in content
+        messages = call_args.kwargs.get("messages") or call_args[0][0]
+        user_msg = next(m for m in messages if m["role"] == "user")
+        assert "Raw invoice text" in user_msg["content"]
 
 
 # ---------------------------------------------------------------------------

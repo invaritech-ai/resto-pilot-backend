@@ -64,11 +64,16 @@ class Settings(BaseSettings):
     openrouter_http_referer: str = ""
     openrouter_title: str = ""
 
-    # Vision model configuration for file processing
-    vision_model: str = ""  # Model name, e.g., "gpt-4-vision-preview"
+    # Vision model configuration for file processing (stage 1: image → markdown OCR)
+    vision_model: str = ""  # Model name, e.g., "gemini-2.0-flash"
     vision_api_key: str = ""  # Optional, defaults to openai_api_key if empty
     vision_base_url: str = ""  # Optional, defaults to openai_base_url if empty
     vision_pdf_chunk_size: int = 3
+
+    # Parser model configuration (stage 2: markdown → JSON extraction, cheaper model)
+    parser_model: str = ""       # Defaults to openai_model if empty
+    parser_api_key: str = ""     # Defaults to openai_api_key if empty
+    parser_base_url: str = ""    # Defaults to openai_base_url if empty
 
     # Google Document AI - Premium OCR for invoices
     use_google_vision_ocr: bool = False  # Enable Google Document AI (reusing this flag)
