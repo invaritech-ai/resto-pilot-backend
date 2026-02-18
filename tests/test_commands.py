@@ -510,7 +510,6 @@ class TestOutletsCommand:
         text = mock_send.call_args[1]["text"]
         assert "✅" in text
         assert "The Blue Bistro" in text
-        assert "active" in text
 
     def test_outlets_multiple_restaurants_active_marked(self):
         user = _make_user(RESTAURANT_ID)
@@ -536,41 +535,6 @@ class TestOutletsCommand:
         # Only one ✅
         assert text.count("✅") == 1
 
-    def test_outlets_multiple_shows_switch_hint(self):
-        user = _make_user(RESTAURANT_ID)
-        ctx_svc = _make_ctx_svc(user)
-        db = _make_db()
-
-        r1 = _mock_restaurant("R1", RESTAURANT_ID)
-        r2 = _mock_restaurant("R2", RESTAURANT_ID_2)
-
-        with patch("app.telegram.handlers.commands.RestaurantService") as MockSvc, \
-             patch("app.telegram.handlers.commands.send_message") as mock_send:
-            MockSvc.return_value.user_membership_exists.return_value = True
-            MockSvc.return_value.list_for_user.return_value = [
-                (r1, _mock_membership()),
-                (r2, _mock_membership()),
-            ]
-            handle(_make_update("/outlets"), user, db, ctx_svc, _make_settings())
-
-        text = mock_send.call_args[1]["text"]
-        assert "Reply #N" in text
-
-    def test_outlets_single_no_switch_hint(self):
-        user = _make_user(RESTAURANT_ID)
-        ctx_svc = _make_ctx_svc(user)
-        db = _make_db()
-
-        r1 = _mock_restaurant("Only Restaurant", RESTAURANT_ID)
-
-        with patch("app.telegram.handlers.commands.RestaurantService") as MockSvc, \
-             patch("app.telegram.handlers.commands.send_message") as mock_send:
-            MockSvc.return_value.user_membership_exists.return_value = True
-            MockSvc.return_value.list_for_user.return_value = [(r1, _mock_membership())]
-            handle(_make_update("/outlets"), user, db, ctx_svc, _make_settings())
-
-        text = mock_send.call_args[1]["text"]
-        assert "Reply #N" not in text
 
 
 # ---------------------------------------------------------------------------

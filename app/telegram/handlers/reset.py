@@ -24,7 +24,7 @@ MAIN_MENU_TEXT = """👋 What would you like to do?
 /list suppliers
 /add supplier
 /uploads
-/switch — change restaurant"""
+/help — all commands"""
 
 
 def handle(

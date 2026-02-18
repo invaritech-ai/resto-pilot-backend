@@ -6,13 +6,12 @@ Commands:
     /list suppliers    — list this restaurant's linked suppliers
     /add supplier      — create a new supplier (search global + create if not found)
     /link supplier     — link an existing global supplier to restaurant
-    /outlets           — Your restaurants
+    /outlets           — Your restaurant
     /products          — Supplier product catalog
     /prices <name>     — Prices from a supplier
     /inventory         — Stock levels
     /balance           — Stock summary
     /uploads           — list pending staging records
-    /switch            — change active restaurant
     /help              — show available commands
 """
 
@@ -41,13 +40,12 @@ HELP_TEXT = """Available commands:
 /list suppliers    — Show your linked suppliers
 /add supplier <name> — Add a new supplier
 /link supplier <name> — Link an existing supplier
-/outlets           — Your restaurants
+/outlets           — Your restaurant
 /products          — Supplier product catalog
 /prices <name>     — Prices from a supplier
 /inventory         — Stock levels
 /balance           — Stock summary
 /uploads           — Pending uploads
-/switch            — Switch restaurant
 /help              — Show this message"""
 
 
@@ -60,7 +58,7 @@ def _require_active_restaurant(
     """Return active_restaurant_id or None if not set.
 
     If user has no active restaurant but has exactly one restaurant,
-    auto-set it. Otherwise, prompt /switch.
+    auto-set it. Otherwise return None (caller shows setup prompt).
 
     Membership is always verified against the database before returning an ID
     so that a corrupted or tampered context cannot grant access to a restaurant
@@ -111,7 +109,6 @@ def _parse_command(text: str) -> tuple[str, str]:
         (r"^/add supplier\b", "add supplier"),
         (r"^/link supplier\b", "link supplier"),
         (r"^/uploads\b", "uploads"),
-        (r"^/switch\b", "switch"),
         (r"^/help\b", "help"),
         (r"^/start\b", "start"),
     ]
@@ -200,7 +197,7 @@ def handle(
         if restaurant_id is None:
             send_message(
                 chat_id=chat_id,
-                text="No active restaurant. Use /switch to select one.",
+                text="No active restaurant. Send /start to complete setup.",
                 settings=settings,
             )
             return
@@ -247,20 +244,11 @@ def handle(
             return
 
         active_id = ctx_svc.get_active_restaurant_id(user)
-        ctx_svc.set_numbered_items(user, [r.id for r, _ in restaurants])
-        ctx_svc.set_list_state(user, "restaurants", 0)
-        ctx_svc.set_fields(user, pending_action="switch_restaurant")
-        db.commit()
 
-        lines = ["🏪 Your Restaurants\n"]
-        for i, (r, _) in enumerate(restaurants, 1):
-            if r.id == active_id:
-                lines.append(f"{i}. ✅ {r.name} (active)")
-            else:
-                lines.append(f"{i}. {r.name}")
-
-        if len(restaurants) > 1:
-            lines.append("\nReply #N to switch.")
+        lines = ["🏪 Your Restaurant\n"]
+        for r, _ in restaurants:
+            marker = "✅ " if r.id == active_id else ""
+            lines.append(f"{marker}{r.name}")
 
         send_message(chat_id=chat_id, text="\n".join(lines), settings=settings)
         return
@@ -271,7 +259,7 @@ def handle(
         if restaurant_id is None:
             send_message(
                 chat_id=chat_id,
-                text="No active restaurant. Use /switch to select one.",
+                text="No active restaurant. Send /start to complete setup.",
                 settings=settings,
             )
             return
@@ -317,7 +305,7 @@ def handle(
         if restaurant_id is None:
             send_message(
                 chat_id=chat_id,
-                text="No active restaurant. Use /switch to select one.",
+                text="No active restaurant. Send /start to complete setup.",
                 settings=settings,
             )
             return
@@ -385,7 +373,7 @@ def handle(
         if restaurant_id is None:
             send_message(
                 chat_id=chat_id,
-                text="No active restaurant. Use /switch to select one.",
+                text="No active restaurant. Send /start to complete setup.",
                 settings=settings,
             )
             return
@@ -403,7 +391,7 @@ def handle(
         if restaurant_id is None:
             send_message(
                 chat_id=chat_id,
-                text="No active restaurant. Use /switch to select one.",
+                text="No active restaurant. Send /start to complete setup.",
                 settings=settings,
             )
             return
@@ -421,7 +409,7 @@ def handle(
         if restaurant_id is None:
             send_message(
                 chat_id=chat_id,
-                text="No active restaurant. Use /switch to select one.",
+                text="No active restaurant. Send /start to complete setup.",
                 settings=settings,
             )
             return
@@ -456,7 +444,7 @@ def handle(
         if restaurant_id is None:
             send_message(
                 chat_id=chat_id,
-                text="No active restaurant. Use /switch to select one.",
+                text="No active restaurant. Send /start to complete setup.",
                 settings=settings,
             )
             return
@@ -518,7 +506,7 @@ def handle(
         if restaurant_id is None:
             send_message(
                 chat_id=chat_id,
-                text="No active restaurant. Use /switch to select one.",
+                text="No active restaurant. Send /start to complete setup.",
                 settings=settings,
             )
             return
@@ -563,42 +551,6 @@ def handle(
             text="No pending uploads.",
             settings=settings,
         )
-        return
-
-    # --- /switch ---
-    if command == "switch":
-        restaurants = RestaurantService(db).list_for_user(user_id=user.id)
-
-        if not restaurants:
-            send_message(
-                chat_id=chat_id,
-                text="You don't have any restaurants yet.",
-                settings=settings,
-            )
-            return
-
-        if len(restaurants) == 1:
-            restaurant, _ = restaurants[0]
-            ctx_svc.set_active_restaurant(user, restaurant.id)
-            db.commit()
-            send_message(
-                chat_id=chat_id,
-                text=f"Active restaurant: {restaurant.name}",
-                settings=settings,
-            )
-            return
-
-        lines = ["🔄 **Select restaurant:**\n"]
-        for i, (r, _) in enumerate(restaurants, 1):
-            lines.append(f"{i}. {r.name}")
-
-        lines.append("\nReply with the number to select.")
-
-        ctx_svc.set_numbered_items(user, [r.id for r, _ in restaurants])
-        ctx_svc.set_fields(user, pending_action="switch_restaurant")
-        db.commit()
-
-        send_message(chat_id=chat_id, text="\n".join(lines), settings=settings)
         return
 
     # Unknown command

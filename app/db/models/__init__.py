@@ -11,6 +11,9 @@ from app.db.models.supplier_price_lists import SupplierPriceList
 from app.db.models.supplier_prices import SupplierPrice
 from app.db.models.file_processing_staging import FileProcessingStaging
 from app.db.models.handshake_requests import HandshakeRequest
+from app.db.models.inventory_items import InventoryItem
+from app.db.models.inventory_transactions import InventoryTransaction
+from app.db.models.inventory_balances import InventoryBalance
 
 __all__ = [
     "User",
@@ -26,4 +29,7 @@ __all__ = [
     "SupplierPrice",
     "FileProcessingStaging",
     "HandshakeRequest",
+    "InventoryItem",
+    "InventoryTransaction",
+    "InventoryBalance",
 ]

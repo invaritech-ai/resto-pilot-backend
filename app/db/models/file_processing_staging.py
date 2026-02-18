@@ -41,6 +41,7 @@ class FileProcessingStaging(Base):
     status: Mapped[str] = mapped_column(
         staging_status_enum, nullable=False, server_default="processing"
     )
+    document_type: Mapped[str | None] = mapped_column(String, nullable=True)  # 'invoice' | 'price_list'
     extracted_data_json: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(
