@@ -14,6 +14,9 @@ from app.db.models.handshake_requests import HandshakeRequest
 from app.db.models.inventory_items import InventoryItem
 from app.db.models.inventory_transactions import InventoryTransaction
 from app.db.models.inventory_balances import InventoryBalance
+from app.db.models.inventory_par_levels import InventoryParLevel
+from app.db.models.purchase_orders import PurchaseOrder
+from app.db.models.purchase_order_items import PurchaseOrderItem
 
 __all__ = [
     "User",
@@ -32,4 +35,7 @@ __all__ = [
     "InventoryItem",
     "InventoryTransaction",
     "InventoryBalance",
+    "InventoryParLevel",
+    "PurchaseOrder",
+    "PurchaseOrderItem",
 ]
