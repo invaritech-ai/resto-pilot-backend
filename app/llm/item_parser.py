@@ -47,6 +47,7 @@ LlmCallCallback = Callable[[dict[str, object]], None]
 
 class ParseError(Exception):
     """Raised when LLM output cannot be parsed or validated."""
+
     pass
 
 
@@ -116,6 +117,7 @@ Rules:
 # Public API
 # ---------------------------------------------------------------------------
 
+
 def ocr_page_to_markdown(
     settings: Settings,
     image_b64: str,
@@ -143,16 +145,20 @@ def ocr_page_to_markdown(
     try:
         response = client.chat.completions.create(
             model=model,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:{image_mime};base64,{image_b64}"},
-                    },
-                    {"type": "text", "text": OCR_PROMPT},
-                ],
-            }],
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{image_mime};base64,{image_b64}"
+                            },
+                        },
+                        {"type": "text", "text": OCR_PROMPT},
+                    ],
+                }
+            ],
             temperature=0.0,
         )
     except Exception as exc:
@@ -228,6 +234,83 @@ def parse_price_list(
     )
 
 
+# _NL_QUERY_SYSTEM = """\
+# You are a concise, practical restaurant ops assistant.
+# Help staff check inventory, suppliers, and stock — no small talk.
+
+# The user has sent a message. Classify it:
+# - route_command: user wants a list/view that maps to an existing bot command
+# - answer: user is asking a factual question you can answer from the CONTEXT below
+# - unknown: cannot be interpreted as a restaurant data query
+
+# Routable commands:
+#   /list suppliers   — all linked suppliers
+#   /products         — supplier product catalog
+#   /inventory        — stock levels (all items)
+#   /balance          — stock summary (totals, zero-stock, negative)
+#   /uploads          — pending upload reviews
+
+# Return ONLY valid JSON — no markdown, no explanation:
+# {{
+#   "action": "route_command" | "answer" | "unknown",
+#   "command": "/inventory" | "/products" | "/balance" | "/list suppliers" | "/uploads" (only when action=route_command),
+#   "answer": "your response" (only when action=answer)
+# }}
+
+# Rules for "answer":
+# - Use ONLY the data in CONTEXT. Never invent numbers, names, or prices.
+# - If context data is missing/zero, say so and suggest the relevant command.
+# - Keep answers under 3 sentences.
+# - If unsure between route_command and answer, prefer route_command.
+
+# CONTEXT:
+# {context}
+# """
+
+_NL_QUERY_SYSTEM = """\
+You are a cheerful anime-style Japanese chef assistant (adult), quick, upbeat, and concise.
+Tone: playful kitchen energy, friendly, no romance, no flirting, no roleplay beyond light style.
+
+You are READ-ONLY.
+You must never assist with write/mutate actions (add, edit, delete, approve, cancel, upload, \
+confirm, link, unlink, adjust stock).
+If user requests a write action, return:
+{{
+  "action": "answer",
+  "answer": "I can only help with read-only queries right now. Try /inventory, /products, /balance, /list suppliers, or /uploads."
+}}
+
+Classify user input as:
+- route_command (read-only list/view commands only)
+- answer (factual answer from context only)
+- unknown
+
+Allowed route commands:
+  /list suppliers   — all linked suppliers
+  /products         — supplier product catalog
+  /inventory        — stock levels (all items)
+  /balance          — stock summary (totals, zero-stock, negative)
+  /uploads          — pending upload reviews
+
+Return ONLY valid JSON — no markdown, no explanation:
+{{
+  "action": "route_command" | "answer" | "unknown",
+  "command": "/inventory" | "/products" | "/balance" | "/list suppliers" | "/uploads" \
+(only when action=route_command),
+  "answer": "your response" (only when action=answer)
+}}
+
+Rules for "answer":
+- Use ONLY the data in CONTEXT. Never invent numbers, names, or prices.
+- If context data is missing/zero, say so and suggest the relevant command.
+- Keep answers under 3 sentences.
+- If unsure between route_command and answer, prefer route_command.
+
+CONTEXT:
+{context}
+"""
+
+
 _STOCK_ADJUSTMENT_SYSTEM = (
     "You parse natural language inventory adjustment messages from restaurant staff.\n"
     "Extract and return ONLY valid JSON with these fields:\n"
@@ -235,15 +318,15 @@ _STOCK_ADJUSTMENT_SYSTEM = (
     "  quantity   (number)  — a positive number (always positive, direction handled separately)\n"
     "  unit       (string|null) — unit like kg, g, L, pkt, box, etc.; null if not mentioned\n"
     "  direction  (string|null) — 'in' if received/added/left on hand, 'out' if used/consumed/sold/removed; null if ambiguous\n"
-    "If the message is NOT an inventory adjustment, return: {\"error\": \"not_stock_adjustment\"}\n"
+    'If the message is NOT an inventory adjustment, return: {"error": "not_stock_adjustment"}\n'
     "Examples:\n"
-    "  'got 5kg chicken' → {\"item_name\":\"chicken\",\"quantity\":5,\"unit\":\"kg\",\"direction\":\"in\"}\n"
-    "  'used 2.5 kg beef' → {\"item_name\":\"beef\",\"quantity\":2.5,\"unit\":\"kg\",\"direction\":\"out\"}\n"
-    "  '+3 boxes milk' → {\"item_name\":\"milk\",\"quantity\":3,\"unit\":\"boxes\",\"direction\":\"in\"}\n"
-    "  '-500g butter' → {\"item_name\":\"butter\",\"quantity\":500,\"unit\":\"g\",\"direction\":\"out\"}\n"
-    "  'onion 1kg' → {\"item_name\":\"onion\",\"quantity\":1,\"unit\":\"kg\",\"direction\":null}\n"
-    "  '1kg onion left' → {\"item_name\":\"onion\",\"quantity\":1,\"unit\":\"kg\",\"direction\":\"in\"}\n"
-    "  'hello' → {\"error\":\"not_stock_adjustment\"}\n"
+    '  \'got 5kg chicken\' → {"item_name":"chicken","quantity":5,"unit":"kg","direction":"in"}\n'
+    '  \'used 2.5 kg beef\' → {"item_name":"beef","quantity":2.5,"unit":"kg","direction":"out"}\n'
+    '  \'+3 boxes milk\' → {"item_name":"milk","quantity":3,"unit":"boxes","direction":"in"}\n'
+    '  \'-500g butter\' → {"item_name":"butter","quantity":500,"unit":"g","direction":"out"}\n'
+    '  \'onion 1kg\' → {"item_name":"onion","quantity":1,"unit":"kg","direction":null}\n'
+    '  \'1kg onion left\' → {"item_name":"onion","quantity":1,"unit":"kg","direction":"in"}\n'
+    '  \'hello\' → {"error":"not_stock_adjustment"}\n'
     "Return ONLY the JSON object, no markdown, no explanation."
 )
 
@@ -263,12 +346,12 @@ def parse_stock_adjustment(
         ParseError: text is not a stock adjustment or LLM returned bad output.
     """
     client = OpenAI(
-        api_key=settings.parser_api_key or settings.openai_api_key,
-        base_url=settings.parser_base_url or settings.openai_base_url,
+        api_key=settings.chat_api_key or settings.openai_api_key,
+        base_url=settings.chat_base_url or settings.openai_base_url,
         timeout=settings.openai_timeout_seconds,
         max_retries=settings.openai_max_retries,
     )
-    model = settings.parser_model or settings.openai_model
+    model = settings.chat_model or settings.openai_model
 
     t0 = time.monotonic()
     try:
@@ -284,20 +367,32 @@ def parse_stock_adjustment(
         latency_ms = int((time.monotonic() - t0) * 1000)
         _emit_llm_call(
             on_llm_call=on_llm_call,
-            payload={"purpose": "stock_adjustment", "model": model, "latency_ms": latency_ms, "error": str(exc)},
+            payload={
+                "purpose": "stock_adjustment",
+                "model": model,
+                "latency_ms": latency_ms,
+                "error": str(exc),
+            },
         )
         raise ParseError(f"LLM call failed: {exc}") from exc
 
     latency_ms = int((time.monotonic() - t0) * 1000)
     _emit_llm_call(
         on_llm_call=on_llm_call,
-        payload={"purpose": "stock_adjustment", "model": model, "latency_ms": latency_ms, **_extract_response_meta(response)},
+        payload={
+            "purpose": "stock_adjustment",
+            "model": model,
+            "latency_ms": latency_ms,
+            **_extract_response_meta(response),
+        },
     )
 
     raw = (response.choices[0].message.content or "").strip()
     if raw.startswith("```"):
         lines = raw.splitlines()
-        raw = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:]).strip()
+        raw = "\n".join(
+            lines[1:-1] if lines[-1].strip() == "```" else lines[1:]
+        ).strip()
 
     try:
         parsed = json.loads(raw)
@@ -320,12 +415,101 @@ def parse_stock_adjustment(
     direction_raw = parsed.get("direction")
     direction = str(direction_raw) if direction_raw in ("in", "out") else None
 
-    return {"item_name": item_name, "quantity": quantity, "unit": unit, "direction": direction}
+    return {
+        "item_name": item_name,
+        "quantity": quantity,
+        "unit": unit,
+        "direction": direction,
+    }
+
+
+def classify_and_answer(
+    settings: Settings,
+    text: str,
+    context_snippet: str,
+    on_llm_call: LlmCallCallback | None = None,
+) -> dict:
+    """Classify user intent and optionally answer from injected context.
+
+    Returns:
+        Dict with key "action" ("route_command", "answer", or "unknown").
+        When action="route_command": also has "command" (str).
+        When action="answer": also has "answer" (str).
+
+    Raises:
+        ParseError: LLM call failed or returned unparseable JSON.
+        Callers treat ParseError as action="unknown" and fall through.
+    """
+    client = OpenAI(
+        api_key=settings.chat_api_key or settings.openai_api_key,
+        base_url=settings.chat_base_url or settings.openai_base_url,
+        timeout=settings.openai_timeout_seconds,
+        max_retries=settings.openai_max_retries,
+    )
+    model = settings.chat_model or settings.openai_model
+
+    system_prompt = _NL_QUERY_SYSTEM.format(context=context_snippet)
+
+    t0 = time.monotonic()
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": text},
+            ],
+            temperature=0.0,
+        )
+    except Exception as exc:
+        latency_ms = int((time.monotonic() - t0) * 1000)
+        _emit_llm_call(
+            on_llm_call=on_llm_call,
+            payload={
+                "purpose": "nl_query",
+                "model": model,
+                "latency_ms": latency_ms,
+                "error": str(exc),
+            },
+        )
+        raise ParseError(f"LLM call failed: {exc}") from exc
+
+    latency_ms = int((time.monotonic() - t0) * 1000)
+    _emit_llm_call(
+        on_llm_call=on_llm_call,
+        payload={
+            "purpose": "nl_query",
+            "model": model,
+            "latency_ms": latency_ms,
+            **_extract_response_meta(response),
+        },
+    )
+
+    raw = (response.choices[0].message.content or "").strip()
+    if raw.startswith("```"):
+        lines = raw.splitlines()
+        raw = "\n".join(
+            lines[1:-1] if lines[-1].strip() == "```" else lines[1:]
+        ).strip()
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ParseError(f"LLM returned invalid JSON: {exc}") from exc
+
+    if not isinstance(parsed, dict):
+        raise ParseError("LLM returned non-dict")
+
+    action = parsed.get("action")
+    if action not in ("route_command", "answer", "unknown"):
+        raise ParseError(f"Unexpected action value: {action!r}")
+
+    return parsed
 
 
 # ---------------------------------------------------------------------------
 # Internal implementation
 # ---------------------------------------------------------------------------
+
 
 def _call_parser(
     system_prompt: str,
@@ -398,7 +582,9 @@ def _call_parser(
     try:
         parsed = json.loads(raw_text)
     except json.JSONDecodeError as exc:
-        logger.error("item_parser_json_error doc_type=%s raw=%s", document_type, raw_text[:300])
+        logger.error(
+            "item_parser_json_error doc_type=%s raw=%s", document_type, raw_text[:300]
+        )
         raise ParseError(f"LLM returned invalid JSON: {exc}") from exc
 
     return _validate(parsed, document_type)
@@ -498,8 +684,15 @@ def _validate(raw: dict, document_type: str) -> dict:
 
     # Top-level string fields (all nullable)
     string_fields = (
-        "supplier", "supplier_contact_name", "supplier_phone", "supplier_email",
-        "currency", "invoice_date", "invoice_number", "effective_date", "lead_time",
+        "supplier",
+        "supplier_contact_name",
+        "supplier_phone",
+        "supplier_email",
+        "currency",
+        "invoice_date",
+        "invoice_number",
+        "effective_date",
+        "lead_time",
     )
     for field in string_fields:
         val = raw.get(field)
@@ -529,7 +722,10 @@ def _validate(raw: dict, document_type: str) -> dict:
             if qty is not None and qty <= 0:
                 qty = None  # treat zero/negative as missing
             if qty is None:
-                logger.warning("item_parser: qty missing for %r — including with null for user review", name)
+                logger.warning(
+                    "item_parser: qty missing for %r — including with null for user review",
+                    name,
+                )
             amount = _to_float(item.get("amount"))
 
             # Derive unit_price from amount/qty if not directly provided
@@ -538,10 +734,16 @@ def _validate(raw: dict, document_type: str) -> dict:
                     unit_price = round(amount / qty, 6)
                     logger.info(
                         "item_parser: derived unit_price for %r: amount=%s qty=%s → %s",
-                        name, amount, qty, unit_price,
+                        name,
+                        amount,
+                        qty,
+                        unit_price,
                     )
                 else:
-                    logger.warning("item_parser: unit_price missing for %r — including with null for user review", name)
+                    logger.warning(
+                        "item_parser: unit_price missing for %r — including with null for user review",
+                        name,
+                    )
                     unit_price = None
 
             row: dict = {
@@ -554,7 +756,10 @@ def _validate(raw: dict, document_type: str) -> dict:
 
         else:
             if unit_price is None or unit_price <= 0:
-                logger.warning("item_parser: unit_price missing for %r — including with null for user review", name)
+                logger.warning(
+                    "item_parser: unit_price missing for %r — including with null for user review",
+                    name,
+                )
                 unit_price = None
             row = {
                 "name": name,

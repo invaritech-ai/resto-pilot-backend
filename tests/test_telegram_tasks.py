@@ -13,7 +13,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from app.workers.telegram_tasks import handle_telegram_update
+from app.workers.telegram_tasks import dispatch_nl_query, handle_telegram_update
 
 
 # ---------------------------------------------------------------------------
@@ -230,3 +230,141 @@ class TestDedupRetryOnFailure:
             handle_telegram_update(self._message_update())
 
         mock_dedup_svc.delete_by_update_id.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# dispatch_nl_query — module-level NL query dispatcher
+# ---------------------------------------------------------------------------
+
+
+def _make_nl_query_mocks(*, active_restaurant_id=None):
+    """Minimal mocks for dispatch_nl_query tests."""
+    user = MagicMock()
+    user.chat_id = 999
+
+    db = MagicMock()
+
+    ctx_svc = MagicMock()
+    ctx_svc.get_active_restaurant_id.return_value = active_restaurant_id
+
+    settings = MagicMock()
+    settings.chat_api_key = ""
+    settings.chat_base_url = ""
+    settings.chat_model = ""
+    settings.openai_api_key = "test-key"
+    settings.openai_base_url = "https://api.openai.com/v1"
+    settings.openai_model = "gpt-4o-mini"
+    settings.openai_timeout_seconds = 30.0
+    settings.openai_max_retries = 2
+
+    return user, db, ctx_svc, settings
+
+
+_SAMPLE_UPDATE = {
+    "update_id": 1,
+    "message": {"message_id": 10, "chat": {"id": 999}, "text": "show my stock"},
+}
+
+
+class TestDispatchNlQuery:
+    def test_route_command_calls_handle_command(self):
+        """route_command result → handle_command called with synthetic update."""
+        user, db, ctx_svc, settings = _make_nl_query_mocks()
+
+        with (
+            patch(
+                "app.llm.item_parser.classify_and_answer",
+                return_value={"action": "route_command", "command": "/inventory"},
+            ),
+            patch("app.telegram.handlers.commands.handle") as mock_cmd,
+        ):
+            result = dispatch_nl_query("show my stock", _SAMPLE_UPDATE, user, db, ctx_svc, settings)
+
+        assert result is True
+        mock_cmd.assert_called_once()
+        # Synthetic update must override message text with the command
+        called_update = mock_cmd.call_args[0][0]
+        assert called_update["message"]["text"] == "/inventory"
+
+    def test_answer_calls_send_message(self):
+        """answer result → send_message called with the LLM answer."""
+        user, db, ctx_svc, settings = _make_nl_query_mocks()
+
+        with (
+            patch(
+                "app.llm.item_parser.classify_and_answer",
+                return_value={"action": "answer", "answer": "You have 45 items."},
+            ),
+            patch("app.telegram.bot_api.send_message") as mock_send,
+        ):
+            result = dispatch_nl_query("how many items?", _SAMPLE_UPDATE, user, db, ctx_svc, settings)
+
+        assert result is True
+        mock_send.assert_called_once()
+        assert "45 items" in mock_send.call_args.kwargs["text"]
+
+    def test_unknown_returns_false(self):
+        """unknown result → returns False so the stub fires."""
+        user, db, ctx_svc, settings = _make_nl_query_mocks()
+
+        with patch(
+            "app.llm.item_parser.classify_and_answer",
+            return_value={"action": "unknown"},
+        ):
+            result = dispatch_nl_query("hello", _SAMPLE_UPDATE, user, db, ctx_svc, settings)
+
+        assert result is False
+
+    def test_parse_error_returns_false(self):
+        """ParseError from LLM → returns False without raising."""
+        from app.llm.item_parser import ParseError
+
+        user, db, ctx_svc, settings = _make_nl_query_mocks()
+
+        with patch(
+            "app.llm.item_parser.classify_and_answer",
+            side_effect=ParseError("LLM call failed"),
+        ):
+            result = dispatch_nl_query("show suppliers", _SAMPLE_UPDATE, user, db, ctx_svc, settings)
+
+        assert result is False
+
+    def test_no_active_restaurant_still_calls_llm(self):
+        """With no active restaurant, context says so; LLM is still called."""
+        user, db, ctx_svc, settings = _make_nl_query_mocks(active_restaurant_id=None)
+
+        classify_calls: list[str] = []
+
+        def _capture(settings, text, context_snippet, on_llm_call=None):
+            classify_calls.append(context_snippet)
+            return {"action": "unknown"}
+
+        with patch("app.llm.item_parser.classify_and_answer", side_effect=_capture):
+            dispatch_nl_query("show my stock", _SAMPLE_UPDATE, user, db, ctx_svc, settings)
+
+        assert len(classify_calls) == 1
+        assert "No active restaurant" in classify_calls[0]
+
+    def test_empty_command_returns_false(self):
+        """route_command with empty command string → returns False (no dispatch)."""
+        user, db, ctx_svc, settings = _make_nl_query_mocks()
+
+        with patch(
+            "app.llm.item_parser.classify_and_answer",
+            return_value={"action": "route_command", "command": ""},
+        ):
+            result = dispatch_nl_query("show stock", _SAMPLE_UPDATE, user, db, ctx_svc, settings)
+
+        assert result is False
+
+    def test_empty_answer_returns_false(self):
+        """answer with empty string → returns False (don't send blank message)."""
+        user, db, ctx_svc, settings = _make_nl_query_mocks()
+
+        with patch(
+            "app.llm.item_parser.classify_and_answer",
+            return_value={"action": "answer", "answer": ""},
+        ):
+            result = dispatch_nl_query("tell me something", _SAMPLE_UPDATE, user, db, ctx_svc, settings)
+
+        assert result is False

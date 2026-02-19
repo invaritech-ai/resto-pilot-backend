@@ -75,6 +75,12 @@ class Settings(BaseSettings):
     parser_api_key: str = ""     # Defaults to openai_api_key if empty
     parser_base_url: str = ""    # Defaults to openai_base_url if empty
 
+    # Chat/conversational model (stock adjustments + natural language queries)
+    # Falls back to openai_* if unset — independent from parser_* settings.
+    chat_model: str = ""         # Defaults to openai_model if empty
+    chat_api_key: str = ""       # Defaults to openai_api_key if empty
+    chat_base_url: str = ""      # Defaults to openai_base_url if empty
+
     # Google Document AI - Premium OCR for invoices
     use_google_vision_ocr: bool = False  # Enable Google Document AI (reusing this flag)
     google_cloud_credentials_path: str = ""  # Path to Google Cloud credentials JSON file (local dev)

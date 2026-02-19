@@ -10,7 +10,13 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from app.llm.item_parser import ParseError, ocr_page_to_markdown, parse_invoice, parse_price_list
+from app.llm.item_parser import (
+    ParseError,
+    classify_and_answer,
+    ocr_page_to_markdown,
+    parse_invoice,
+    parse_price_list,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -30,6 +36,9 @@ def _make_settings(
     parser_model: str = "",
     parser_api_key: str = "",
     parser_base_url: str = "",
+    chat_model: str = "",
+    chat_api_key: str = "",
+    chat_base_url: str = "",
 ) -> MagicMock:
     s = MagicMock()
     s.vision_api_key = vision_api_key
@@ -43,6 +52,9 @@ def _make_settings(
     s.parser_model = parser_model
     s.parser_api_key = parser_api_key
     s.parser_base_url = parser_base_url
+    s.chat_model = chat_model
+    s.chat_api_key = chat_api_key
+    s.chat_base_url = chat_base_url
     return s
 
 
@@ -511,3 +523,124 @@ class TestNullableFields:
         assert result.get("invoice_number") is None
         assert result.get("invoice_date") is None
         assert result.get("currency") is None
+
+
+# ---------------------------------------------------------------------------
+# classify_and_answer — natural language read query
+# ---------------------------------------------------------------------------
+
+
+class TestClassifyAndAnswer:
+    _CONTEXT = "Restaurant: The Kitchen\nInventory: 45 items total, 2 with zero stock, 0 with negative balance\nSuppliers: Fresh Farm, Metro"
+
+    def test_route_command_returned(self):
+        settings = _make_settings()
+        payload = {"action": "route_command", "command": "/inventory"}
+        with patch("app.llm.item_parser.OpenAI") as MockOpenAI:
+            client = MockOpenAI.return_value
+            client.chat.completions.create.return_value = _mock_llm_response(
+                json.dumps(payload)
+            )
+            result = classify_and_answer(settings, "show my stock", self._CONTEXT)
+
+        assert result["action"] == "route_command"
+        assert result["command"] == "/inventory"
+
+    def test_answer_returned(self):
+        settings = _make_settings()
+        payload = {"action": "answer", "answer": "You have 45 items in stock."}
+        with patch("app.llm.item_parser.OpenAI") as MockOpenAI:
+            client = MockOpenAI.return_value
+            client.chat.completions.create.return_value = _mock_llm_response(
+                json.dumps(payload)
+            )
+            result = classify_and_answer(settings, "how many items do I have?", self._CONTEXT)
+
+        assert result["action"] == "answer"
+        assert "45" in result["answer"]
+
+    def test_unknown_returned(self):
+        settings = _make_settings()
+        payload = {"action": "unknown"}
+        with patch("app.llm.item_parser.OpenAI") as MockOpenAI:
+            client = MockOpenAI.return_value
+            client.chat.completions.create.return_value = _mock_llm_response(
+                json.dumps(payload)
+            )
+            result = classify_and_answer(settings, "hello", self._CONTEXT)
+
+        assert result["action"] == "unknown"
+
+    def test_raises_parse_error_on_bad_json(self):
+        settings = _make_settings()
+        with patch("app.llm.item_parser.OpenAI") as MockOpenAI:
+            client = MockOpenAI.return_value
+            client.chat.completions.create.return_value = _mock_llm_response(
+                "not JSON at all"
+            )
+            with pytest.raises(ParseError, match="invalid JSON"):
+                classify_and_answer(settings, "show suppliers", self._CONTEXT)
+
+    def test_raises_parse_error_on_llm_error(self):
+        settings = _make_settings()
+        with patch("app.llm.item_parser.OpenAI") as MockOpenAI:
+            client = MockOpenAI.return_value
+            client.chat.completions.create.side_effect = RuntimeError("connection reset")
+            with pytest.raises(ParseError, match="LLM call failed"):
+                classify_and_answer(settings, "show suppliers", self._CONTEXT)
+
+    def test_raises_parse_error_on_unexpected_action(self):
+        settings = _make_settings()
+        with patch("app.llm.item_parser.OpenAI") as MockOpenAI:
+            client = MockOpenAI.return_value
+            client.chat.completions.create.return_value = _mock_llm_response(
+                json.dumps({"action": "delete_everything"})
+            )
+            with pytest.raises(ParseError, match="Unexpected action"):
+                classify_and_answer(settings, "show suppliers", self._CONTEXT)
+
+    def test_strips_markdown_fences(self):
+        settings = _make_settings()
+        payload = {"action": "route_command", "command": "/balance"}
+        fenced = f"```json\n{json.dumps(payload)}\n```"
+        with patch("app.llm.item_parser.OpenAI") as MockOpenAI:
+            client = MockOpenAI.return_value
+            client.chat.completions.create.return_value = _mock_llm_response(fenced)
+            result = classify_and_answer(settings, "stock summary", self._CONTEXT)
+
+        assert result["action"] == "route_command"
+        assert result["command"] == "/balance"
+
+    def test_context_injected_into_system_prompt(self):
+        """Context snippet must appear in the system message sent to the LLM."""
+        settings = _make_settings()
+        with patch("app.llm.item_parser.OpenAI") as MockOpenAI:
+            client = MockOpenAI.return_value
+            client.chat.completions.create.return_value = _mock_llm_response(
+                json.dumps({"action": "unknown"})
+            )
+            classify_and_answer(settings, "hello", self._CONTEXT)
+
+        call_args = client.chat.completions.create.call_args
+        messages = call_args.kwargs.get("messages") or call_args[0][0]
+        system_msg = next(m for m in messages if m["role"] == "system")
+        assert "The Kitchen" in system_msg["content"]
+        assert "45 items" in system_msg["content"]
+
+    def test_emits_nl_query_telemetry(self):
+        settings = _make_settings()
+        calls: list[dict] = []
+        with patch("app.llm.item_parser.OpenAI") as MockOpenAI:
+            client = MockOpenAI.return_value
+            client.chat.completions.create.return_value = _mock_llm_response(
+                json.dumps({"action": "unknown"})
+            )
+            classify_and_answer(
+                settings,
+                "hello",
+                self._CONTEXT,
+                on_llm_call=lambda p: calls.append(p),
+            )
+
+        assert len(calls) == 1
+        assert calls[0]["purpose"] == "nl_query"
