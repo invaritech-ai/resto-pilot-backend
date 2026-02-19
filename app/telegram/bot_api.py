@@ -573,7 +573,14 @@ def send_message_with_keyboard(
 ) -> int | None:
     """Send a message with an inline keyboard. Returns message_id or None.
 
-    Falls back to plain send_message when in dev/test sink mode.
+    Falls back to plain send_message (no buttons) when:
+    - Running in dev/test sink mode.
+    - Telegram rejects the keyboard payload (e.g. malformed markup).
+    - A network/HTTP error occurs.
+
+    The fallback ensures the user always receives the text content. Callers that
+    require buttons for the message to be useful (e.g. OCR review) should direct
+    users to /uploads as the recovery path when keyboard delivery fails.
     """
     if not isinstance(text, str) or not text.strip():
         logger.warning(
@@ -617,11 +624,21 @@ def send_message_with_keyboard(
                 telegram_message_id=telegram_message_id,
             )
             return telegram_message_id
-        logger.error("send_message_with_keyboard failed: %s", data.get("description"))
-        return None
+        # Telegram rejected the keyboard payload — fall back to plain text.
+        logger.warning(
+            "send_message_with_keyboard_fallback",
+            extra={"chat_id": chat_id, "reason": data.get("description")},
+        )
     except Exception as exc:
-        logger.error("send_message_with_keyboard error: %s", exc)
-        return None
+        # Network / HTTP error — fall back to plain text.
+        logger.warning(
+            "send_message_with_keyboard_fallback",
+            extra={"chat_id": chat_id, "reason": str(exc)},
+        )
+    # Fallback: deliver the text without buttons so the user is not left with nothing.
+    # Callers that need buttons (e.g. OCR review messages) can use /uploads as the
+    # recovery path since staging remains in pending_review and "Open" re-sends buttons.
+    return send_message(chat_id=chat_id, text=text_out, settings=settings)
 
 
 def answer_callback_query(

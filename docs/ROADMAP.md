@@ -1,26 +1,38 @@
 # Resto Pilot Roadmap
 
-## Current snapshot (2026-02-18)
-Phase 1 is in late hardening mode. Core supplier/price/invoice/inventory chat flows are implemented and test-covered.
+## Current snapshot (2026-02-19)
+Phase 1 is in final hardening mode. All core features are shipped and test-covered (501 tests passing).
 
 ### Done in this phase
 - Telegram onboarding and routing pipeline.
 - Supplier management and restaurant-scoped supplier linking.
 - OCR pipeline for invoices and price lists (PDF + image paths).
 - Review and confirm flows with inline keyboards.
-- Invoice -> inventory ledger + balance updates.
-- Price list -> supplier price upserts.
+- Invoice → inventory ledger + balance updates.
+- Price list → supplier price upserts.
 - Paginated command lists with button navigation.
 - `/balance` item-level breakdown (negative and zero-stock sections).
 - Session-aware telemetry wiring:
   - outgoing message logs
   - OCR/parser LLM call logs (usage metadata)
+- Manual stock reconciliation via free-text shortcuts:
+  - `"used 1kg onion"` → debit with confirm keyboard
+  - `"2kg chicken left"` → set-balance with confirm keyboard
+- Quick `[+]`/`[-]` ±1 adjust buttons on every `/inventory` row.
+- Low-stock `⚠️` alerts shown after debit confirms.
+- Natural language query routing (classify_and_answer + DB enrichment):
+  - "how much onion do I have?" → answers from inventory context
+  - "where can I buy chicken?" → routes to `/search chicken`
+- `/search <query>` — unified cross-domain search (inventory + products + suppliers).
+- `/history <item>` — last 10 transactions for an item with timestamps.
+- `/export` — inventory CSV file download.
+- `/chart` — visual per-unit-group stock bar chart (seaborn/PNG).
+- `/help` refresh with categorised command sections.
 
 ### Still open before phase close
-- Final auth hardening on staging mutations (require active membership consistently).
-- Production reliability hardening around Telegram keyboard-send failures.
-- Remaining UX polish for review/confirm edge cases.
-- Optional telemetry enhancements (cost backfill/reporting views).
+- Price-list meta display: wire `get_price_list_meta()` into `/prices` output (service ready, UI pending).
+- Auth hardening: verify `_is_authorized_for_staging()` is called consistently on all staging-mutating callbacks.
+- Keyboard-send error-path: graceful text fallback when `send_message_with_keyboard` returns non-2xx.
 
 ---
 
