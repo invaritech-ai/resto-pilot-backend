@@ -77,7 +77,10 @@ def dispatch_nl_query(
     from app.llm.item_parser import ParseError, classify_and_answer
     from app.services.inventory_service import InventoryService
     from app.services.supplier_service import SupplierService
+    from app.services.money import to_display
     from app.db.models.restaurant import Restaurant
+    from app.db.models.inventory_balances import InventoryBalance
+    from sqlalchemy import select as _sa_select
     from app.telegram.handlers.commands import handle as handle_command
     from app.telegram.bot_api import send_message
 
@@ -89,15 +92,53 @@ def dispatch_nl_query(
         if restaurant:
             lines.append(f"Restaurant: {restaurant.name}")
         inv_svc = InventoryService(db)
+        sup_svc = SupplierService(db)
         summary = inv_svc.get_balance_summary(active_restaurant_id)
         lines.append(
             f"Inventory: {summary.total_items} items total, "
             f"{summary.zero_stock_count} with zero stock, "
             f"{summary.negative_count} with negative balance"
         )
-        suppliers = SupplierService(db).list_for_restaurant(active_restaurant_id, limit=50)
+        suppliers = sup_svc.list_for_restaurant(active_restaurant_id, limit=50)
         if suppliers:
             lines.append(f"Suppliers: {', '.join(s.name for s in suppliers)}")
+
+        # --- DB search: supplier prices matching query ---
+        price_hits = sup_svc.search_items_across_suppliers(
+            restaurant_id=active_restaurant_id,
+            query=msg_text,
+            threshold=0.3,
+            limit=5,
+        )
+        if price_hits:
+            lines.append("\nProducts matching your query:")
+            for price, supplier, _eff_date, _score in price_hits:
+                price_val = to_display(price.price_minor, price.price_exp)
+                currency = price.currency or supplier.default_currency or ""
+                unit_str = f"/{price.unit}" if price.unit else ""
+                lines.append(
+                    f"  {price.item_name} — {supplier.name}"
+                    f" @ {price_val:g} {currency}{unit_str}"
+                )
+
+        # --- DB search: inventory items matching query ---
+        inv_hits = inv_svc.fuzzy_match_item(
+            restaurant_id=active_restaurant_id,
+            name=msg_text,
+            threshold=0.3,
+        )
+        if inv_hits:
+            lines.append("\nInventory items matching your query:")
+            for item, _score in inv_hits[:3]:
+                bal = db.scalar(
+                    _sa_select(InventoryBalance.balance).where(
+                        InventoryBalance.item_id == item.id,
+                        InventoryBalance.restaurant_id == active_restaurant_id,
+                    )
+                )
+                bal_str = f"{float(bal):g}" if bal is not None else "0"
+                unit_str = f" {item.unit}" if item.unit else ""
+                lines.append(f"  {item.name}: {bal_str}{unit_str}")
     else:
         lines.append("No active restaurant set.")
 

@@ -36,6 +36,7 @@ from app.telegram.bot_api import (
     send_document,
     send_message,
     send_message_with_keyboard,
+    send_photo,
 )
 from app.telegram.keyboards import pagination_keyboard, quick_adj_rows
 from app.telegram.renderer import (
@@ -51,6 +52,7 @@ HELP_TEXT = """Available commands:
 📦 Inventory
 /inventory         — Stock levels (with [+]/[-] quick adjust buttons)
 /balance           — Stock summary (zero & negative alerts)
+/chart             — Visual stock levels chart
 /history <item>    — Recent transactions for an item
 /export            — Download inventory as CSV
 
@@ -137,6 +139,7 @@ def _parse_command(text: str) -> tuple[str, str]:
         (r"^/uploads\b", "uploads"),
         (r"^/history\b", "history"),
         (r"^/export\b", "export"),
+        (r"^/chart\b", "chart"),
         (r"^/help\b", "help"),
         (r"^/start\b", "start"),
     ]
@@ -1214,6 +1217,35 @@ def handle(
             )
         else:
             send_message(chat_id=chat_id, text=text, settings=settings)
+        return
+
+    # --- /chart ---
+    if command == "chart":
+        from app.services.chart_service import make_stock_chart
+        from app.db.models.restaurant import Restaurant
+
+        restaurant_id = _require_active_restaurant(user, ctx_svc, db, settings)
+        if restaurant_id is None:
+            send_message(chat_id=chat_id, text="No active restaurant. Send /start to set up.", settings=settings)
+            return
+
+        inv_svc = InventoryService(db)
+        total = inv_svc.count_items(restaurant_id)
+        if total == 0:
+            send_message(chat_id=chat_id, text="📦 No inventory data yet. Upload an invoice to get started.", settings=settings)
+            return
+
+        items = inv_svc.list_items(restaurant_id, offset=0, limit=15)
+        restaurant = db.get(Restaurant, restaurant_id)
+        rest_name = restaurant.name if restaurant else "Inventory"
+
+        image_bytes = make_stock_chart(items, rest_name)
+        send_photo(
+            chat_id=chat_id,
+            image_bytes=image_bytes,
+            caption=f"📦 {rest_name} — stock levels ({total} items)",
+            settings=settings,
+        )
         return
 
     # --- /history <item name> ---

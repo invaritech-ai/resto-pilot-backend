@@ -802,6 +802,37 @@ def edit_message_text(
         return False
 
 
+def send_photo(
+    chat_id: int,
+    image_bytes: bytes,
+    caption: str | None = None,
+    settings: "Settings" = None,  # type: ignore[assignment]
+) -> None:
+    """Send a PNG/JPEG image to a Telegram chat via sendPhoto."""
+    if chat_id == 0:
+        logger.info("send_photo skipped (console mode)")
+        return
+
+    if not settings or not settings.telegram_bot_token:
+        raise ValueError("Telegram bot token is not configured")
+
+    url = f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendPhoto"
+    try:
+        resp = httpx.post(
+            url,
+            data={"chat_id": chat_id, **({"caption": caption} if caption else {})},
+            files={"photo": ("chart.png", image_bytes, "image/png")},
+            timeout=30.0,
+        )
+        resp.raise_for_status()
+    except httpx.HTTPError as e:
+        logger.error(
+            "telegram_send_photo_http_error",
+            extra={"chat_id": chat_id, "error": type(e).__name__},
+        )
+        raise
+
+
 def send_document(
     chat_id: int,
     file_bytes: bytes,
