@@ -160,6 +160,29 @@ def cb_stock_cancel() -> str:
     return "stock_cancel"
 
 
+def cb_quick_adj(item_id: uuid.UUID, direction: str) -> str:
+    """Quick ±1 inventory adjustment callback: qadj:{item_hex}:{in|out}"""
+    return f"qadj:{uuid_to_hex(item_id)}:{direction}"
+
+
+def quick_adj_rows(items: list) -> list:
+    """Build [#N +] [#N -] button rows for the current inventory page.
+
+    Groups 4 buttons per row: [#1 +] [#1 -] [#2 +] [#2 -]
+    """
+    rows: list = []
+    buttons: list = []
+    for i, (item, _) in enumerate(items, 1):
+        buttons.append(make_button(f"#{i} +", cb_quick_adj(item.id, "in")))
+        buttons.append(make_button(f"#{i} -", cb_quick_adj(item.id, "out")))
+        if len(buttons) == 4:
+            rows.append(buttons)
+            buttons = []
+    if buttons:
+        rows.append(buttons)
+    return rows
+
+
 def stock_adj_keyboard(
     direction: str,
     match_score: float,

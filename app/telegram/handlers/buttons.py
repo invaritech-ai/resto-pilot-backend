@@ -79,6 +79,7 @@ from app.telegram.keyboards import (
     cb_use_match,
     hex_to_uuid,
     make_button,
+    uuid_to_hex,
 )
 
 logger = logging.getLogger(__name__)
@@ -203,6 +204,7 @@ def handle(
         "stock_conf":  _handle_stock_conf,
         "stock_new":   _handle_stock_new,
         "stock_cancel": _handle_stock_cancel,
+        "qadj":        _handle_qadj,
     }
 
     handler = dispatch.get(action)
@@ -2106,6 +2108,8 @@ def _handle_stock_conf(
     unit_str = f" {unit}" if unit else ""
     verb = "Added" if direction == "in" else "Removed"
     result_text = f"✅ {verb} {qty:g}{unit_str} {item_name}. Balance: {bal_str}{unit_str}"
+    if new_balance is not None and float(new_balance) <= 0:
+        result_text += "\n⚠️ Low stock!"
 
     answer_callback_query(callback_id=callback_id, text="", settings=settings)
     if message_id:
@@ -2189,6 +2193,8 @@ def _handle_stock_new(
     unit_str = f" {unit}" if unit else ""
     verb = "Added" if direction == "in" else "Removed"
     result_text = f"✅ {verb} {qty:g}{unit_str} {new_item.name}. Balance: {bal_str}{unit_str}"
+    if new_balance is not None and float(new_balance) <= 0:
+        result_text += "\n⚠️ Low stock!"
 
     answer_callback_query(callback_id=callback_id, text="", settings=settings)
     if message_id:
@@ -2213,3 +2219,77 @@ def _handle_stock_cancel(
     answer_callback_query(callback_id=callback_id, text="", settings=settings)
     if message_id:
         edit_message_text(chat_id=chat_id, message_id=message_id, text="Cancelled.", settings=settings)
+
+
+def _handle_qadj(
+    *,
+    params: list[str],
+    user: "User",
+    db: "Session",
+    ctx_svc: ContextService,
+    settings: Settings,
+    callback_id: str,
+    chat_id: int,
+    message_id: int | None,
+    **_: object,
+) -> None:
+    """Quick ±1 inventory adjustment from /inventory list buttons."""
+    if len(params) < 2 or params[1] not in ("in", "out"):
+        answer_callback_query(callback_id=callback_id, text="Invalid action.", settings=settings)
+        return
+
+    item_id = hex_to_uuid(params[0])
+    direction = params[1]
+
+    active_restaurant_id = ctx_svc.get_active_restaurant_id(user)
+    if active_restaurant_id is None:
+        answer_callback_query(callback_id=callback_id, text="No active restaurant.", settings=settings)
+        return
+
+    is_member, _ = _membership_flags(db=db, restaurant_id=active_restaurant_id, user_id=user.id)
+    if not is_member:
+        answer_callback_query(callback_id=callback_id, text=_AUTHZ_DENIED_TEXT, show_alert=True, settings=settings)
+        return
+
+    from app.db.models.inventory_balances import InventoryBalance
+    from app.db.models.inventory_items import InventoryItem
+    from sqlalchemy import select as _sa_select
+
+    inv_svc = InventoryService(db)
+    txn_type = "credit" if direction == "in" else "debit"
+    try:
+        inv_svc.record_transaction(
+            restaurant_id=active_restaurant_id,
+            item_id=item_id,
+            txn_type=txn_type,
+            quantity=1.0,
+            created_by=user.id,
+            source="manual",
+        )
+        db.commit()
+    except ValueError as exc:
+        answer_callback_query(callback_id=callback_id, text=str(exc), show_alert=True, settings=settings)
+        return
+
+    new_balance = db.scalar(
+        _sa_select(InventoryBalance.balance).where(
+            InventoryBalance.item_id == item_id,
+            InventoryBalance.restaurant_id == active_restaurant_id,
+        )
+    )
+    item = db.get(InventoryItem, item_id)
+    item_name = item.name if item else "item"
+    unit_str = f" {item.unit}" if item and item.unit else ""
+    bal_str = f"{float(new_balance):g}" if new_balance is not None else "?"
+    verb = "+1" if direction == "in" else "−1"
+
+    low_stock = new_balance is not None and float(new_balance) <= 0
+    alert_suffix = "  ⚠️ Low stock!" if low_stock else ""
+    toast = f"{verb}{unit_str} {item_name}  →  {bal_str}{unit_str}{alert_suffix}"
+
+    answer_callback_query(
+        callback_id=callback_id,
+        text=toast,
+        show_alert=low_stock,
+        settings=settings,
+    )

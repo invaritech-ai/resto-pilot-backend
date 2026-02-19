@@ -800,3 +800,38 @@ def edit_message_text(
             },
         )
         return False
+
+
+def send_document(
+    chat_id: int,
+    file_bytes: bytes,
+    filename: str,
+    caption: str | None = None,
+    settings: Settings = None,  # type: ignore[assignment]
+) -> None:
+    """Send a file to a Telegram chat via sendDocument.
+
+    Skipped silently in test/dev sink mode (no document delivery infrastructure).
+    """
+    if chat_id == 0:
+        logger.info("send_document skipped (console mode) filename=%s", filename)
+        return
+
+    if not settings or not settings.telegram_bot_token:
+        raise ValueError("Telegram bot token is not configured")
+
+    url = f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendDocument"
+    try:
+        resp = httpx.post(
+            url,
+            data={"chat_id": chat_id, **({"caption": caption} if caption else {})},
+            files={"document": (filename, file_bytes, "application/octet-stream")},
+            timeout=30.0,
+        )
+        resp.raise_for_status()
+    except httpx.HTTPError as e:
+        logger.error(
+            "telegram_send_document_http_error",
+            extra={"chat_id": chat_id, "filename": filename, "error": type(e).__name__},
+        )
+        raise

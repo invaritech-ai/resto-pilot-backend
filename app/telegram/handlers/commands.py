@@ -33,10 +33,11 @@ from app.services.restaurant_service import RestaurantService
 from app.services.supplier_service import AlreadyLinkedError, SupplierService
 from app.telegram.bot_api import (
     edit_message_reply_markup,
+    send_document,
     send_message,
     send_message_with_keyboard,
 )
-from app.telegram.keyboards import pagination_keyboard
+from app.telegram.keyboards import pagination_keyboard, quick_adj_rows
 from app.telegram.renderer import (
     format_with_emoji,
     format_supplier_name,
@@ -47,15 +48,30 @@ from app.telegram.renderer import (
 
 HELP_TEXT = """Available commands:
 
-/profile           — Your profile
-/team              — Staff & invites
+📦 Inventory
+/inventory         — Stock levels (with [+]/[-] quick adjust buttons)
+/balance           — Stock summary (zero & negative alerts)
+/history <item>    — Recent transactions for an item
+/export            — Download inventory as CSV
+
+🛒 Suppliers & Prices
 /list suppliers    — Show your linked suppliers
 /add supplier <name> — Add a new supplier
 /products          — Supplier product catalog
-/prices <name>     — Prices from a supplier (or search items across suppliers)
-/inventory         — Stock levels
-/balance           — Stock summary
-/uploads           — Pending uploads
+/prices <name>     — Prices from a supplier
+
+📂 Uploads
+/uploads           — Pending upload reviews
+
+👤 Account
+/profile           — Your profile
+/team              — Staff & invites
+
+💬 Free text shortcuts
+"used 1kg onion"   — Record stock usage (with confirm)
+"2kg chicken left" — Set stock balance (with confirm)
+Or just ask: "how many items do I have?"
+
 /help              — Show this message"""
 
 
@@ -119,6 +135,8 @@ def _parse_command(text: str) -> tuple[str, str]:
         (r"^/add supplier\b", "add supplier"),
         (r"^/link supplier\b", "link supplier"),
         (r"^/uploads\b", "uploads"),
+        (r"^/history\b", "history"),
+        (r"^/export\b", "export"),
         (r"^/help\b", "help"),
         (r"^/start\b", "start"),
     ]
@@ -481,15 +499,20 @@ def _render_inventory_page(
     footer_text = f"📊 {total} item{'s' if total != 1 else ''} total"
     if total_pages > 1:
         footer_text += f" • Page {page + 1}/{total_pages}"
-    
+
     lines.append("")  # Empty line before footer
     lines.append(format_footer(footer_text, divider=True))
 
-    keyboard = _pagination_markup(
+    # Build keyboard: quick-adjust rows + pagination
+    adj_rows = quick_adj_rows(items)
+    pag_keyboard = _pagination_markup(
         list_type="inventory",
         current_page=page,
         total_pages=total_pages,
     )
+    pag_rows = (pag_keyboard or {}).get("inline_keyboard", [])
+    combined_rows = adj_rows + pag_rows
+    keyboard = {"inline_keyboard": combined_rows} if combined_rows else None
     return "\n".join(lines), keyboard
 
 
@@ -1191,6 +1214,82 @@ def handle(
             )
         else:
             send_message(chat_id=chat_id, text=text, settings=settings)
+        return
+
+    # --- /history <item name> ---
+    if command == "history":
+        restaurant_id = _require_active_restaurant(user, ctx_svc, db, settings)
+        if restaurant_id is None:
+            send_message(chat_id=chat_id, text="No active restaurant. Send /start to set up.", settings=settings)
+            return
+
+        if not args:
+            send_message(chat_id=chat_id, text="Usage: /history <item name>\nExample: /history onion", settings=settings)
+            return
+
+        inv_svc = InventoryService(db)
+        matches = inv_svc.fuzzy_match_item(restaurant_id=restaurant_id, name=args, threshold=0.45)
+        if not matches:
+            send_message(chat_id=chat_id, text=f'No inventory item matching "{args}". Try /inventory to see all items.', settings=settings)
+            return
+
+        item, score = matches[0]
+        txns = inv_svc.get_item_transactions(restaurant_id=restaurant_id, item_id=item.id, limit=10)
+        if not txns:
+            send_message(chat_id=chat_id, text=f"No transactions recorded for {item.name} yet.", settings=settings)
+            return
+
+        unit_str = f" {item.unit}" if item.unit else ""
+        lines = [f"📋 {format_with_emoji(item.name)} — last {len(txns)} transactions\n"]
+        for txn in txns:
+            arrow = "➕" if txn.txn_type == "credit" else "➖"
+            src = f" ({txn.source})" if txn.source != "manual" else ""
+            date_str = txn.created_at.strftime("%-d %b %H:%M") if txn.created_at else "?"
+            lines.append(f"{arrow} {float(txn.quantity):g}{unit_str}{src}  ·  {date_str}")
+
+        send_message(chat_id=chat_id, text="\n".join(lines), settings=settings)
+        return
+
+    # --- /export ---
+    if command == "export":
+        import csv
+        import io
+
+        restaurant_id = _require_active_restaurant(user, ctx_svc, db, settings)
+        if restaurant_id is None:
+            send_message(chat_id=chat_id, text="No active restaurant. Send /start to set up.", settings=settings)
+            return
+
+        inv_svc = InventoryService(db)
+        total = inv_svc.count_items(restaurant_id)
+        if total == 0:
+            send_message(chat_id=chat_id, text="📦 No inventory data yet. Upload an invoice to get started.", settings=settings)
+            return
+
+        # Fetch all items (no pagination for export)
+        items = inv_svc.list_items(restaurant_id, offset=0, limit=total)
+
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(["Item", "Unit", "Balance"])
+        for item, balance in items:
+            bal = float(balance.balance) if balance is not None else 0.0
+            writer.writerow([item.name, item.unit or "", f"{bal:g}"])
+
+        from app.db.models.restaurant import Restaurant
+        restaurant = db.get(Restaurant, restaurant_id)
+        rest_name = (restaurant.name if restaurant else "inventory").replace(" ", "_")
+        import datetime as _dt
+        date_str = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%d")
+        filename = f"{rest_name}_{date_str}.csv"
+
+        send_document(
+            chat_id=chat_id,
+            file_bytes=buf.getvalue().encode("utf-8"),
+            filename=filename,
+            caption=f"📦 {total} items — {date_str}",
+            settings=settings,
+        )
         return
 
     # Unknown command

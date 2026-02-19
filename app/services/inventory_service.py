@@ -411,3 +411,21 @@ class InventoryService:
             InventoryBalance.restaurant_id == restaurant_id
         )
         return self.session.scalar(stmt)
+
+    def get_item_transactions(
+        self,
+        restaurant_id: uuid.UUID,
+        item_id: uuid.UUID,
+        limit: int = 10,
+    ) -> list[InventoryTransaction]:
+        """Return the most recent transactions for an item, newest first."""
+        stmt = (
+            select(InventoryTransaction)
+            .where(
+                InventoryTransaction.restaurant_id == restaurant_id,
+                InventoryTransaction.item_id == item_id,
+            )
+            .order_by(InventoryTransaction.created_at.desc())
+            .limit(limit)
+        )
+        return list(self.session.scalars(stmt).all())

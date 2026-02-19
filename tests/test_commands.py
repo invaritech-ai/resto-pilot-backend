@@ -464,13 +464,15 @@ class TestInventoryCommand:
 
         with patch("app.telegram.handlers.commands.RestaurantService") as MockRest, \
              patch("app.telegram.handlers.commands.InventoryService") as MockInv, \
-             patch("app.telegram.handlers.commands.send_message") as mock_send:
+             patch("app.telegram.handlers.commands.send_message_with_keyboard") as mock_send_kb, \
+             patch("app.telegram.handlers.commands.send_message"):
             MockRest.return_value.user_membership_exists.return_value = True
             MockInv.return_value.count_items.return_value = 1
             MockInv.return_value.list_items.return_value = [(item1, balance1)]
             handle(_make_update("/inventory"), user, db, ctx_svc, _make_settings())
 
-        text = mock_send.call_args[1]["text"]
+        # Inventory always renders with quick-adj keyboard now
+        text = mock_send_kb.call_args[1]["text"]
         assert "Chicken Breast" in text
         assert "10.5" in text
         assert "kg" in text
@@ -490,13 +492,14 @@ class TestInventoryCommand:
 
         with patch("app.telegram.handlers.commands.RestaurantService") as MockRest, \
              patch("app.telegram.handlers.commands.InventoryService") as MockInv, \
-             patch("app.telegram.handlers.commands.send_message") as mock_send:
+             patch("app.telegram.handlers.commands.send_message_with_keyboard") as mock_send_kb, \
+             patch("app.telegram.handlers.commands.send_message"):
             MockRest.return_value.user_membership_exists.return_value = True
             MockInv.return_value.count_items.return_value = 1
             MockInv.return_value.list_items.return_value = [(item1, balance1)]
             handle(_make_update("/inventory"), user, db, ctx_svc, _make_settings())
 
-        text = mock_send.call_args[1]["text"]
+        text = mock_send_kb.call_args[1]["text"]
         assert "⚠️" in text
         assert "Olive Oil" in text
 
