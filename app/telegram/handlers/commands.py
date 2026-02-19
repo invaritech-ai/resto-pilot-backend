@@ -69,10 +69,13 @@ HELP_TEXT = """Available commands:
 /profile           — Your profile
 /team              — Staff & invites
 
+🔍 Search
+/search <query>    — Search inventory, products & suppliers at once
+
 💬 Free text shortcuts
 "used 1kg onion"   — Record stock usage (with confirm)
 "2kg chicken left" — Set stock balance (with confirm)
-Or just ask: "how many items do I have?"
+Or just ask: "where can I buy truffle?" / "how much onion do I have?"
 
 /help              — Show this message"""
 
@@ -140,6 +143,7 @@ def _parse_command(text: str) -> tuple[str, str]:
         (r"^/history\b", "history"),
         (r"^/export\b", "export"),
         (r"^/chart\b", "chart"),
+        (r"^/search\b", "search"),
         (r"^/help\b", "help"),
         (r"^/start\b", "start"),
     ]
@@ -1322,6 +1326,80 @@ def handle(
             caption=f"📦 {total} items — {date_str}",
             settings=settings,
         )
+        return
+
+    # --- /search <query> ---
+    if command == "search":
+        restaurant_id = _require_active_restaurant(user, ctx_svc, db, settings)
+        if restaurant_id is None:
+            send_message(chat_id=chat_id, text="No active restaurant. Send /start to set up.", settings=settings)
+            return
+
+        if not args:
+            send_message(chat_id=chat_id, text="Usage: /search <query>\nExample: /search black truffle", settings=settings)
+            return
+
+        from app.services.money import to_display
+
+        inv_svc = InventoryService(db)
+        sup_svc = SupplierService(db)
+
+        lines: list[str] = [f"🔍 Results for \"{args}\"\n"]
+        found_any = False
+
+        # 1. Inventory items
+        inv_hits = inv_svc.fuzzy_match_item(restaurant_id=restaurant_id, name=args, threshold=0.3)
+        if inv_hits:
+            found_any = True
+            lines.append(f"📦 Inventory ({len(inv_hits)} item{'s' if len(inv_hits) != 1 else ''}):")
+            from sqlalchemy import select as _sa_select
+            from app.db.models.inventory_balances import InventoryBalance
+            for item, score in inv_hits[:5]:
+                bal = db.scalar(
+                    _sa_select(InventoryBalance.balance).where(
+                        InventoryBalance.item_id == item.id,
+                        InventoryBalance.restaurant_id == restaurant_id,
+                    )
+                )
+                bal_str = f"{float(bal):g}" if bal is not None else "0"
+                unit_str = f" {item.unit}" if item.unit else ""
+                score_str = f" ({score:.0%})" if score < 0.8 else ""
+                lines.append(f"  • {format_with_emoji(item.name)}: {bal_str}{unit_str}{score_str}")
+
+        # 2. Supplier products (prices)
+        price_hits = sup_svc.search_items_across_suppliers(
+            restaurant_id=restaurant_id, query=args, threshold=0.3, limit=8
+        )
+        if price_hits:
+            found_any = True
+            lines.append(f"\n🛒 Products ({len(price_hits)} result{'s' if len(price_hits) != 1 else ''}):")
+            for price, supplier, _eff_date, score in price_hits[:8]:
+                price_val = to_display(price.price_minor, price.price_exp)
+                currency = price.currency or supplier.default_currency or ""
+                unit_str = f"/{price.unit}" if price.unit else ""
+                score_str = f" ({score:.0%})" if score < 0.8 else ""
+                lines.append(
+                    f"  • {format_with_emoji(price.item_name)}{score_str}"
+                    f" — {supplier.name}"
+                    f" @ {price_val:g} {currency}{unit_str}"
+                )
+
+        # 3. Suppliers by name
+        sup_hits = sup_svc.fuzzy_search_for_restaurant(
+            name=args, restaurant_id=restaurant_id, threshold=0.4
+        )
+        if sup_hits:
+            found_any = True
+            lines.append(f"\n🏪 Suppliers ({len(sup_hits)}):")
+            for supplier, score in sup_hits[:5]:
+                score_str = f" ({score:.0%})" if score < 0.8 else ""
+                lines.append(f"  • {format_supplier_name(supplier.name)}{score_str}")
+
+        if not found_any:
+            lines.append(f"No results found for \"{args}\".")
+            lines.append("Try a shorter or different search term.")
+
+        send_message(chat_id=chat_id, text="\n".join(lines), settings=settings)
         return
 
     # Unknown command

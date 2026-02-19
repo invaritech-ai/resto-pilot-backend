@@ -286,23 +286,28 @@ Classify user input as:
 - unknown
 
 Allowed route commands:
-  /list suppliers   — all linked suppliers
-  /products         — supplier product catalog
-  /inventory        — stock levels (all items)
-  /balance          — stock summary (totals, zero-stock, negative)
-  /uploads          — pending upload reviews
+  /list suppliers       — all linked suppliers
+  /products             — supplier product catalog
+  /inventory            — stock levels (all items)
+  /balance              — stock summary (totals, zero-stock, negative)
+  /uploads              — pending upload reviews
+  /search <terms>       — unified search across inventory, products & suppliers
 
 Return ONLY valid JSON — no markdown, no explanation:
 {{
   "action": "route_command" | "answer" | "unknown",
-  "command": "/inventory" | "/products" | "/balance" | "/list suppliers" | "/uploads" \
+  "command": "/inventory" | "/products" | "/balance" | "/list suppliers" | "/uploads" | "/search <terms>" \
 (only when action=route_command),
   "answer": "your response" (only when action=answer)
 }}
 
+Rules for "route_command":
+- Use /search <terms> for queries about specific ingredients, products, or suppliers by name.
+  Examples: "where can I buy truffle?" → /search truffle | "do we have chicken?" → /search chicken
+
 Rules for "answer":
 - Use ONLY the data in CONTEXT. Never invent numbers, names, or prices.
-- If context data is missing/zero, say so and suggest the relevant command.
+- If context data is missing/zero, say so and suggest /search <relevant term>.
 - Keep answers under 3 sentences.
 - If unsure between route_command and answer, prefer route_command.
 
