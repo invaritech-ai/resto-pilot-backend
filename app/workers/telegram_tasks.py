@@ -305,10 +305,135 @@ def handle_telegram_update(update: dict) -> None:
                             handle_item_edit_input(update, ctx.user, ctx.db, ctx_svc, settings)
                             return
 
+                        # Try natural-language quick stock adjustment
+                        msg_text = (update.get("message", {}).get("text", "") or "").strip()
+                        if msg_text:
+                            from app.llm.item_parser import ParseError, parse_stock_adjustment
+                            from app.services.inventory_service import InventoryService
+                            try:
+                                adj = parse_stock_adjustment(settings, msg_text)
+                            except ParseError:
+                                adj = None
+                            if adj:
+                                _dispatch_stock_adjustment(
+                                    adj=adj,
+                                    update=update,
+                                    user=ctx.user,
+                                    db=ctx.db,
+                                    ctx_svc=ctx_svc,
+                                    settings=settings,
+                                )
+                                return
+
                         logger.info("llm_handler_stub: falling back to LLM")
                         send_message(
                             chat_id=ctx.user.chat_id,
                             text="I'm not sure how to help with that. Try /help for available commands.",
+                            settings=settings,
+                        )
+
+                    def _dispatch_stock_adjustment(
+                        adj: dict,
+                        update: dict,
+                        user: "object",
+                        db: "object",
+                        ctx_svc: "object",
+                        settings: "object",
+                    ) -> None:
+                        """Fuzzy-match adj item, store in context, show confirm keyboard."""
+                        from app.services.inventory_service import InventoryService
+                        from app.telegram.bot_api import send_message_with_keyboard
+                        from app.telegram.keyboards import cb_stock_cancel, cb_stock_conf, cb_stock_new, make_button
+
+                        active_restaurant_id = ctx_svc.get_active_restaurant_id(user)
+                        if active_restaurant_id is None:
+                            send_message(
+                                chat_id=user.chat_id,
+                                text="No active restaurant. Send /start to complete setup.",
+                                settings=settings,
+                            )
+                            return
+
+                        inv_svc = InventoryService(db)
+                        item_name = adj["item_name"]
+                        qty = adj["quantity"]
+                        unit = adj.get("unit")
+                        direction = adj.get("direction")  # "in", "out", or None
+
+                        matches = inv_svc.fuzzy_match_item(active_restaurant_id, item_name, threshold=0.5)
+                        unit_str = f" {unit}" if unit else ""
+
+                        if matches:
+                            best_item, best_score = matches[0]
+                            # Store pending adjustment in context
+                            ctx_svc.set_fields(
+                                user,
+                                adj_item_id=str(best_item.id),
+                                adj_item_name=best_item.name,
+                                adj_qty=qty,
+                                adj_unit=unit,
+                            )
+                            db.commit()
+
+                            display_name = best_item.name
+                            display_unit = f" {best_item.unit}" if best_item.unit else unit_str
+
+                            if best_score >= 0.8:
+                                if direction:
+                                    verb = "Add" if direction == "in" else "Remove"
+                                    msg = f"📦 {verb} {qty:g}{display_unit} {display_name}?"
+                                    buttons = [
+                                        [make_button(f"✅ Yes", cb_stock_conf(direction)), make_button("❌ Cancel", cb_stock_cancel())],
+                                    ]
+                                else:
+                                    msg = f"📦 {qty:g}{display_unit} {display_name} — add or remove?"
+                                    buttons = [
+                                        [make_button("➕ Add to stock", cb_stock_conf("in")), make_button("➖ Remove", cb_stock_conf("out"))],
+                                        [make_button("❌ Cancel", cb_stock_cancel())],
+                                    ]
+                            else:
+                                # Fuzzy suggestion
+                                if direction:
+                                    verb = "Add" if direction == "in" else "Remove"
+                                    msg = f"📦 Did you mean '{display_name}'?\n{verb} {qty:g}{display_unit}?"
+                                    buttons = [
+                                        [make_button(f"✅ Yes, {display_name}", cb_stock_conf(direction)), make_button("➕ New item", cb_stock_new(direction))],
+                                        [make_button("❌ Cancel", cb_stock_cancel())],
+                                    ]
+                                else:
+                                    msg = f"📦 Did you mean '{display_name}'?\n{qty:g}{display_unit} — add or remove?"
+                                    buttons = [
+                                        [make_button("➕ Add", cb_stock_conf("in")), make_button("➖ Remove", cb_stock_conf("out"))],
+                                        [make_button("➕ New item", cb_stock_new("in")), make_button("❌ Cancel", cb_stock_cancel())],
+                                    ]
+                        else:
+                            # No match — offer to create new item
+                            ctx_svc.set_fields(
+                                user,
+                                adj_item_id=None,
+                                adj_item_name=item_name,
+                                adj_qty=qty,
+                                adj_unit=unit,
+                            )
+                            db.commit()
+
+                            if direction:
+                                verb = "Add" if direction == "in" else "Remove"
+                                msg = f"📦 '{item_name}' not found.\n{verb} {qty:g}{unit_str} as a new item?"
+                                buttons = [
+                                    [make_button(f"➕ {verb} as new item", cb_stock_new(direction)), make_button("❌ Cancel", cb_stock_cancel())],
+                                ]
+                            else:
+                                msg = f"📦 '{item_name}' not found. Add {qty:g}{unit_str} as a new item?"
+                                buttons = [
+                                    [make_button("➕ Add to stock", cb_stock_new("in")), make_button("➖ Remove from stock", cb_stock_new("out"))],
+                                    [make_button("❌ Cancel", cb_stock_cancel())],
+                                ]
+
+                        send_message_with_keyboard(
+                            chat_id=user.chat_id,
+                            text=msg,
+                            reply_markup={"inline_keyboard": buttons},
                             settings=settings,
                         )
 

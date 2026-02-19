@@ -37,6 +37,12 @@ from app.telegram.bot_api import (
     send_message_with_keyboard,
 )
 from app.telegram.keyboards import pagination_keyboard
+from app.telegram.renderer import (
+    format_with_emoji,
+    format_supplier_name,
+    format_price_monospace,
+    format_footer,
+)
 
 
 HELP_TEXT = """Available commands:
@@ -46,7 +52,7 @@ HELP_TEXT = """Available commands:
 /list suppliers    — Show your linked suppliers
 /add supplier <name> — Add a new supplier
 /products          — Supplier product catalog
-/prices <name>     — Prices from a supplier
+/prices <name>     — Prices from a supplier (or search items across suppliers)
 /inventory         — Stock levels
 /balance           — Stock summary
 /uploads           — Pending uploads
@@ -309,19 +315,33 @@ def _render_products_page(
     ctx_svc.set_numbered_items(user, [price.id for _, price in products])
     ctx_svc.set_list_state(user, "products", offset)
 
-    lines = ["📦 Products\n"]
-    current_supplier_name = None
+    # Pre-fetch last-updated metadata for each unique supplier on this page
+    supplier_meta: dict = {}
+    for supplier, _ in products:
+        if supplier.id not in supplier_meta:
+            last_updated, _ = svc.get_price_list_meta(restaurant_id, supplier.id)
+            supplier_meta[supplier.id] = last_updated
+
+    lines = ["📦 **Products**\n"]
+    current_supplier_id = None
     for i, (supplier, price) in enumerate(products, offset + 1):
-        if supplier.name != current_supplier_name:
-            lines.append(f"\n{supplier.name}:")
-            current_supplier_name = supplier.name
-        price_str = format_price(price.price_minor, price.price_exp, price.currency)
+        if supplier.id != current_supplier_id:
+            last_updated = supplier_meta.get(supplier.id)
+            date_suffix = f" · {last_updated.strftime('%-d %b')}" if last_updated else ""
+            lines.append(f"\n{format_supplier_name(supplier.name)}{date_suffix}:")
+            current_supplier_id = supplier.id
+        price_str = format_price_monospace(price.price_minor, price.price_exp, price.currency)
         unit = f"/{price.unit}" if price.unit else ""
-        lines.append(f"{i}. {price.item_name} — {price_str}{unit}")
+        item_with_emoji = format_with_emoji(price.item_name)
+        lines.append(f"{i}. {item_with_emoji} — {price_str}{unit}")
 
     total_pages = max(1, math.ceil(total / _LIST_PAGE_SIZE))
+    footer_text = f"📊 {total} product{'s' if total != 1 else ''} total"
     if total_pages > 1:
-        lines.append(f"\nPage {page + 1}/{total_pages}")
+        footer_text += f" • Page {page + 1}/{total_pages}"
+    
+    lines.append("")  # Empty line before footer
+    lines.append(format_footer(footer_text, divider=True))
 
     keyboard = _pagination_markup(
         list_type="products",
@@ -385,7 +405,7 @@ def _render_prices_page(
     ctx_svc.set_list_state(user, "prices", offset)
     ctx_svc.set_fields(user, prices_supplier_id=str(supplier_id))
 
-    lines = [f"💰 Prices — {supplier_name}"]
+    lines = [f"💰 Prices — {format_supplier_name(supplier_name)}"]
     if last_updated:
         # Format: 12 June 2026 5:35 AM
         last_updated_str = last_updated.strftime('%-d %B %Y %-I:%M %p UTC')
@@ -395,18 +415,23 @@ def _render_prices_page(
     lines.append("")  # blank line before items
 
     for i, (price, effective_date) in enumerate(prices, offset + 1):
-        price_str = format_price(price.price_minor, price.price_exp, price.currency)
+        price_str = format_price_monospace(price.price_minor, price.price_exp, price.currency)
         unit = f"/{price.unit}" if price.unit else ""
         date_str = (
             f" (updated {effective_date.strftime('%b %d')})"
             if effective_date
             else ""
         )
-        lines.append(f"{i}. {price.item_name} — {price_str}{unit}{date_str}")
+        item_with_emoji = format_with_emoji(price.item_name)
+        lines.append(f"{i}. {item_with_emoji} — {price_str}{unit}{date_str}")
 
     total_pages = max(1, math.ceil(total / _LIST_PAGE_SIZE))
+    footer_text = f"📊 {total} price{'s' if total != 1 else ''} total"
     if total_pages > 1:
-        lines.append(f"\nPage {page + 1}/{total_pages}")
+        footer_text += f" • Page {page + 1}/{total_pages}"
+    
+    lines.append("")  # Empty line before footer
+    lines.append(format_footer(footer_text, divider=True))
 
     keyboard = _pagination_markup(
         list_type="prices",
@@ -440,16 +465,25 @@ def _render_inventory_page(
     ctx_svc.set_numbered_items(user, [item.id for item, _ in items])
     ctx_svc.set_list_state(user, "inventory", offset)
 
-    lines = ["📦 Inventory\n"]
+    last_movement = inv_svc.get_last_movement_time(restaurant_id)
+    lines = ["📦 **Inventory**"]
+    if last_movement:
+        lines.append(f"Last movement: {last_movement.strftime('%-d %B %Y %-I:%M %p UTC')}")
+    lines.append("")
     for i, (item, balance) in enumerate(items, offset + 1):
         bal_val = float(balance.balance) if balance is not None else 0.0
         unit = f" {item.unit}" if item.unit else ""
         prefix = "⚠️ " if bal_val < 0 else ""
-        lines.append(f"{i}. {prefix}{item.name} — {bal_val:g}{unit}")
+        item_with_emoji = format_with_emoji(item.name)
+        lines.append(f"{i}. {prefix}{item_with_emoji} — {bal_val:g}{unit}")
 
     total_pages = max(1, math.ceil(total / _LIST_PAGE_SIZE))
+    footer_text = f"📊 {total} item{'s' if total != 1 else ''} total"
     if total_pages > 1:
-        lines.append(f"\nPage {page + 1}/{total_pages}")
+        footer_text += f" • Page {page + 1}/{total_pages}"
+    
+    lines.append("")  # Empty line before footer
+    lines.append(format_footer(footer_text, divider=True))
 
     keyboard = _pagination_markup(
         list_type="inventory",
@@ -501,6 +535,67 @@ def _render_suppliers_page(
         total_pages=total_pages,
     )
     return "\n".join(lines), keyboard
+
+
+def _render_item_search_results(
+    *,
+    user: User,
+    db: Session,
+    ctx_svc: ContextService,
+    settings: Settings,
+    query: str,
+) -> str:
+    """Render item-first search results across all suppliers.
+    
+    Returns formatted message showing prices for the searched item
+    from all suppliers that have it.
+    """
+    restaurant_id = _require_active_restaurant(user, ctx_svc, db, settings)
+    if restaurant_id is None:
+        raise ValueError("No active restaurant. Send /start to complete setup.")
+
+    svc = SupplierService(db)
+    results = svc.search_items_across_suppliers(
+        restaurant_id=restaurant_id,
+        query=query,
+        threshold=0.3,
+        limit=20,
+    )
+
+    if not results:
+        raise ValueError(f'No items found matching "{query}".')
+
+    # Group by supplier for better presentation
+    lines = [f"🔍 **Item Search:** {query}\n"]
+    
+    current_supplier_name = None
+    supplier_results = []
+    
+    for price, supplier, effective_date, similarity_score in results:
+        if supplier.name != current_supplier_name:
+            if supplier_results:
+                lines.append("")  # empty line before next supplier
+            lines.append(f"{format_supplier_name(supplier.name)}:")
+            current_supplier_name = supplier.name
+            supplier_results = []
+        
+        price_str = format_price_monospace(price.price_minor, price.price_exp, price.currency)
+        unit = f"/{price.unit}" if price.unit else ""
+        date_str = (
+            f" (updated {effective_date.strftime('%b %d')})"
+            if effective_date
+            else ""
+        )
+        item_with_emoji = format_with_emoji(price.item_name)
+        # Show similarity score if less than 0.8 (not exact match)
+        score_indicator = f" ({similarity_score:.0%})" if similarity_score < 0.8 else ""
+        lines.append(f"• {item_with_emoji} — {price_str}{unit}{date_str}{score_indicator}")
+
+    total = len(results)
+    lines.append("")
+    lines.append(format_footer(f"📊 Found {total} price{'s' if total != 1 else ''} across {len(set(r[1].name for r in results))} supplier{'s' if len(set(r[1].name for r in results)) != 1 else ''}", divider=True))
+    
+    return "\n".join(lines)
 
 
 def build_list_page(
@@ -718,73 +813,91 @@ def handle(
         if not args:
             send_message(
                 chat_id=chat_id,
-                text="Usage: /prices <supplier name>\nExample: /prices ABC Wholesalers",
+                text="Usage: /prices <supplier or item name>\nExample: /prices ABC Wholesalers\nExample: /prices chicken breast",
                 settings=settings,
             )
             return
 
         svc = SupplierService(db)
+        # First try to match a supplier
         matches = svc.fuzzy_search_for_restaurant(
             args,
             restaurant_id=restaurant_id,
             threshold=0.6,
         )
-        if not matches:
-            suggestions = svc.fuzzy_search_for_restaurant(
-                args,
-                restaurant_id=restaurant_id,
-                threshold=0.2,
-            )
-            if suggestions:
-                unique_names: list[str] = []
-                for candidate, _score in suggestions:
-                    if candidate.name in unique_names:
-                        continue
-                    unique_names.append(candidate.name)
-                    if len(unique_names) >= 3:
-                        break
-                suggestion_lines = [f"• {name}" for name in unique_names]
-                send_message(
-                    chat_id=chat_id,
-                    text=(
-                        f'No supplier found matching "{args}".\n\n'
-                        "Did you mean:\n"
-                        f"{'\n'.join(suggestion_lines)}\n\n"
-                        "Use /prices <supplier name> or /list suppliers."
-                    ),
+        if matches:
+            # Supplier found: show prices from that supplier
+            supplier, _ = matches[0]
+            try:
+                text_out, keyboard = _render_prices_page(
+                    user=user,
+                    db=db,
+                    ctx_svc=ctx_svc,
                     settings=settings,
+                    page=0,
+                    supplier_id=supplier.id,
+                    supplier_name=supplier.name,
                 )
+            except ValueError as exc:
+                send_message(chat_id=chat_id, text=str(exc), settings=settings)
                 return
-            send_message(
+
+            db.commit()
+            _publish_list_message(
+                user=user,
+                db=db,
+                ctx_svc=ctx_svc,
                 chat_id=chat_id,
-                text=f'No supplier found matching "{args}". Use /list suppliers to see your suppliers.',
+                text=text_out,
+                reply_markup=keyboard,
                 settings=settings,
             )
             return
-
-        supplier, _ = matches[0]
+        
+        # No supplier found: try item-first search across all suppliers
         try:
-            text_out, keyboard = _render_prices_page(
+            item_results_text = _render_item_search_results(
                 user=user,
                 db=db,
                 ctx_svc=ctx_svc,
                 settings=settings,
-                page=0,
-                supplier_id=supplier.id,
-                supplier_name=supplier.name,
+                query=args,
             )
-        except ValueError as exc:
-            send_message(chat_id=chat_id, text=str(exc), settings=settings)
+            send_message(chat_id=chat_id, text=item_results_text, settings=settings)
             return
+        except ValueError:
+            # Item search also failed - show supplier suggestions as before
+            pass
 
-        db.commit()
-        _publish_list_message(
-            user=user,
-            db=db,
-            ctx_svc=ctx_svc,
+        # Neither supplier nor item found - show supplier suggestions
+        suggestions = svc.fuzzy_search_for_restaurant(
+            args,
+            restaurant_id=restaurant_id,
+            threshold=0.2,
+        )
+        if suggestions:
+            unique_names: list[str] = []
+            for candidate, _score in suggestions:
+                if candidate.name in unique_names:
+                    continue
+                unique_names.append(candidate.name)
+                if len(unique_names) >= 3:
+                    break
+            suggestion_lines = [f"• {name}" for name in unique_names]
+            send_message(
+                chat_id=chat_id,
+                text=(
+                    f'No supplier or item found matching "{args}".\n\n'
+                    "Did you mean these suppliers?\n"
+                    f"{'\n'.join(suggestion_lines)}\n\n"
+                    "Use /prices <supplier name> or /list suppliers."
+                ),
+                settings=settings,
+            )
+            return
+        send_message(
             chat_id=chat_id,
-            text=text_out,
-            reply_markup=keyboard,
+            text=f'No supplier or item found matching "{args}". Use /list suppliers to see your suppliers.',
             settings=settings,
         )
         return
@@ -856,7 +969,7 @@ def handle(
             for item, balance in negative_items:
                 bal_val = float(balance.balance)
                 unit = f" {item.unit}" if item.unit else ""
-                lines.append(f"• {item.name}: {bal_val:g}{unit}")
+                lines.append(f"• {format_with_emoji(item.name)}: {bal_val:g}{unit}")
             if summary.negative_count > len(negative_items):
                 lines.append(f"• +{summary.negative_count - len(negative_items)} more")
 
@@ -864,7 +977,7 @@ def handle(
             lines.append("\nZero-stock items:")
             for item, _balance in zero_items:
                 unit = f" ({item.unit})" if item.unit else ""
-                lines.append(f"• {item.name}{unit}")
+                lines.append(f"• {format_with_emoji(item.name)}{unit}")
             if summary.zero_stock_count > len(zero_items):
                 lines.append(f"• +{summary.zero_stock_count - len(zero_items)} more")
 

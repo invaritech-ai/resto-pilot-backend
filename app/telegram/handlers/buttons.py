@@ -63,6 +63,7 @@ from app.services.restaurant_service import RestaurantService
 from app.services.staging_service import StagingService
 from app.services.supplier_service import SupplierService
 from app.telegram.bot_api import answer_callback_query, edit_message_text, send_message, send_message_with_keyboard
+from app.telegram.renderer import format_with_emoji, format_supplier_name, format_price_monospace, format_footer
 from app.telegram.keyboards import (
     cb_confirm_upload,
     cb_delete_upload,
@@ -72,6 +73,9 @@ from app.telegram.keyboards import (
     cb_pick_currency,
     cb_set_currency,
     cb_skip_item,
+    cb_stock_cancel,
+    cb_stock_conf,
+    cb_stock_new,
     cb_use_match,
     hex_to_uuid,
     make_button,
@@ -180,22 +184,25 @@ def handle(
     params = parts[1:] if len(parts) > 1 else []
 
     dispatch = {
-        "doc_type":  _handle_doc_type,
-        "conf_u":    _handle_conf_u,
-        "del_u":     _handle_del_u,
-        "set_sup":   _handle_set_sup,
-        "new_sup":   _handle_new_sup,
-        "type_sup":  _handle_type_sup,
-        "use_match": _handle_use_match,
-        "mk_item":   _handle_mk_item,
-        "skip_item": _handle_skip_item,
-        "rev_p":     _handle_rev_page,
-        "open_u":    _handle_open_u,
-        "pick_cur":  _handle_pick_cur,
-        "set_cur":   _handle_set_cur,
-        "list_p":    _handle_list_page,
-        "ed_row":    _handle_ed_row,
-        "ed_fld":    _handle_ed_fld,
+        "doc_type":    _handle_doc_type,
+        "conf_u":      _handle_conf_u,
+        "del_u":       _handle_del_u,
+        "set_sup":     _handle_set_sup,
+        "new_sup":     _handle_new_sup,
+        "type_sup":    _handle_type_sup,
+        "use_match":   _handle_use_match,
+        "mk_item":     _handle_mk_item,
+        "skip_item":   _handle_skip_item,
+        "rev_p":       _handle_rev_page,
+        "open_u":      _handle_open_u,
+        "pick_cur":    _handle_pick_cur,
+        "set_cur":     _handle_set_cur,
+        "list_p":      _handle_list_page,
+        "ed_row":      _handle_ed_row,
+        "ed_fld":      _handle_ed_fld,
+        "stock_conf":  _handle_stock_conf,
+        "stock_new":   _handle_stock_new,
+        "stock_cancel": _handle_stock_cancel,
     }
 
     handler = dispatch.get(action)
@@ -362,6 +369,21 @@ def _handle_conf_u(*, params, user, db, ctx_svc, settings, callback_id, chat_id,
             )
             return
 
+        # Get price changes for insight card
+        from app.services.emoji_taxonomy import emoji_taxonomy
+        from app.services.money import to_display
+        
+        extracted_data = staging.extracted_data_json or {}
+        line_items = extracted_data.get("line_items", [])
+        currency = extracted_data.get("currency", "")
+        
+        price_changes = PriceService(db).get_price_changes_for_supplier(
+            supplier_id=staging.supplier_id,
+            restaurant_id=staging.restaurant_id,
+            new_items=line_items,
+            currency=currency,
+        )
+        
         staging.status = "confirmed"
         ctx_svc.set_fields(
             user,
@@ -371,11 +393,75 @@ def _handle_conf_u(*, params, user, db, ctx_svc, settings, callback_id, chat_id,
         )
         db.commit()
 
+        # Build insight card
+        insight_lines = []
+        
+        if price_changes:
+            # Group changes
+            new_items = [c for c in price_changes if c["is_new"]]
+            increases = [c for c in price_changes if not c["is_new"] and c.get("percent_change") is not None and c["percent_change"] > 10]
+            decreases = [c for c in price_changes if not c["is_new"] and c.get("percent_change") is not None and c["percent_change"] < -10]
+            minor_changes = [c for c in price_changes if not c["is_new"] and c.get("percent_change") is not None and -10 <= c["percent_change"] <= 10]
+            
+            # Get supplier name for header
+            from sqlalchemy import select
+            from app.db.models.suppliers import Supplier
+            supplier = db.scalar(select(Supplier).where(Supplier.id == staging.supplier_id))
+            supplier_name = supplier.name if supplier else "Supplier"
+            
+            insight_lines.append(f"✅ Price list confirmed — {count} price{'s' if count != 1 else ''} saved.\n")
+            insight_lines.append(f"📈 Price Insights for {supplier_name}:\n")
+            
+            # New items
+            if new_items:
+                insight_lines.append(f"🆕 New items ({len(new_items)}):")
+                for change in new_items[:5]:  # Limit to 5
+                    item_name = emoji_taxonomy.format_with_emoji(change["item_name"])
+                    price_display = to_display(change["new_price_minor"], change["new_price_exp"])
+                    currency_symbol = change["new_currency"] or ""
+                    insight_lines.append(f"  {item_name} — {currency_symbol}{price_display:.2f}")
+                insight_lines.append("")
+            
+            # Significant increases
+            if increases:
+                insight_lines.append(f"🔺 Price increases >10% ({len(increases)}):")
+                for change in increases[:5]:  # Limit to 5
+                    item_name = emoji_taxonomy.format_with_emoji(change["item_name"])
+                    old_price = to_display(change["old_price_minor"], change["old_price_exp"])
+                    new_price = to_display(change["new_price_minor"], change["new_price_exp"])
+                    percent = change["percent_change"]
+                    currency_symbol = change["new_currency"] or ""
+                    insight_lines.append(f"  {item_name} — {currency_symbol}{old_price:.2f} → {currency_symbol}{new_price:.2f} (+{percent:.0f}%)")
+                insight_lines.append("")
+            
+            # Significant decreases
+            if decreases:
+                insight_lines.append(f"🔻 Price decreases >10% ({len(decreases)}):")
+                for change in decreases[:5]:  # Limit to 5
+                    item_name = emoji_taxonomy.format_with_emoji(change["item_name"])
+                    old_price = to_display(change["old_price_minor"], change["old_price_exp"])
+                    new_price = to_display(change["new_price_minor"], change["new_price_exp"])
+                    percent = change["percent_change"]
+                    currency_symbol = change["new_currency"] or ""
+                    insight_lines.append(f"  {item_name} — {currency_symbol}{old_price:.2f} → {currency_symbol}{new_price:.2f} ({percent:.0f}%)")
+                insight_lines.append("")
+            
+            # Minor changes (optional)
+            if minor_changes and not (new_items or increases or decreases):
+                insight_lines.append("✅ No significant price changes detected.")
+            
+            # Truncate if too long
+            insight_text = "\n".join(insight_lines)
+            if len(insight_text) > 4000:
+                insight_text = "\n".join(insight_lines[:20]) + "\n\n... and more"
+        else:
+            insight_text = f"✅ Price list confirmed — {count} price{'s' if count != 1 else ''} saved."
+        
         if message_id:
             edit_message_text(
                 chat_id=chat_id,
                 message_id=message_id,
-                text=f"✅ Price list confirmed — {count} price{'s' if count != 1 else ''} saved.",
+                text=insight_text,
                 settings=settings,
             )
         answer_callback_query(
@@ -1936,3 +2022,194 @@ def handle_item_edit_input(
         if new_msg_id:
             ctx_svc.set_fields(user, review_message_id=new_msg_id)
             db.commit()
+
+
+# ---------------------------------------------------------------------------
+# Quick stock adjustment button handlers
+# ---------------------------------------------------------------------------
+
+
+def _clear_adj_context(ctx_svc: ContextService, user: "User", db: "Session") -> None:
+    ctx_svc.set_fields(user, adj_item_id=None, adj_item_name=None, adj_qty=None, adj_unit=None)
+    db.commit()
+
+
+def _handle_stock_conf(
+    *,
+    params: list[str],
+    user: "User",
+    db: "Session",
+    ctx_svc: ContextService,
+    settings: Settings,
+    callback_id: str,
+    chat_id: int,
+    message_id: int | None,
+    **_: object,
+) -> None:
+    """Confirm pending quick stock adjustment for a matched item."""
+    if not params or params[0] not in ("in", "out"):
+        answer_callback_query(callback_id=callback_id, text="Invalid action.", settings=settings)
+        return
+
+    direction = params[0]
+    fields = ctx_svc.get_fields(user)
+    item_id_raw = fields.get("adj_item_id")
+    item_name = str(fields.get("adj_item_name") or "")
+    qty_raw = fields.get("adj_qty")
+    unit = fields.get("adj_unit") or None
+
+    if not item_id_raw or not item_name or qty_raw is None:
+        answer_callback_query(callback_id=callback_id, text="Expired — please type again.", settings=settings)
+        if message_id:
+            edit_message_text(chat_id=chat_id, message_id=message_id, text="Adjustment expired. Please type again.", settings=settings)
+        return
+
+    try:
+        item_id = _uuid_mod.UUID(str(item_id_raw))
+        qty = float(qty_raw)
+    except (ValueError, TypeError):
+        answer_callback_query(callback_id=callback_id, text="Expired — please type again.", settings=settings)
+        return
+
+    active_restaurant_id = ctx_svc.get_active_restaurant_id(user)
+    if active_restaurant_id is None:
+        answer_callback_query(callback_id=callback_id, text="No active restaurant.", settings=settings)
+        return
+
+    is_member, _ = _membership_flags(db=db, restaurant_id=active_restaurant_id, user_id=user.id)
+    if not is_member:
+        answer_callback_query(callback_id=callback_id, text=_AUTHZ_DENIED_TEXT, show_alert=True, settings=settings)
+        _clear_adj_context(ctx_svc, user, db)
+        return
+
+    inv_svc = InventoryService(db)
+    txn_type = "credit" if direction == "in" else "debit"
+    inv_svc.record_transaction(
+        restaurant_id=active_restaurant_id,
+        item_id=item_id,
+        txn_type=txn_type,
+        quantity=qty,
+        created_by=user.id,
+        source="manual",
+    )
+    _clear_adj_context(ctx_svc, user, db)
+
+    from app.db.models.inventory_balances import InventoryBalance
+    from sqlalchemy import select as _sa_select
+    new_balance = db.scalar(
+        _sa_select(InventoryBalance.balance).where(
+            InventoryBalance.item_id == item_id,
+            InventoryBalance.restaurant_id == active_restaurant_id,
+        )
+    )
+    bal_str = f"{float(new_balance):g}" if new_balance is not None else "?"
+    unit_str = f" {unit}" if unit else ""
+    verb = "Added" if direction == "in" else "Removed"
+    result_text = f"✅ {verb} {qty:g}{unit_str} {item_name}. Balance: {bal_str}{unit_str}"
+
+    answer_callback_query(callback_id=callback_id, text="", settings=settings)
+    if message_id:
+        edit_message_text(chat_id=chat_id, message_id=message_id, text=result_text, settings=settings)
+    else:
+        send_message(chat_id=chat_id, text=result_text, settings=settings)
+
+
+def _handle_stock_new(
+    *,
+    params: list[str],
+    user: "User",
+    db: "Session",
+    ctx_svc: ContextService,
+    settings: Settings,
+    callback_id: str,
+    chat_id: int,
+    message_id: int | None,
+    **_: object,
+) -> None:
+    """Create new inventory item and record quick stock adjustment."""
+    if not params or params[0] not in ("in", "out"):
+        answer_callback_query(callback_id=callback_id, text="Invalid action.", settings=settings)
+        return
+
+    direction = params[0]
+    fields = ctx_svc.get_fields(user)
+    item_name = str(fields.get("adj_item_name") or "").strip()
+    qty_raw = fields.get("adj_qty")
+    unit = fields.get("adj_unit") or None
+
+    if not item_name or qty_raw is None:
+        answer_callback_query(callback_id=callback_id, text="Expired — please type again.", settings=settings)
+        if message_id:
+            edit_message_text(chat_id=chat_id, message_id=message_id, text="Adjustment expired. Please type again.", settings=settings)
+        return
+
+    try:
+        qty = float(qty_raw)
+    except (ValueError, TypeError):
+        answer_callback_query(callback_id=callback_id, text="Expired — please type again.", settings=settings)
+        return
+
+    active_restaurant_id = ctx_svc.get_active_restaurant_id(user)
+    if active_restaurant_id is None:
+        answer_callback_query(callback_id=callback_id, text="No active restaurant.", settings=settings)
+        return
+
+    is_member, _ = _membership_flags(db=db, restaurant_id=active_restaurant_id, user_id=user.id)
+    if not is_member:
+        answer_callback_query(callback_id=callback_id, text=_AUTHZ_DENIED_TEXT, show_alert=True, settings=settings)
+        _clear_adj_context(ctx_svc, user, db)
+        return
+
+    inv_svc = InventoryService(db)
+    new_item, _ = inv_svc.get_or_create_item(
+        restaurant_id=active_restaurant_id,
+        name=item_name,
+        unit=unit,
+    )
+    txn_type = "credit" if direction == "in" else "debit"
+    inv_svc.record_transaction(
+        restaurant_id=active_restaurant_id,
+        item_id=new_item.id,
+        txn_type=txn_type,
+        quantity=qty,
+        created_by=user.id,
+        source="manual",
+    )
+    _clear_adj_context(ctx_svc, user, db)
+
+    from app.db.models.inventory_balances import InventoryBalance
+    from sqlalchemy import select as _sa_select
+    new_balance = db.scalar(
+        _sa_select(InventoryBalance.balance).where(
+            InventoryBalance.item_id == new_item.id,
+            InventoryBalance.restaurant_id == active_restaurant_id,
+        )
+    )
+    bal_str = f"{float(new_balance):g}" if new_balance is not None else "?"
+    unit_str = f" {unit}" if unit else ""
+    verb = "Added" if direction == "in" else "Removed"
+    result_text = f"✅ {verb} {qty:g}{unit_str} {new_item.name}. Balance: {bal_str}{unit_str}"
+
+    answer_callback_query(callback_id=callback_id, text="", settings=settings)
+    if message_id:
+        edit_message_text(chat_id=chat_id, message_id=message_id, text=result_text, settings=settings)
+    else:
+        send_message(chat_id=chat_id, text=result_text, settings=settings)
+
+
+def _handle_stock_cancel(
+    *,
+    user: "User",
+    db: "Session",
+    ctx_svc: ContextService,
+    settings: Settings,
+    callback_id: str,
+    chat_id: int,
+    message_id: int | None,
+    **_: object,
+) -> None:
+    """Cancel pending quick stock adjustment."""
+    _clear_adj_context(ctx_svc, user, db)
+    answer_callback_query(callback_id=callback_id, text="", settings=settings)
+    if message_id:
+        edit_message_text(chat_id=chat_id, message_id=message_id, text="Cancelled.", settings=settings)

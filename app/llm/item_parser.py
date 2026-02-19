@@ -228,6 +228,101 @@ def parse_price_list(
     )
 
 
+_STOCK_ADJUSTMENT_SYSTEM = (
+    "You parse natural language inventory adjustment messages from restaurant staff.\n"
+    "Extract and return ONLY valid JSON with these fields:\n"
+    "  item_name  (string)  — the ingredient or product name\n"
+    "  quantity   (number)  — a positive number (always positive, direction handled separately)\n"
+    "  unit       (string|null) — unit like kg, g, L, pkt, box, etc.; null if not mentioned\n"
+    "  direction  (string|null) — 'in' if received/added/left on hand, 'out' if used/consumed/sold/removed; null if ambiguous\n"
+    "If the message is NOT an inventory adjustment, return: {\"error\": \"not_stock_adjustment\"}\n"
+    "Examples:\n"
+    "  'got 5kg chicken' → {\"item_name\":\"chicken\",\"quantity\":5,\"unit\":\"kg\",\"direction\":\"in\"}\n"
+    "  'used 2.5 kg beef' → {\"item_name\":\"beef\",\"quantity\":2.5,\"unit\":\"kg\",\"direction\":\"out\"}\n"
+    "  '+3 boxes milk' → {\"item_name\":\"milk\",\"quantity\":3,\"unit\":\"boxes\",\"direction\":\"in\"}\n"
+    "  '-500g butter' → {\"item_name\":\"butter\",\"quantity\":500,\"unit\":\"g\",\"direction\":\"out\"}\n"
+    "  'onion 1kg' → {\"item_name\":\"onion\",\"quantity\":1,\"unit\":\"kg\",\"direction\":null}\n"
+    "  '1kg onion left' → {\"item_name\":\"onion\",\"quantity\":1,\"unit\":\"kg\",\"direction\":\"in\"}\n"
+    "  'hello' → {\"error\":\"not_stock_adjustment\"}\n"
+    "Return ONLY the JSON object, no markdown, no explanation."
+)
+
+
+def parse_stock_adjustment(
+    settings: Settings,
+    text: str,
+    on_llm_call: LlmCallCallback | None = None,
+) -> dict:
+    """Parse natural language inventory adjustment into structured data.
+
+    Returns:
+        Dict with keys: item_name (str), quantity (float), unit (str|None),
+        direction ("in"|"out"|None).
+
+    Raises:
+        ParseError: text is not a stock adjustment or LLM returned bad output.
+    """
+    client = OpenAI(
+        api_key=settings.parser_api_key or settings.openai_api_key,
+        base_url=settings.parser_base_url or settings.openai_base_url,
+        timeout=settings.openai_timeout_seconds,
+        max_retries=settings.openai_max_retries,
+    )
+    model = settings.parser_model or settings.openai_model
+
+    t0 = time.monotonic()
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": _STOCK_ADJUSTMENT_SYSTEM},
+                {"role": "user", "content": text},
+            ],
+            temperature=0.0,
+        )
+    except Exception as exc:
+        latency_ms = int((time.monotonic() - t0) * 1000)
+        _emit_llm_call(
+            on_llm_call=on_llm_call,
+            payload={"purpose": "stock_adjustment", "model": model, "latency_ms": latency_ms, "error": str(exc)},
+        )
+        raise ParseError(f"LLM call failed: {exc}") from exc
+
+    latency_ms = int((time.monotonic() - t0) * 1000)
+    _emit_llm_call(
+        on_llm_call=on_llm_call,
+        payload={"purpose": "stock_adjustment", "model": model, "latency_ms": latency_ms, **_extract_response_meta(response)},
+    )
+
+    raw = (response.choices[0].message.content or "").strip()
+    if raw.startswith("```"):
+        lines = raw.splitlines()
+        raw = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:]).strip()
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ParseError(f"LLM returned invalid JSON: {exc}") from exc
+
+    if not isinstance(parsed, dict):
+        raise ParseError("LLM returned non-dict")
+    if "error" in parsed:
+        raise ParseError(f"Not a stock adjustment: {parsed['error']}")
+
+    item_name = str(parsed.get("item_name") or "").strip()
+    if not item_name:
+        raise ParseError("Missing item_name in stock adjustment")
+    quantity = _to_float(parsed.get("quantity"))
+    if quantity is None or quantity <= 0:
+        raise ParseError(f"Invalid quantity: {parsed.get('quantity')!r}")
+    unit_raw = parsed.get("unit")
+    unit = str(unit_raw).strip() if unit_raw else None
+    direction_raw = parsed.get("direction")
+    direction = str(direction_raw) if direction_raw in ("in", "out") else None
+
+    return {"item_name": item_name, "quantity": quantity, "unit": unit, "direction": direction}
+
+
 # ---------------------------------------------------------------------------
 # Internal implementation
 # ---------------------------------------------------------------------------

@@ -404,3 +404,10 @@ class InventoryService:
         )
         rows = self.session.execute(stmt).all()
         return [(row[0], row[1]) for row in rows]
+
+    def get_last_movement_time(self, restaurant_id: uuid.UUID) -> dt.datetime | None:
+        """Return the most recent inventory_balances.updated_at for this restaurant."""
+        stmt = select(func.max(InventoryBalance.updated_at)).where(
+            InventoryBalance.restaurant_id == restaurant_id
+        )
+        return self.session.scalar(stmt)

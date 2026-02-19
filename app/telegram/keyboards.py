@@ -145,6 +145,21 @@ def cb_set_currency(staging_id: uuid.UUID, code: str) -> str:
     return _ensure_callback_limit(f"set_cur:{uuid_to_hex(staging_id)}:{code}")
 
 
+def cb_stock_conf(direction: str) -> str:
+    """Confirm quick stock adjustment: stock_conf:{in|out}"""
+    return f"stock_conf:{direction}"
+
+
+def cb_stock_new(direction: str) -> str:
+    """Create new item + record quick stock adjustment: stock_new:{in|out}"""
+    return f"stock_new:{direction}"
+
+
+def cb_stock_cancel() -> str:
+    """Cancel pending quick stock adjustment: stock_cancel"""
+    return "stock_cancel"
+
+
 # ---------------------------------------------------------------------------
 # Keyboard builders
 # ---------------------------------------------------------------------------

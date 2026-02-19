@@ -7,6 +7,13 @@ Display converts back to human-readable decimals.
 Example:
     price_minor=250, price_exp=2 → "2.50"
     unit_qty_minor=1500, unit_qty_exp=3 → "1.500"
+
+Visual Hierarchy:
+    - Item names with emoji prefix via emoji_taxonomy
+    - Supplier names in bold
+    - Prices in monospace
+    - Status chips (⚪️ Pending, 🟡 Review, ✅ Confirmed, ❌ Error)
+    - Consistent footer formatting
 """
 
 from __future__ import annotations
@@ -14,6 +21,7 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
+from app.services.emoji_taxonomy import emoji_taxonomy
 from app.services.money import to_display
 
 
@@ -173,3 +181,70 @@ def render_success(message: str) -> str:
 def render_error(message: str) -> str:
     """Render error message."""
     return f"❌ {message}"
+
+
+def format_with_emoji(item_name: str) -> str:
+    """Format item name with emoji prefix if available.
+    
+    Returns:
+        Formatted string like "🐔 Chicken Breast" or "Chicken Breast"
+    """
+    return emoji_taxonomy.format_with_emoji(item_name)
+
+
+def format_status_chip(status: str) -> str:
+    """Format a status indicator chip.
+    
+    Args:
+        status: Status string (pending, review, confirmed, error)
+        
+    Returns:
+        Emoji + label like "⚪️ Pending", "🟡 Review", "✅ Confirmed", "❌ Error"
+    """
+    mapping = {
+        "pending": "⚪️ Pending",
+        "processing": "⚪️ Processing",
+        "review": "🟡 Review",
+        "confirmed": "✅ Confirmed",
+        "error": "❌ Error",
+        "pending_review": "🟡 Pending Review",
+        "active": "✅ Active",
+        "inactive": "⚪️ Inactive",
+    }
+    return mapping.get(status.lower(), f"⚪️ {status.title()}")
+
+
+def format_supplier_name(supplier_name: str) -> str:
+    """Format supplier name in bold.
+    
+    Returns:
+        Markdown-bold string like "**ABC Wholesalers**"
+    """
+    return f"**{supplier_name}**"
+
+
+def format_price_monospace(price_minor: int, price_exp: int, currency: str | None = None) -> str:
+    """Format price in monospace for visual distinction.
+    
+    Returns:
+        Monospace string like "`2.50 SGD`"
+    """
+    display = str(to_display(price_minor, price_exp))
+    if currency:
+        return f"`{display} {currency}`"
+    return f"`{display}`"
+
+
+def format_footer(text: str, divider: bool = True) -> str:
+    """Format footer text with optional divider.
+    
+    Args:
+        text: Footer text
+        divider: Whether to add a divider line before the footer
+        
+    Returns:
+        Formatted footer like "─────────────\n📊 5 items total"
+    """
+    if divider:
+        return f"─────────────\n{text}"
+    return text

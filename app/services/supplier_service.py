@@ -310,6 +310,45 @@ class SupplierService:
         rows = self.session.execute(stmt).all()
         return [(row[0], row[1]) for row in rows]
 
+    def search_items_across_suppliers(
+        self,
+        restaurant_id: uuid.UUID,
+        query: str,
+        threshold: float = 0.3,
+        limit: int = 20,
+    ) -> list[tuple[SupplierPrice, Supplier, dt.date | None, float]]:
+        """Fuzzy search for items across all suppliers for a restaurant.
+
+        Args:
+            restaurant_id: Restaurant to search within.
+            query: Item name to search for.
+            threshold: Minimum similarity score (0.0–1.0). Lower threshold for broad matches.
+            limit: Maximum number of results.
+
+        Returns:
+            List of (SupplierPrice, Supplier, effective_date, similarity_score) tuples,
+            ordered by similarity descending, then supplier name, then item name.
+        """
+        query_lower = query.strip().lower()
+        if not query_lower:
+            return []
+
+        score = func.similarity(SupplierPrice.item_name_lower, query_lower).label("score")
+
+        stmt = (
+            select(SupplierPrice, Supplier, SupplierPriceList.effective_date, score)
+            .join(SupplierPriceList, SupplierPrice.price_list_id == SupplierPriceList.id)
+            .join(Supplier, SupplierPrice.supplier_id == Supplier.id)
+            .where(
+                SupplierPriceList.restaurant_id == restaurant_id,
+                func.similarity(SupplierPrice.item_name_lower, query_lower) >= threshold,
+            )
+            .order_by(score.desc(), Supplier.name_lower, SupplierPrice.item_name_lower)
+            .limit(limit)
+        )
+        rows = self.session.execute(stmt).all()
+        return [(row[0], row[1], row[2], float(row[3])) for row in rows]
+
     def count_products_for_restaurant(self, restaurant_id: uuid.UUID) -> int:
         """Return total product count across all price lists for a restaurant."""
         stmt = (

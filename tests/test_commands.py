@@ -755,6 +755,7 @@ class TestProductsCommand:
             MockSvc.return_value.user_membership_exists.return_value = True
             MockSvc2.return_value.list_products_for_restaurant.return_value = [(supplier, price)]
             MockSvc2.return_value.count_products_for_restaurant.return_value = 1
+            MockSvc2.return_value.get_price_list_meta.return_value = (None, None)
             handle(_make_update("/products"), user, db, ctx_svc, _make_settings())
 
         text = mock_send.call_args[1]["text"]
@@ -783,6 +784,7 @@ class TestProductsCommand:
                 (s1, p1), (s2, p2)
             ]
             MockSvc2.return_value.count_products_for_restaurant.return_value = 2
+            MockSvc2.return_value.get_price_list_meta.return_value = (None, None)
             handle(_make_update("/products"), user, db, ctx_svc, _make_settings())
 
         text = mock_send.call_args[1]["text"]
@@ -807,6 +809,7 @@ class TestProductsCommand:
             MockSvc.return_value.user_membership_exists.return_value = True
             MockSvc2.return_value.list_products_for_restaurant.return_value = page
             MockSvc2.return_value.count_products_for_restaurant.return_value = 11
+            MockSvc2.return_value.get_price_list_meta.return_value = (None, None)
             handle(_make_update("/products"), user, db, ctx_svc, _make_settings())
 
         text = mock_send.call_args[1]["text"]
@@ -832,6 +835,7 @@ class TestProductsCommand:
             MockSvc.return_value.user_membership_exists.return_value = True
             MockSvc2.return_value.list_products_for_restaurant.return_value = page
             MockSvc2.return_value.count_products_for_restaurant.return_value = 11
+            MockSvc2.return_value.get_price_list_meta.return_value = (None, None)
             mock_send_kb.return_value = 222
             handle(_make_update("/products"), user, db, ctx_svc, _make_settings())
 
@@ -912,10 +916,12 @@ class TestPricesCommand:
              patch("app.telegram.handlers.commands.send_message") as mock_send:
             MockSvc.return_value.user_membership_exists.return_value = True
             MockSvc2.return_value.fuzzy_search_for_restaurant.return_value = []
+            # Mock item search to raise ValueError (no items found)
+            MockSvc2.return_value.search_items_across_suppliers.side_effect = ValueError('No items found')
             handle(_make_update("/prices UnknownCo"), user, db, ctx_svc, _make_settings())
 
         text = mock_send.call_args[1]["text"]
-        assert "No supplier found" in text
+        assert "No supplier or item found" in text
 
     def test_prices_no_match_shows_did_you_mean_suggestions(self):
         user = _make_user(RESTAURANT_ID)
@@ -937,6 +943,8 @@ class TestPricesCommand:
                 [],
                 [(suggestion_1, 0.33), (suggestion_2, 0.27)],
             ]
+            # Mock item search to raise ValueError (no items found)
+            MockSvc2.return_value.search_items_across_suppliers.side_effect = ValueError('No items found')
             handle(_make_update("/prices Soha"), user, db, ctx_svc, _make_settings())
 
         text = mock_send.call_args[1]["text"]
@@ -1045,7 +1053,7 @@ class TestPricesCommand:
         """Regression: /prices must use fuzzy_search_for_restaurant, not fuzzy_search.
 
         A supplier that exists globally but is not linked to the active restaurant
-        must return "No supplier found", not leak prices from another restaurant.
+        must return "No supplier or item found", not leak prices from another restaurant.
         """
         user = _make_user(RESTAURANT_ID)
         ctx_svc = _make_ctx_svc(user)
@@ -1057,10 +1065,12 @@ class TestPricesCommand:
             MockSvc.return_value.user_membership_exists.return_value = True
             # Restaurant-scoped search finds nothing (supplier exists globally but not linked)
             MockSvc2.return_value.fuzzy_search_for_restaurant.return_value = []
+            # Mock item search to raise ValueError (no items found)
+            MockSvc2.return_value.search_items_across_suppliers.side_effect = ValueError('No items found')
             handle(_make_update("/prices GlobalOnlyCo"), user, db, ctx_svc, _make_settings())
 
         text = mock_send.call_args[1]["text"]
-        assert "No supplier found" in text
+        assert "No supplier or item found" in text
         # Global fuzzy_search must NOT have been called for /prices
         MockSvc2.return_value.fuzzy_search.assert_not_called()
 

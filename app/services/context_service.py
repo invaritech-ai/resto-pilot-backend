@@ -41,6 +41,10 @@ _NAV_FIELDS = (
     "supplier_input_staging_id", # staging_id waiting for typed supplier input
     "supplier_input_mode",       # supplier input mode: resolve or create
     "prices_supplier_id",        # active supplier context for /prices pagination callbacks
+    "adj_item_id",               # quick stock adj: UUID of matched inventory item
+    "adj_item_name",             # quick stock adj: display name (also used for new-item creation)
+    "adj_qty",                   # quick stock adj: quantity (float)
+    "adj_unit",                  # quick stock adj: unit string (optional)
 )
 
 

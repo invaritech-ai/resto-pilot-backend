@@ -22,14 +22,16 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import uuid
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
 
-from sqlalchemy import select
+from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
 from app.db.models.supplier_price_lists import SupplierPriceList
 from app.db.models.supplier_prices import SupplierPrice
 from app.db.models.suppliers import Supplier
-from app.services.money import infer_exp, to_minor as _money_to_minor
+from app.services.money import infer_exp, to_minor as _money_to_minor, to_display, format_price
 from app.services.staging_service import StagingNotFoundError, StagingService
 
 logger = logging.getLogger(__name__)
@@ -156,7 +158,7 @@ class PriceService:
     def enrich_supplier(self, supplier: Supplier, data: dict) -> None:
         """Null-fill supplier contact fields from extracted document data.
 
-        Never overwrites existing non-null values. Caller must flush/commit.
+        Never overwrites existing non‑null values. Caller must flush/commit.
 
         Fields updated if currently null:
             contact_name, phone, email, default_currency, notes (lead_time appended)
@@ -192,3 +194,107 @@ class PriceService:
             self.session.add(supplier)
             self.session.flush()
             logger.info("price_service_supplier_enriched supplier_id=%s", supplier.id)
+
+    def get_price_changes_for_supplier(
+        self,
+        supplier_id: uuid.UUID,
+        restaurant_id: uuid.UUID,
+        new_items: List[dict],
+        currency: str,
+    ) -> List[dict]:
+        """Compare new price list items with previous prices for the same supplier.
+
+        Args:
+            supplier_id: Supplier identifier
+            restaurant_id: Restaurant identifier
+            new_items: List of dicts with keys: name, unit_price, unit (optional)
+            currency: Currency code for the new price list
+
+        Returns:
+            List of dicts with keys:
+                item_name: str
+                old_price_minor: int | None
+                old_price_exp: int | None
+                old_currency: str | None
+                new_price_minor: int
+                new_price_exp: int
+                new_currency: str
+                percent_change: float | None  # positive = increase, negative = decrease
+                is_new: bool
+        """
+        if not new_items:
+            return []
+
+        price_exp = infer_exp(currency)
+        changes = []
+
+        # Get previous prices for each item (most recent per item)
+        for item in new_items:
+            name = str(item.get("name") or "").strip()
+            unit_price = item.get("unit_price")
+
+            if not name or unit_price is None:
+                continue
+
+            try:
+                price_float = float(unit_price)
+            except (TypeError, ValueError):
+                continue
+
+            if price_float <= 0:
+                continue
+
+            new_price_minor = _money_to_minor(price_float, price_exp)
+
+            # Find the most recent previous price for this supplier + item
+            prev_price = self.session.execute(
+                select(
+                    SupplierPrice.price_minor,
+                    SupplierPrice.price_exp,
+                    SupplierPrice.currency,
+                )
+                .where(
+                    SupplierPrice.supplier_id == supplier_id,
+                    SupplierPrice.item_name_lower == name.lower(),
+                )
+                .order_by(SupplierPrice.created_at.desc())
+                .limit(1)
+            ).first()
+
+            if prev_price:
+                old_minor, old_exp, old_currency = prev_price
+                # Calculate percentage change
+                old_display = to_display(old_minor, old_exp)
+                new_display = to_display(new_price_minor, price_exp)
+                
+                if old_display != 0:
+                    percent_change = ((new_display - old_display) / old_display) * 100
+                else:
+                    percent_change = None  # division by zero
+                
+                changes.append({
+                    "item_name": name,
+                    "old_price_minor": old_minor,
+                    "old_price_exp": old_exp,
+                    "old_currency": old_currency,
+                    "new_price_minor": new_price_minor,
+                    "new_price_exp": price_exp,
+                    "new_currency": currency,
+                    "percent_change": percent_change,
+                    "is_new": False,
+                })
+            else:
+                # No previous price - this is a new item
+                changes.append({
+                    "item_name": name,
+                    "old_price_minor": None,
+                    "old_price_exp": None,
+                    "old_currency": None,
+                    "new_price_minor": new_price_minor,
+                    "new_price_exp": price_exp,
+                    "new_currency": currency,
+                    "percent_change": None,
+                    "is_new": True,
+                })
+
+        return changes
