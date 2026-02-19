@@ -160,6 +160,35 @@ def cb_stock_cancel() -> str:
     return "stock_cancel"
 
 
+def stock_adj_keyboard(
+    direction: str,
+    match_score: float,
+    item_found: bool,
+) -> "InlineKeyboardMarkup":
+    """Confirm keyboard for a pending quick stock adjustment.
+
+    - High confidence (≥0.8): single Confirm + Cancel row.
+    - Medium confidence (0.45–0.8): Confirm + Create-new + Cancel.
+    - No match: Add-new + Cancel.
+    """
+    if item_found and match_score >= 0.8:
+        return {"inline_keyboard": [[
+            make_button("✅ Confirm", cb_stock_conf(direction)),
+            make_button("✗ Cancel", cb_stock_cancel()),
+        ]]}
+    elif item_found:
+        return {"inline_keyboard": [[
+            make_button("✅ Yes, use this", cb_stock_conf(direction)),
+            make_button("➕ Create new item", cb_stock_new(direction)),
+            make_button("✗ Cancel", cb_stock_cancel()),
+        ]]}
+    else:
+        return {"inline_keyboard": [[
+            make_button("➕ Add & record", cb_stock_new(direction)),
+            make_button("✗ Cancel", cb_stock_cancel()),
+        ]]}
+
+
 # ---------------------------------------------------------------------------
 # Keyboard builders
 # ---------------------------------------------------------------------------

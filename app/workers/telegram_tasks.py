@@ -373,8 +373,104 @@ def handle_telegram_update(update: dict) -> None:
                             handle_item_edit_input(update, ctx.user, ctx.db, ctx_svc, settings)
                             return
 
-                        # Natural language read query (route to command or answer from context)
                         msg_text = (update.get("message", {}).get("text", "") or "").strip()
+
+                        # Manual stock reconciliation (deterministic, write with confirm)
+                        if msg_text:
+                            from app.services.stock_parser import parse_stock_phrase
+                            from app.services.inventory_service import InventoryService
+                            from app.db.models.inventory_balances import InventoryBalance
+                            from sqlalchemy import select as _sa_select
+                            from app.telegram.keyboards import stock_adj_keyboard
+
+                            phrase = parse_stock_phrase(msg_text)
+                            if phrase is not None:
+                                active_restaurant_id = ctx_svc.get_active_restaurant_id(ctx.user)
+                                if active_restaurant_id:
+                                    inv_svc = InventoryService(ctx.db)
+                                    matches = inv_svc.fuzzy_match_item(
+                                        restaurant_id=active_restaurant_id,
+                                        name=phrase.item_name,
+                                        threshold=0.45,
+                                    )
+                                    best_item, score = matches[0] if matches else (None, 0.0)
+                                    unit_str = f" {phrase.unit}" if phrase.unit else ""
+
+                                    if phrase.kind == "use":
+                                        direction = "out"
+                                        adj_qty = float(phrase.qty)
+                                        if best_item:
+                                            cur_val = float(ctx.db.scalar(
+                                                _sa_select(InventoryBalance.balance).where(
+                                                    InventoryBalance.item_id == best_item.id,
+                                                    InventoryBalance.restaurant_id == active_restaurant_id,
+                                                )
+                                            ) or 0)
+                                            msg_lines = [
+                                                f"📤 Used {adj_qty:g}{unit_str} {best_item.name}",
+                                                f"Balance: {cur_val:g}{unit_str} → {cur_val - adj_qty:g}{unit_str}",
+                                            ]
+                                        else:
+                                            msg_lines = [
+                                                f"📤 Used {adj_qty:g}{unit_str} {phrase.item_name}",
+                                                "⚠️ New item — will be created.",
+                                            ]
+                                    else:  # reconcile
+                                        target = float(phrase.qty)
+                                        if best_item:
+                                            cur_val = float(ctx.db.scalar(
+                                                _sa_select(InventoryBalance.balance).where(
+                                                    InventoryBalance.item_id == best_item.id,
+                                                    InventoryBalance.restaurant_id == active_restaurant_id,
+                                                )
+                                            ) or 0)
+                                            delta = target - cur_val
+                                            if delta == 0:
+                                                send_message(
+                                                    chat_id=ctx.user.chat_id,
+                                                    text=f"✅ {best_item.name} is already {target:g}{unit_str}. No change needed.",
+                                                    settings=settings,
+                                                )
+                                                return
+                                            direction = "in" if delta >= 0 else "out"
+                                            adj_qty = abs(delta)
+                                            msg_lines = [
+                                                f"🔄 Set {best_item.name} balance",
+                                                f"{cur_val:g}{unit_str} → {target:g}{unit_str} ({delta:+g}{unit_str})",
+                                            ]
+                                        else:
+                                            direction = "in"
+                                            adj_qty = target
+                                            msg_lines = [
+                                                f"🔄 Set {phrase.item_name} to {target:g}{unit_str}",
+                                                "⚠️ New item — will be created.",
+                                            ]
+
+                                    if best_item and 0.45 <= score < 0.8:
+                                        msg_lines.append(f'→ Matched: "{best_item.name}" ({score:.0%})')
+
+                                    ctx_svc.set_fields(
+                                        ctx.user,
+                                        adj_item_id=str(best_item.id) if best_item else None,
+                                        adj_item_name=best_item.name if best_item else phrase.item_name,
+                                        adj_qty=str(adj_qty),
+                                        adj_unit=phrase.unit,
+                                    )
+                                    ctx.db.commit()
+
+                                    send_message(
+                                        chat_id=ctx.user.chat_id,
+                                        text="\n".join(msg_lines),
+                                        settings=settings,
+                                        reply_markup=stock_adj_keyboard(
+                                            direction=direction,
+                                            match_score=score,
+                                            item_found=best_item is not None,
+                                        ),
+                                    )
+                                    return
+
+                        # Natural language read query (route to command or answer from context)
                         if msg_text and dispatch_nl_query(msg_text, update, ctx.user, ctx.db, ctx_svc, settings):
                             return
 
