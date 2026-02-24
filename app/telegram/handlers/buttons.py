@@ -71,6 +71,7 @@ from app.telegram.keyboards import (
     cb_mk_item,
     cb_open_upload,
     cb_pick_currency,
+    cb_po_add_item,
     cb_set_currency,
     cb_skip_item,
     cb_stock_cancel,
@@ -79,6 +80,8 @@ from app.telegram.keyboards import (
     cb_use_match,
     hex_to_uuid,
     make_button,
+    po_draft_keyboard,
+    po_sent_keyboard,
     uuid_to_hex,
 )
 
@@ -205,6 +208,12 @@ def handle(
         "stock_new":   _handle_stock_new,
         "stock_cancel": _handle_stock_cancel,
         "qadj":        _handle_qadj,
+        "po_sub":      _handle_po_submit,
+        "po_rcv":      _handle_po_receive,
+        "po_can":      _handle_po_cancel,
+        "po_add":      _handle_po_add_item,
+        "po_view":     _handle_po_view,
+        "reorder_po":  _handle_reorder_to_po,
     }
 
     handler = dispatch.get(action)
@@ -2291,5 +2300,517 @@ def _handle_qadj(
         callback_id=callback_id,
         text=toast,
         show_alert=low_stock,
+        settings=settings,
+    )
+
+
+# ---------------------------------------------------------------------------
+# PO button handlers (Phase 2 — Smart Procurement)
+# ---------------------------------------------------------------------------
+
+
+def _authorize_po_callback(
+    *,
+    db: Session,
+    po,
+    user: User,
+    callback_id: str,
+    settings: Settings,
+) -> bool:
+    """Verify user is a member of the PO's restaurant. Denies and returns False if not."""
+    is_member, _ = _membership_flags(db=db, restaurant_id=po.restaurant_id, user_id=user.id)
+    if is_member:
+        return True
+    _deny_callback_authz(callback_id=callback_id, settings=settings)
+    return False
+
+
+def _render_po_detail_text(po, items: list) -> str:
+    """Build a text summary for a purchase order."""
+    from app.services.money import to_display
+
+    status_icon = {"draft": "📝", "sent": "📤", "received": "✅", "cancelled": "✗"}.get(
+        po.status, "?"
+    )
+    lines = [f"{status_icon} PO — {po.supplier_name}  [{po.status}]"]
+    if po.sent_at:
+        lines.append(f"Submitted: {po.sent_at.strftime('%-d %b %Y')}")
+    if po.received_at:
+        lines.append(f"Received: {po.received_at.strftime('%-d %b %Y')}")
+
+    lines.append("")
+
+    if not items:
+        lines.append("(no items yet)")
+    else:
+        total_display = None
+        known_currency = None
+        for i, item in enumerate(items, 1):
+            unit_str = f" {item.unit}" if item.unit else ""
+            qty_str = f"{float(item.quantity):g}"
+            if item.unit_price_minor is not None and item.unit_price_exp is not None:
+                price_val = to_display(item.unit_price_minor, item.unit_price_exp)
+                line_total = price_val * item.quantity
+                currency = item.currency or ""
+                lines.append(
+                    f"{i}. {item.item_name}  {qty_str}{unit_str}  "
+                    f"@ {price_val:g} {currency}  = {float(line_total):,.2f} {currency}"
+                )
+                if total_display is None:
+                    total_display = line_total
+                    known_currency = currency
+                elif known_currency == currency:
+                    total_display += line_total
+            else:
+                lines.append(f"{i}. {item.item_name}  {qty_str}{unit_str}  (no price)")
+
+        if total_display is not None and known_currency:
+            lines.append(f"\nEstimated total  {known_currency} {float(total_display):,.2f}")
+
+    return "\n".join(lines)
+
+
+def _get_po_by_hex(hex_str: str, db: Session):
+    """Parse PO hex and fetch from DB. Returns None on invalid/missing."""
+    from app.db.models.purchase_orders import PurchaseOrder
+    try:
+        po_id = hex_to_uuid(hex_str)
+    except ValueError:
+        return None
+    return db.get(PurchaseOrder, po_id)
+
+
+def _handle_po_submit(
+    *,
+    params: list[str],
+    user: User,
+    db: Session,
+    ctx_svc: ContextService,
+    settings: Settings,
+    callback_id: str,
+    chat_id: int,
+    message_id: int | None,
+    **_: object,
+) -> None:
+    """Submit a draft PO (draft → sent). Edits message to show sent keyboard."""
+    if not params:
+        answer_callback_query(callback_id=callback_id, text="Invalid.", settings=settings)
+        return
+
+    po = _get_po_by_hex(params[0], db)
+    if po is None:
+        answer_callback_query(callback_id=callback_id, text="Order not found.", settings=settings)
+        return
+
+    if not _authorize_po_callback(db=db, po=po, user=user, callback_id=callback_id, settings=settings):
+        return
+
+    from app.services.purchase_order_service import POStatusError, PurchaseOrderService
+    from app.db.models.purchase_order_items import PurchaseOrderItem
+    from sqlalchemy import select as _sa_select
+
+    try:
+        po_svc = PurchaseOrderService(db)
+        po = po_svc.submit(po.id, po.restaurant_id)
+        db.commit()
+    except POStatusError as exc:
+        answer_callback_query(callback_id=callback_id, text=str(exc), show_alert=True, settings=settings)
+        return
+
+    items = db.scalars(
+        _sa_select(PurchaseOrderItem).where(PurchaseOrderItem.po_id == po.id)
+    ).all()
+
+    # Build shareable order text
+    order_lines = [f"ORDER — {po.supplier_name} ({po.sent_at.strftime('%-d %b %Y')})"]
+    for item in items:
+        qty_str = f"{float(item.quantity):g}"
+        unit_str = f" {item.unit}" if item.unit else ""
+        order_lines.append(f"• {item.item_name}  {qty_str}{unit_str}")
+
+    detail_text = _render_po_detail_text(po, list(items))
+    share_block = "\n".join(order_lines)
+    full_text = f"{detail_text}\n\nTo share with supplier:\n──────────────────────\n{share_block}\n──────────────────────"
+
+    answer_callback_query(callback_id=callback_id, text="✅ Order submitted!", settings=settings)
+    if message_id:
+        try:
+            edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=full_text,
+                reply_markup=po_sent_keyboard(po.id),
+                settings=settings,
+            )
+        except Exception:
+            send_message_with_keyboard(
+                chat_id=chat_id,
+                text=full_text,
+                reply_markup=po_sent_keyboard(po.id),
+                settings=settings,
+            )
+    else:
+        send_message_with_keyboard(
+            chat_id=chat_id,
+            text=full_text,
+            reply_markup=po_sent_keyboard(po.id),
+            settings=settings,
+        )
+
+
+def _handle_po_receive(
+    *,
+    params: list[str],
+    user: User,
+    db: Session,
+    ctx_svc: ContextService,
+    settings: Settings,
+    callback_id: str,
+    chat_id: int,
+    message_id: int | None,
+    **_: object,
+) -> None:
+    """Mark PO received (sent → received). Auto-stages invoice for review."""
+    if not params:
+        answer_callback_query(callback_id=callback_id, text="Invalid.", settings=settings)
+        return
+
+    po = _get_po_by_hex(params[0], db)
+    if po is None:
+        answer_callback_query(callback_id=callback_id, text="Order not found.", settings=settings)
+        return
+
+    if not _authorize_po_callback(db=db, po=po, user=user, callback_id=callback_id, settings=settings):
+        return
+
+    from app.services.purchase_order_service import POStatusError, PurchaseOrderService
+    from app.db.models.purchase_order_items import PurchaseOrderItem
+    from app.db.models.file_processing_staging import FileProcessingStaging
+    from app.services.money import to_display
+    from sqlalchemy import select as _sa_select
+
+    try:
+        po_svc = PurchaseOrderService(db)
+        po = po_svc.mark_received(po.id, po.restaurant_id)
+    except POStatusError as exc:
+        answer_callback_query(callback_id=callback_id, text=str(exc), show_alert=True, settings=settings)
+        return
+
+    items = db.scalars(
+        _sa_select(PurchaseOrderItem).where(PurchaseOrderItem.po_id == po.id)
+    ).all()
+
+    # Build extracted_data_json in the same format as OCR output
+    line_items = []
+    currency = None
+    for item in items:
+        unit_price = None
+        if item.unit_price_minor is not None and item.unit_price_exp is not None:
+            unit_price = float(to_display(item.unit_price_minor, item.unit_price_exp))
+            if currency is None and item.currency:
+                currency = item.currency
+        line_items.append({
+            "name": item.item_name,
+            "qty": float(item.quantity),
+            "unit": item.unit or "",
+            "unit_price": unit_price,
+        })
+
+    staging = FileProcessingStaging(
+        restaurant_id=po.restaurant_id,
+        uploaded_by=user.id,
+        supplier_id=po.supplier_id,
+        document_type="invoice",
+        status="pending_review",
+        extracted_data_json={
+            "line_items": line_items,
+            "supplier": po.supplier_name,
+            **({"currency": currency} if currency else {}),
+        },
+    )
+    db.add(staging)
+    db.commit()
+
+    # Update existing PO message
+    detail_text = _render_po_detail_text(po, list(items))
+    received_text = f"{detail_text}\n\n✅ Received. Invoice staging created — review below."
+    answer_callback_query(callback_id=callback_id, text="✅ PO marked received!", settings=settings)
+    if message_id:
+        try:
+            edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=received_text,
+                reply_markup={"inline_keyboard": []},
+                settings=settings,
+            )
+        except Exception:
+            pass
+
+    # Send the invoice review keyboard
+    from app.workers.ocr_tasks import _build_review_keyboard, _build_review_text
+    supplier = db.get(type(po).__class__, po.supplier_id) if po.supplier_id else None
+    # Fetch actual supplier model
+    if po.supplier_id:
+        from app.db.models.suppliers import Supplier as SupplierModel
+        supplier = db.get(SupplierModel, po.supplier_id)
+    else:
+        supplier = None
+
+    extracted = staging.extracted_data_json or {}
+    review_text = _build_review_text(staging, extracted, supplier, "invoice", page=0)
+    review_kb = _build_review_keyboard(staging, extracted, sup_buttons=None, page=0)
+    send_message_with_keyboard(
+        chat_id=chat_id,
+        text=review_text,
+        reply_markup=review_kb,
+        settings=settings,
+    )
+
+
+def _handle_po_cancel(
+    *,
+    params: list[str],
+    user: User,
+    db: Session,
+    ctx_svc: ContextService,
+    settings: Settings,
+    callback_id: str,
+    chat_id: int,
+    message_id: int | None,
+    **_: object,
+) -> None:
+    """Cancel a draft or sent PO."""
+    if not params:
+        answer_callback_query(callback_id=callback_id, text="Invalid.", settings=settings)
+        return
+
+    po = _get_po_by_hex(params[0], db)
+    if po is None:
+        answer_callback_query(callback_id=callback_id, text="Order not found.", settings=settings)
+        return
+
+    if not _authorize_po_callback(db=db, po=po, user=user, callback_id=callback_id, settings=settings):
+        return
+
+    from app.services.purchase_order_service import POStatusError, PurchaseOrderService
+
+    try:
+        po_svc = PurchaseOrderService(db)
+        po = po_svc.cancel(po.id, po.restaurant_id)
+        db.commit()
+    except POStatusError as exc:
+        answer_callback_query(callback_id=callback_id, text=str(exc), show_alert=True, settings=settings)
+        return
+
+    answer_callback_query(callback_id=callback_id, text="✗ Order cancelled.", settings=settings)
+    if message_id:
+        try:
+            edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=f"✗ PO cancelled — {po.supplier_name}",
+                reply_markup={"inline_keyboard": []},
+                settings=settings,
+            )
+        except Exception:
+            pass
+
+
+def _handle_po_add_item(
+    *,
+    params: list[str],
+    user: User,
+    db: Session,
+    ctx_svc: ContextService,
+    settings: Settings,
+    callback_id: str,
+    chat_id: int,
+    message_id: int | None,
+    **_: object,
+) -> None:
+    """Enter add-item text mode for a draft PO."""
+    if not params:
+        answer_callback_query(callback_id=callback_id, text="Invalid.", settings=settings)
+        return
+
+    po = _get_po_by_hex(params[0], db)
+    if po is None:
+        answer_callback_query(callback_id=callback_id, text="Order not found.", settings=settings)
+        return
+
+    if not _authorize_po_callback(db=db, po=po, user=user, callback_id=callback_id, settings=settings):
+        return
+
+    if po.status != "draft":
+        answer_callback_query(
+            callback_id=callback_id,
+            text="Only draft orders can have items added.",
+            show_alert=True,
+            settings=settings,
+        )
+        return
+
+    # Store PO id in context so the next free-text message is treated as an item
+    ctx_svc.set_fields(user, po_input_id=str(po.id))
+    db.commit()
+
+    answer_callback_query(callback_id=callback_id, text="", settings=settings)
+    send_message(
+        chat_id=chat_id,
+        text=(
+            f"Type an item to add to the {po.supplier_name} order.\n"
+            "Format: <item name> <qty> <unit>\n"
+            "Example: flour 10 kg  or  eggs 2 trays"
+        ),
+        settings=settings,
+    )
+
+
+def _handle_po_view(
+    *,
+    params: list[str],
+    user: User,
+    db: Session,
+    ctx_svc: ContextService,
+    settings: Settings,
+    callback_id: str,
+    chat_id: int,
+    message_id: int | None,
+    **_: object,
+) -> None:
+    """Re-render PO detail (refresh view)."""
+    if not params:
+        answer_callback_query(callback_id=callback_id, text="Invalid.", settings=settings)
+        return
+
+    po = _get_po_by_hex(params[0], db)
+    if po is None:
+        answer_callback_query(callback_id=callback_id, text="Order not found.", settings=settings)
+        return
+
+    if not _authorize_po_callback(db=db, po=po, user=user, callback_id=callback_id, settings=settings):
+        return
+
+    from app.db.models.purchase_order_items import PurchaseOrderItem
+    from sqlalchemy import select as _sa_select
+
+    items = db.scalars(
+        _sa_select(PurchaseOrderItem).where(PurchaseOrderItem.po_id == po.id)
+    ).all()
+    text = _render_po_detail_text(po, list(items))
+
+    keyboard = po_draft_keyboard(po.id) if po.status == "draft" else (
+        po_sent_keyboard(po.id) if po.status == "sent" else {"inline_keyboard": []}
+    )
+
+    answer_callback_query(callback_id=callback_id, text="", settings=settings)
+    if message_id:
+        try:
+            edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+                reply_markup=keyboard,
+                settings=settings,
+            )
+        except Exception:
+            send_message_with_keyboard(
+                chat_id=chat_id, text=text, reply_markup=keyboard, settings=settings
+            )
+    else:
+        send_message_with_keyboard(
+            chat_id=chat_id, text=text, reply_markup=keyboard, settings=settings
+        )
+
+
+def _handle_reorder_to_po(
+    *,
+    params: list[str],
+    user: User,
+    db: Session,
+    ctx_svc: ContextService,
+    settings: Settings,
+    callback_id: str,
+    chat_id: int,
+    message_id: int | None,
+    **_: object,
+) -> None:
+    """Create a draft PO pre-populated from below-par items for a given supplier."""
+    if not params:
+        answer_callback_query(callback_id=callback_id, text="Invalid.", settings=settings)
+        return
+
+    try:
+        supplier_id = hex_to_uuid(params[0])
+    except ValueError:
+        answer_callback_query(callback_id=callback_id, text="Invalid supplier.", settings=settings)
+        return
+
+    active_restaurant_id = ctx_svc.get_active_restaurant_id(user)
+    if active_restaurant_id is None:
+        answer_callback_query(callback_id=callback_id, text="No active restaurant.", settings=settings)
+        return
+
+    is_member, _ = _membership_flags(db=db, restaurant_id=active_restaurant_id, user_id=user.id)
+    if not is_member:
+        _deny_callback_authz(callback_id=callback_id, settings=settings)
+        return
+
+    from app.db.models.suppliers import Supplier as SupplierModel
+    from app.services.par_service import ParService
+    from app.services.purchase_order_service import PurchaseOrderService
+    from decimal import Decimal as _Decimal
+
+    supplier = db.get(SupplierModel, supplier_id)
+    if supplier is None:
+        answer_callback_query(callback_id=callback_id, text="Supplier not found.", settings=settings)
+        return
+
+    par_svc = ParService(db)
+    below = par_svc.get_below_par_items(active_restaurant_id)
+
+    # Filter to items whose best supplier matches
+    supplier_items = [
+        bi for bi in below
+        if bi.best_supplier_id == supplier_id
+    ]
+
+    po_svc = PurchaseOrderService(db)
+    po = po_svc.create_draft(
+        restaurant_id=active_restaurant_id,
+        supplier_id=supplier_id,
+        supplier_name=supplier.name,
+        created_by=user.id,
+    )
+
+    for bi in supplier_items:
+        po_svc.add_item(
+            po_id=po.id,
+            restaurant_id=active_restaurant_id,
+            inventory_item_id=bi.item.id,
+            item_name=bi.item.name,
+            quantity=_Decimal(str(bi.gap)),
+            unit=bi.unit,
+            unit_price_minor=bi.best_price_minor,
+            unit_price_exp=bi.best_price_exp,
+            currency=bi.best_price_currency,
+        )
+
+    db.commit()
+
+    from app.db.models.purchase_order_items import PurchaseOrderItem
+    from sqlalchemy import select as _sa_select
+
+    items = db.scalars(
+        _sa_select(PurchaseOrderItem).where(PurchaseOrderItem.po_id == po.id)
+    ).all()
+    text = _render_po_detail_text(po, list(items))
+
+    answer_callback_query(callback_id=callback_id, text="✅ Draft PO created!", settings=settings)
+    send_message_with_keyboard(
+        chat_id=chat_id,
+        text=text,
+        reply_markup=po_draft_keyboard(po.id),
         settings=settings,
     )
