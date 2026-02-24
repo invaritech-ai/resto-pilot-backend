@@ -45,6 +45,7 @@ _NAV_FIELDS = (
     "adj_item_name",             # quick stock adj: display name (also used for new-item creation)
     "adj_qty",                   # quick stock adj: quantity (float)
     "adj_unit",                  # quick stock adj: unit string (optional)
+    "po_input_id",               # PO add-item mode: UUID of draft PO awaiting item text
 )
 
 

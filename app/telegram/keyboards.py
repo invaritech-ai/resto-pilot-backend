@@ -308,6 +308,93 @@ def doc_type_keyboard(staging_id: uuid.UUID) -> InlineKeyboardMarkup:
     }
 
 
+def cb_po_submit(po_id: uuid.UUID) -> str:
+    """Submit draft PO callback: po_sub:{hex}  (39 bytes)"""
+    return _ensure_callback_limit(f"po_sub:{uuid_to_hex(po_id)}")
+
+
+def cb_po_receive(po_id: uuid.UUID) -> str:
+    """Mark PO received callback: po_rcv:{hex}  (39 bytes)"""
+    return _ensure_callback_limit(f"po_rcv:{uuid_to_hex(po_id)}")
+
+
+def cb_po_cancel(po_id: uuid.UUID) -> str:
+    """Cancel PO callback: po_can:{hex}  (39 bytes)"""
+    return _ensure_callback_limit(f"po_can:{uuid_to_hex(po_id)}")
+
+
+def cb_po_add_item(po_id: uuid.UUID) -> str:
+    """Enter add-item text mode for PO: po_add:{hex}  (39 bytes)"""
+    return _ensure_callback_limit(f"po_add:{uuid_to_hex(po_id)}")
+
+
+def cb_po_view(po_id: uuid.UUID) -> str:
+    """Re-render PO detail: po_view:{hex}  (40 bytes)"""
+    return _ensure_callback_limit(f"po_view:{uuid_to_hex(po_id)}")
+
+
+def cb_reorder_to_po(supplier_id: uuid.UUID) -> str:
+    """Create draft PO from reorder suggestions: reorder_po:{hex}  (43 bytes)"""
+    return _ensure_callback_limit(f"reorder_po:{uuid_to_hex(supplier_id)}")
+
+
+def po_draft_keyboard(po_id: uuid.UUID) -> InlineKeyboardMarkup:
+    """Keyboard shown on a draft PO.
+
+    Layout:
+        [ ➕ Add item ]
+        [ ✅ Submit order ]  [ ✗ Cancel ]
+    """
+    return {
+        "inline_keyboard": [
+            [make_button("➕ Add item", cb_po_add_item(po_id))],
+            [
+                make_button("✅ Submit order", cb_po_submit(po_id)),
+                make_button("✗ Cancel", cb_po_cancel(po_id)),
+            ],
+        ]
+    }
+
+
+def po_sent_keyboard(po_id: uuid.UUID) -> InlineKeyboardMarkup:
+    """Keyboard shown on a submitted (sent) PO.
+
+    Layout:
+        [ ✅ Mark received ]  [ ✗ Cancel order ]
+    """
+    return {
+        "inline_keyboard": [
+            [
+                make_button("✅ Mark received", cb_po_receive(po_id)),
+                make_button("✗ Cancel order", cb_po_cancel(po_id)),
+            ]
+        ]
+    }
+
+
+def reorder_keyboard(
+    supplier_ids_names: list[tuple[uuid.UUID, str]],
+) -> InlineKeyboardMarkup:
+    """Keyboard shown with /reorder output.
+
+    One [Order from <Supplier>] button per unique supplier, capped at 5.
+
+    Layout:
+        [ Order from Cheong Hing ]
+        [ Order from Metro Fresh ]
+        ...
+    """
+    keyboard = []
+    seen: set[uuid.UUID] = set()
+    for supplier_id, supplier_name in supplier_ids_names:
+        if supplier_id in seen or len(keyboard) >= 5:
+            continue
+        seen.add(supplier_id)
+        label = f"Order from {supplier_name}"
+        keyboard.append([make_button(label, cb_reorder_to_po(supplier_id))])
+    return {"inline_keyboard": keyboard}
+
+
 def handshake_keyboard(
     handshake_id: uuid.UUID,
     options: list[str] | None = None,

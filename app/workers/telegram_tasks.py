@@ -170,6 +170,128 @@ def dispatch_nl_query(
     return False
 
 
+def handle_po_item_input(
+    update: dict,
+    user: object,
+    db: object,
+    ctx_svc: object,
+    settings: object,
+) -> None:
+    """Handle free-text item input while user is in PO add-item mode (po_input_id set).
+
+    Parses "item name qty unit" from the message text, looks up the inventory item
+    via fuzzy match, adds the line to the draft PO, then re-renders the PO summary.
+
+    Clears po_input_id on success or if the PO is no longer in draft state.
+    """
+    from decimal import Decimal
+    from app.db.models.purchase_orders import PurchaseOrder
+    from app.db.models.purchase_order_items import PurchaseOrderItem
+    from app.services.inventory_service import InventoryService
+    from app.services.purchase_order_service import POStatusError, PurchaseOrderService
+    from app.telegram.bot_api import send_message, send_message_with_keyboard
+    from app.telegram.keyboards import po_draft_keyboard
+    from app.telegram.handlers.buttons import _render_po_detail_text
+    from sqlalchemy import select as _sa_select
+
+    msg = update.get("message", {})
+    text = (msg.get("text") or "").strip()
+    chat_id = user.chat_id
+
+    fields = ctx_svc.get_fields(user)
+    po_id_raw = fields.get("po_input_id")
+    if not po_id_raw:
+        return
+
+    try:
+        po_id = uuid.UUID(str(po_id_raw))
+    except (ValueError, AttributeError):
+        ctx_svc.set_fields(user, po_input_id=None)
+        db.commit()
+        return
+
+    po = db.get(PurchaseOrder, po_id)
+    if po is None or po.status != "draft":
+        ctx_svc.set_fields(user, po_input_id=None)
+        db.commit()
+        send_message(
+            chat_id=chat_id,
+            text="That order is no longer in draft status.",
+            settings=settings,
+        )
+        return
+
+    # Parse free text: last token = unit, second-to-last = qty, rest = item name
+    words = text.split()
+    if len(words) < 3:
+        send_message(
+            chat_id=chat_id,
+            text=(
+                "Please include item name, quantity, and unit.\n"
+                "Example: flour 10 kg  or  eggs 2 trays"
+            ),
+            settings=settings,
+        )
+        return
+
+    unit = words[-1]
+    try:
+        qty = Decimal(words[-2])
+    except Exception:
+        send_message(
+            chat_id=chat_id,
+            text=f'Invalid quantity "{words[-2]}". Example: flour 10 kg',
+            settings=settings,
+        )
+        return
+
+    if qty <= 0:
+        send_message(chat_id=chat_id, text="Quantity must be positive.", settings=settings)
+        return
+
+    item_query = " ".join(words[:-2])
+    active_restaurant_id = po.restaurant_id
+
+    # Fuzzy match for inventory_item_id (optional — won't block if no match)
+    inv_svc = InventoryService(db)
+    matches = inv_svc.fuzzy_match_item(
+        restaurant_id=active_restaurant_id, name=item_query, threshold=0.6
+    )
+    inventory_item_id = matches[0][0].id if matches else None
+    resolved_name = matches[0][0].name if matches else item_query
+
+    po_svc = PurchaseOrderService(db)
+    try:
+        po_svc.add_item(
+            po_id=po_id,
+            restaurant_id=active_restaurant_id,
+            inventory_item_id=inventory_item_id,
+            item_name=resolved_name,
+            quantity=qty,
+            unit=unit,
+        )
+    except (POStatusError, ValueError) as exc:
+        send_message(chat_id=chat_id, text=str(exc), settings=settings)
+        return
+
+    db.commit()
+
+    # Re-render PO summary
+    items = db.scalars(
+        _sa_select(PurchaseOrderItem).where(PurchaseOrderItem.po_id == po_id)
+    ).all()
+    detail_text = _render_po_detail_text(po, list(items))
+    added_line = f"✅ Added: {resolved_name} — {float(qty):g} {unit}"
+
+    send_message_with_keyboard(
+        chat_id=chat_id,
+        text=f"{added_line}\n\n{detail_text}",
+        reply_markup=po_draft_keyboard(po_id),
+        settings=settings,
+    )
+    # Stay in add-item mode (keep po_input_id)
+
+
 @celery_app.task(name="handle_telegram_update")
 def handle_telegram_update(update: dict) -> None:
     """Process a Telegram update: get-or-create user, onboard or route.
@@ -412,6 +534,13 @@ def handle_telegram_update(update: dict) -> None:
                         ):
                             from app.telegram.handlers.buttons import handle_item_edit_input
                             handle_item_edit_input(update, ctx.user, ctx.db, ctx_svc, settings)
+                            return
+
+                        # Check for active PO add-item flow before stock phrase check
+                        if edit_ctx.get("po_input_id") is not None:
+                            handle_po_item_input(
+                                update, ctx.user, ctx.db, ctx_svc, settings
+                            )
                             return
 
                         msg_text = (update.get("message", {}).get("text", "") or "").strip()

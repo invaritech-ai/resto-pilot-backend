@@ -1,7 +1,8 @@
 # Resto Pilot Roadmap
 
-## Current snapshot (2026-02-19)
-Phase 1 is in final hardening mode. All core features are shipped and test-covered (501 tests passing).
+## Current snapshot (2026-02-24)
+Phase 2 (Smart Procurement) is complete. 583 tests passing.
+Phase 1 features remain fully intact.
 
 ### Done in this phase
 - Telegram onboarding and routing pipeline.
@@ -47,8 +48,30 @@ Exit criteria:
 - Data written to final tables is consistent and tenant-safe.
 - Operational telemetry is complete enough for debugging and cost attribution.
 
-## Phase 2 - Purchase ordering
-Goal: Create and track purchase orders to suppliers through chat.
+## Phase 2 - Smart Procurement ✅ COMPLETE (2026-02-24)
+Goal: Close the procurement loop — par levels → reorder suggestions → purchase orders → receive.
+Collapsed with Phase 4 (Intelligence layer) into one cohesive delivery.
+
+### Shipped in Phase 2
+- **Par levels** — `/par set <item> <qty> <unit>` (fuzzy item match, upsert idempotent)
+- **Par view** — `/par` (paginated, ✅/⚠️/🚨 status icons per item)
+- **Smart reorder** — `/reorder` (below-par items with best price + supplier buttons)
+- **Purchase orders** — `/order <supplier>` (create draft), `/orders` (paginated list)
+- **PO lifecycle buttons** — Submit (draft→sent), Mark received (sent→received), Cancel, Add item
+- **Add-item text mode** — free-text "flour 10 kg" while `po_input_id` set in context
+- **Auto-staging on receive** — PO receipt auto-creates `pending_review` staging record for the invoice review flow
+- **Spend analytics** — `/spend` (current month by supplier, optional supplier filter for 3-month view)
+- **Par-aware low-stock alerts** — after any debit (qadj or stock_conf), shows par gap + /reorder hint
+- **NL routing** — /reorder, /orders, /par, /spend routed from natural language queries
+- **Keyboard callbacks** — 6 new PO callbacks, all ≤ 64 bytes verified
+
+### Test coverage
+- `tests/test_par_service.py` — 14 tests
+- `tests/test_purchase_order_service.py` — 18 tests
+- `tests/test_keyboards.py` — 17 tests (callback sizes + keyboard shapes)
+- `tests/test_commands_phase2.py` — 24 tests
+- `tests/test_buttons_po.py` — 9 tests
+- **Total: 583 passed, 1 skipped**
 
 ## Phase 3 - Expanded inventory operations
 Goal: Stock movement workflows beyond invoice intake (consume, waste, adjustments, receiving states).

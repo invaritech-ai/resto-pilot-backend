@@ -292,11 +292,16 @@ Allowed route commands:
   /balance              — stock summary (totals, zero-stock, negative)
   /uploads              — pending upload reviews
   /search <terms>       — unified search across inventory, products & suppliers
+  /par                  — view par levels (minimum stock thresholds) vs current stock
+  /reorder              — smart reorder list: items below par with best price and supplier
+  /orders               — view open purchase orders
+  /spend                — spend analytics by supplier for current month
 
 Return ONLY valid JSON — no markdown, no explanation:
 {{
   "action": "route_command" | "answer" | "unknown",
-  "command": "/inventory" | "/products" | "/balance" | "/list suppliers" | "/uploads" | "/search <terms>" \
+  "command": "/inventory" | "/products" | "/balance" | "/list suppliers" | "/uploads" | \
+"/search <terms>" | "/par" | "/reorder" | "/orders" | "/spend" \
 (only when action=route_command),
   "answer": "your response" (only when action=answer)
 }}
@@ -304,6 +309,14 @@ Return ONLY valid JSON — no markdown, no explanation:
 Rules for "route_command":
 - Use /search <terms> for queries about specific ingredients, products, or suppliers by name.
   Examples: "where can I buy truffle?" → /search truffle | "do we have chicken?" → /search chicken
+- Use /reorder when user asks what to reorder, is running low, or needs to restock.
+  Examples: "what do I need to order?" → /reorder | "my chicken is running low" → /reorder
+- Use /orders when user asks about pending orders, order status, or what's been ordered.
+  Examples: "show me my open orders" → /orders | "do I have any pending orders?" → /orders
+- Use /par when user asks about par levels or minimum stock thresholds.
+  Examples: "what's my par level for onion?" → /par | "show my minimum stock levels" → /par
+- Use /spend when user asks about spending, supplier costs, bills, or how much was spent.
+  Examples: "how much did I spend last month?" → /spend | "what are my supplier costs?" → /spend
 
 Rules for "answer":
 - Use ONLY the data in CONTEXT. Never invent numbers, names, or prices.

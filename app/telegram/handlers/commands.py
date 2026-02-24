@@ -17,9 +17,11 @@ Commands:
 
 from __future__ import annotations
 
+import datetime as dt
 import math
 import re
 import uuid
+from decimal import Decimal
 
 from sqlalchemy.orm import Session
 
@@ -38,7 +40,13 @@ from app.telegram.bot_api import (
     send_message_with_keyboard,
     send_photo,
 )
-from app.telegram.keyboards import pagination_keyboard, quick_adj_rows
+from app.telegram.keyboards import (
+    pagination_keyboard,
+    po_draft_keyboard,
+    po_sent_keyboard,
+    quick_adj_rows,
+    reorder_keyboard,
+)
 from app.telegram.renderer import (
     format_with_emoji,
     format_supplier_name,
@@ -55,6 +63,16 @@ HELP_TEXT = """Available commands:
 /chart             — Visual stock levels chart
 /history <item>    — Recent transactions for an item
 /export            — Download inventory as CSV
+
+📊 Par Levels & Reorder
+/par               — View par levels vs current stock
+/par set <item> <qty> <unit> — Set minimum stock threshold
+/reorder           — Smart reorder list (below-par items + best price)
+
+🛍 Purchase Orders
+/order <supplier>  — Create a new purchase order
+/orders            — View open purchase orders
+/spend             — Spend analytics by supplier
 
 🛒 Suppliers & Prices
 /list suppliers    — Show your linked suppliers
@@ -128,6 +146,7 @@ def _parse_command(text: str) -> tuple[str, str]:
     """
     text = text.strip()
     # Match command patterns — new commands first, then existing
+    # NOTE: "par set" must appear before "par"; "orders" before "order"
     patterns = [
         (r"^/profile\b", "profile"),
         (r"^/team\b", "team"),
@@ -144,6 +163,12 @@ def _parse_command(text: str) -> tuple[str, str]:
         (r"^/export\b", "export"),
         (r"^/chart\b", "chart"),
         (r"^/search\b", "search"),
+        (r"^/par set\b", "par set"),
+        (r"^/par\b", "par"),
+        (r"^/reorder\b", "reorder"),
+        (r"^/orders\b", "orders"),
+        (r"^/order\b", "order"),
+        (r"^/spend\b", "spend"),
         (r"^/help\b", "help"),
         (r"^/start\b", "start"),
     ]
@@ -628,6 +653,109 @@ def _render_item_search_results(
     return "\n".join(lines)
 
 
+def _render_par_levels_page(
+    *,
+    user: User,
+    db: Session,
+    ctx_svc: ContextService,
+    settings: Settings,
+    page: int,
+) -> tuple[str, dict | None]:
+    from app.services.par_service import ParService
+
+    restaurant_id = _require_active_restaurant(user, ctx_svc, db, settings)
+    if restaurant_id is None:
+        raise ValueError("No active restaurant. Send /start to complete setup.")
+
+    par_svc = ParService(db)
+    total = par_svc.count_par_levels(restaurant_id)
+    if total == 0:
+        raise ValueError("No par levels set yet. Use /par set <item> <qty> <unit> to get started.")
+
+    page = _safe_page(page, total)
+    offset = page * _LIST_PAGE_SIZE
+    rows = par_svc.list_par_levels(restaurant_id, offset=offset, limit=_LIST_PAGE_SIZE)
+
+    ctx_svc.set_list_state(user, "par_levels", offset)
+
+    lines = ["📊 Par Levels\n"]
+    for i, (par, item, balance) in enumerate(rows, offset + 1):
+        bal_qty = float(balance.balance) if balance is not None else 0.0
+        par_qty = float(par.par_qty)
+        unit = par.unit
+
+        if bal_qty >= par_qty:
+            icon = "✅"
+            detail = ""
+        elif bal_qty <= 0:
+            icon = "🚨"
+            gap = par_qty - bal_qty
+            detail = f"  need {gap:g} {unit}"
+        else:
+            icon = "⚠️"
+            gap = par_qty - bal_qty
+            detail = f"  need {gap:g} {unit}"
+
+        item_name = format_with_emoji(item.name)
+        lines.append(
+            f"{i}. {icon} {item_name}  have {bal_qty:g} {unit}  par {par_qty:g} {unit}{detail}"
+        )
+
+    total_pages = max(1, math.ceil(total / _LIST_PAGE_SIZE))
+    footer = f"📊 {total} par level{'s' if total != 1 else ''} set"
+    if total_pages > 1:
+        footer += f" • Page {page + 1}/{total_pages}"
+    lines.append("")
+    lines.append(format_footer(footer, divider=True))
+
+    keyboard = _pagination_markup(list_type="par_levels", current_page=page, total_pages=total_pages)
+    return "\n".join(lines), keyboard
+
+
+def _render_orders_page(
+    *,
+    user: User,
+    db: Session,
+    ctx_svc: ContextService,
+    settings: Settings,
+    page: int,
+) -> tuple[str, dict | None]:
+    from app.services.purchase_order_service import PurchaseOrderService
+
+    restaurant_id = _require_active_restaurant(user, ctx_svc, db, settings)
+    if restaurant_id is None:
+        raise ValueError("No active restaurant. Send /start to complete setup.")
+
+    po_svc = PurchaseOrderService(db)
+    total = po_svc.count_orders(restaurant_id)
+    if total == 0:
+        raise ValueError("No purchase orders yet. Use /order <supplier> to create one.")
+
+    page = _safe_page(page, total)
+    offset = page * _LIST_PAGE_SIZE
+    orders = po_svc.list_orders(restaurant_id, offset=offset, limit=_LIST_PAGE_SIZE)
+
+    ctx_svc.set_list_state(user, "orders", offset)
+
+    _STATUS_ICON = {"draft": "📝", "sent": "📤", "received": "✅", "cancelled": "✗"}
+
+    lines = ["🛒 Purchase Orders\n"]
+    for i, po in enumerate(orders, offset + 1):
+        icon = _STATUS_ICON.get(po.status, "?")
+        date_str = po.created_at.strftime("%-d %b") if po.created_at else "?"
+        lines.append(f"{i}. {icon} {po.supplier_name}  [{po.status}]  {date_str}")
+
+    total_pages = max(1, math.ceil(total / _LIST_PAGE_SIZE))
+    footer = f"📊 {total} order{'s' if total != 1 else ''} total"
+    if total_pages > 1:
+        footer += f" • Page {page + 1}/{total_pages}"
+    lines.append("")
+    lines.append(format_footer(footer, divider=True))
+
+    keyboard = _pagination_markup(list_type="orders", current_page=page, total_pages=total_pages)
+    return "\n".join(lines), keyboard
+
+
 def build_list_page(
     *,
     list_type: str,
@@ -676,6 +804,22 @@ def build_list_page(
         )
     if list_type == "suppliers":
         return _render_suppliers_page(
+            user=user,
+            db=db,
+            ctx_svc=ctx_svc,
+            settings=settings,
+            page=page,
+        )
+    if list_type == "par_levels":
+        return _render_par_levels_page(
+            user=user,
+            db=db,
+            ctx_svc=ctx_svc,
+            settings=settings,
+            page=page,
+        )
+    if list_type == "orders":
+        return _render_orders_page(
             user=user,
             db=db,
             ctx_svc=ctx_svc,
@@ -1398,6 +1542,348 @@ def handle(
         if not found_any:
             lines.append(f"No results found for \"{args}\".")
             lines.append("Try a shorter or different search term.")
+
+        send_message(chat_id=chat_id, text="\n".join(lines), settings=settings)
+        return
+
+    # --- /par (view all par levels) ---
+    if command == "par":
+        try:
+            text_out, keyboard = build_list_page(
+                list_type="par_levels",
+                page=0,
+                user=user,
+                db=db,
+                ctx_svc=ctx_svc,
+                settings=settings,
+            )
+        except ValueError as exc:
+            send_message(chat_id=chat_id, text=str(exc), settings=settings)
+            return
+
+        db.commit()
+        _publish_list_message(
+            user=user,
+            db=db,
+            ctx_svc=ctx_svc,
+            chat_id=chat_id,
+            text=text_out,
+            reply_markup=keyboard,
+            settings=settings,
+        )
+        return
+
+    # --- /par set <item> <qty> <unit> ---
+    if command == "par set":
+        restaurant_id = _require_active_restaurant(user, ctx_svc, db, settings)
+        if restaurant_id is None:
+            send_message(
+                chat_id=chat_id,
+                text="No active restaurant. Send /start to complete setup.",
+                settings=settings,
+            )
+            return
+
+        if not args:
+            send_message(
+                chat_id=chat_id,
+                text="Usage: /par set <item> <qty> <unit>\nExample: /par set chicken 5 kg",
+                settings=settings,
+            )
+            return
+
+        words = args.split()
+        if len(words) < 3:
+            send_message(
+                chat_id=chat_id,
+                text="Usage: /par set <item> <qty> <unit>\nExample: /par set chicken 5 kg",
+                settings=settings,
+            )
+            return
+
+        unit = words[-1]
+        try:
+            qty = Decimal(words[-2])
+        except Exception:
+            send_message(
+                chat_id=chat_id,
+                text=f'Invalid quantity "{words[-2]}". Example: /par set chicken 5 kg',
+                settings=settings,
+            )
+            return
+
+        if qty <= 0:
+            send_message(
+                chat_id=chat_id, text="Quantity must be positive.", settings=settings
+            )
+            return
+
+        item_query = " ".join(words[:-2])
+
+        inv_svc = InventoryService(db)
+        matches = inv_svc.fuzzy_match_item(
+            restaurant_id=restaurant_id, name=item_query, threshold=0.5
+        )
+        if not matches:
+            send_message(
+                chat_id=chat_id,
+                text=f'No inventory item matching "{item_query}". Upload an invoice first to add items to inventory.',
+                settings=settings,
+            )
+            return
+
+        item, _score = matches[0]
+
+        from app.services.par_service import ParService
+        from app.db.models.inventory_balances import InventoryBalance
+        from sqlalchemy import select as _sa_select
+
+        par_svc = ParService(db)
+        par, created = par_svc.set_par(
+            restaurant_id=restaurant_id,
+            inventory_item_id=item.id,
+            par_qty=qty,
+            unit=unit,
+            user_id=user.id,
+        )
+        db.commit()
+
+        bal = db.scalar(
+            _sa_select(InventoryBalance.balance).where(
+                InventoryBalance.item_id == item.id,
+                InventoryBalance.restaurant_id == restaurant_id,
+            )
+        )
+        bal_qty = float(bal) if bal is not None else 0.0
+        par_qty_f = float(qty)
+
+        verb = "set" if created else "updated"
+        lines = [f"✅ Par level {verb}: {format_with_emoji(item.name)} — {par_qty_f:g} {unit}"]
+        if bal_qty >= par_qty_f:
+            lines.append(f"   Current balance: {bal_qty:g} {unit} ✅")
+        else:
+            gap = par_qty_f - bal_qty
+            lines.append(
+                f"   Current balance: {bal_qty:g} {unit}  ⚠️ Below par (need {gap:g} more {unit})"
+            )
+            lines.append("   Use /reorder to create a purchase order.")
+
+        send_message(chat_id=chat_id, text="\n".join(lines), settings=settings)
+        return
+
+    # --- /reorder ---
+    if command == "reorder":
+        restaurant_id = _require_active_restaurant(user, ctx_svc, db, settings)
+        if restaurant_id is None:
+            send_message(
+                chat_id=chat_id,
+                text="No active restaurant. Send /start to complete setup.",
+                settings=settings,
+            )
+            return
+
+        from app.services.par_service import ParService
+        from app.services.money import to_display
+
+        par_svc = ParService(db)
+        below = par_svc.get_below_par_items(restaurant_id)
+
+        if not below:
+            send_message(
+                chat_id=chat_id,
+                text="✅ All items at or above par level.",
+                settings=settings,
+            )
+            return
+
+        count = len(below)
+        lines = [f"📋 {count} item{'s' if count != 1 else ''} below par\n"]
+
+        supplier_buttons: list[tuple[uuid.UUID, str]] = []
+        seen_sup: set[uuid.UUID] = set()
+
+        for bi in below:
+            item_emoji = format_with_emoji(bi.item.name)
+            bal_str = f"{float(bi.balance):g}"
+            par_str = f"{float(bi.par_qty):g}"
+            gap_str = f"{float(bi.gap):g}"
+            unit = bi.unit
+
+            if bi.best_price_minor is not None:
+                price_val = to_display(bi.best_price_minor, bi.best_price_exp)
+                currency = bi.best_price_currency or ""
+                sup_str = f" · {bi.best_supplier_name}" if bi.best_supplier_name else ""
+                price_info = f"  💰 {price_val:g} {currency}/{unit}{sup_str}"
+            else:
+                price_info = "  💰 no price data"
+
+            lines.append(f"{item_emoji}  {bal_str} → {par_str} (+{gap_str} {unit}){price_info}")
+
+            if (
+                bi.best_supplier_id is not None
+                and bi.best_supplier_name is not None
+                and bi.best_supplier_id not in seen_sup
+            ):
+                seen_sup.add(bi.best_supplier_id)
+                supplier_buttons.append((bi.best_supplier_id, bi.best_supplier_name))
+
+        keyboard = reorder_keyboard(supplier_buttons) if supplier_buttons else None
+
+        _send_with_optional_keyboard(
+            chat_id=chat_id,
+            text="\n".join(lines),
+            reply_markup=keyboard,
+            settings=settings,
+        )
+        return
+
+    # --- /orders ---
+    if command == "orders":
+        try:
+            text_out, keyboard = build_list_page(
+                list_type="orders",
+                page=0,
+                user=user,
+                db=db,
+                ctx_svc=ctx_svc,
+                settings=settings,
+            )
+        except ValueError as exc:
+            send_message(chat_id=chat_id, text=str(exc), settings=settings)
+            return
+
+        db.commit()
+        _publish_list_message(
+            user=user,
+            db=db,
+            ctx_svc=ctx_svc,
+            chat_id=chat_id,
+            text=text_out,
+            reply_markup=keyboard,
+            settings=settings,
+        )
+        return
+
+    # --- /order [supplier] ---
+    if command == "order":
+        restaurant_id = _require_active_restaurant(user, ctx_svc, db, settings)
+        if restaurant_id is None:
+            send_message(
+                chat_id=chat_id,
+                text="No active restaurant. Send /start to complete setup.",
+                settings=settings,
+            )
+            return
+
+        if not args:
+            send_message(
+                chat_id=chat_id,
+                text="Usage: /order <supplier name>\nExample: /order Cheong Hing\n\nUse /list suppliers to see your suppliers.",
+                settings=settings,
+            )
+            return
+
+        sup_svc = SupplierService(db)
+        matches = sup_svc.fuzzy_search_for_restaurant(
+            args, restaurant_id=restaurant_id, threshold=0.5
+        )
+        if not matches:
+            send_message(
+                chat_id=chat_id,
+                text=f'No supplier found matching "{args}". Use /list suppliers to see your suppliers.',
+                settings=settings,
+            )
+            return
+
+        supplier, _score = matches[0]
+
+        from app.services.purchase_order_service import PurchaseOrderService
+
+        po_svc = PurchaseOrderService(db)
+        po = po_svc.create_draft(
+            restaurant_id=restaurant_id,
+            supplier_id=supplier.id,
+            supplier_name=supplier.name,
+            created_by=user.id,
+        )
+        db.commit()
+
+        text_out = (
+            f"📝 Draft PO — {supplier.name}\n\n"
+            "No items yet. Tap ➕ Add item to add lines, "
+            "or /reorder to auto-populate from your below-par items."
+        )
+        send_message_with_keyboard(
+            chat_id=chat_id,
+            text=text_out,
+            reply_markup=po_draft_keyboard(po.id),
+            settings=settings,
+        )
+        return
+
+    # --- /spend ---
+    if command == "spend":
+        restaurant_id = _require_active_restaurant(user, ctx_svc, db, settings)
+        if restaurant_id is None:
+            send_message(
+                chat_id=chat_id,
+                text="No active restaurant. Send /start to complete setup.",
+                settings=settings,
+            )
+            return
+
+        from app.services.purchase_order_service import PurchaseOrderService
+        from app.services.money import to_display
+
+        # Default: current month
+        now = dt.datetime.now(dt.timezone.utc)
+        since = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        period_label = now.strftime("%b %Y")
+
+        # If supplier arg given, show last 3 months filtered to that supplier
+        supplier_filter: str | None = None
+        if args:
+            sup_svc = SupplierService(db)
+            sup_matches = sup_svc.fuzzy_search_for_restaurant(
+                args, restaurant_id=restaurant_id, threshold=0.5
+            )
+            if not sup_matches:
+                send_message(
+                    chat_id=chat_id,
+                    text=f'No supplier found matching "{args}". Use /list suppliers to see your suppliers.',
+                    settings=settings,
+                )
+                return
+            supplier_filter = sup_matches[0][0].name
+            # Extend window to last 3 months
+            three_months_ago = now - dt.timedelta(days=90)
+            since = three_months_ago.replace(hour=0, minute=0, second=0, microsecond=0)
+            period_label = "Last 3 months"
+
+        po_svc = PurchaseOrderService(db)
+        summary = po_svc.get_spend_summary(restaurant_id, since)
+
+        rows = summary.rows
+        if supplier_filter:
+            rows = [r for r in rows if r.supplier_name == supplier_filter]
+
+        if not rows:
+            period_desc = f"since {since.strftime('%-d %b %Y')}"
+            send_message(
+                chat_id=chat_id,
+                text=f"💰 No received orders {period_desc}.",
+                settings=settings,
+            )
+            return
+
+        grand_total = sum(r.total_display for r in rows)
+        lines = [f"💰 Spend — {period_label}\n"]
+        for row in rows:
+            order_str = f"({row.order_count} order{'s' if row.order_count != 1 else ''})"
+            lines.append(f"{row.supplier_name}  {row.currency} {row.total_display:,.2f}  {order_str}")
+
+        lines.append("")
+        lines.append(f"Total  {grand_total:,.2f}")
 
         send_message(chat_id=chat_id, text="\n".join(lines), settings=settings)
         return
