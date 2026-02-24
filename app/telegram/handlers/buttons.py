@@ -2119,6 +2119,14 @@ def _handle_stock_conf(
     result_text = f"✅ {verb} {qty:g}{unit_str} {item_name}. Balance: {bal_str}{unit_str}"
     if new_balance is not None and float(new_balance) <= 0:
         result_text += "\n⚠️ Low stock!"
+    # Par-aware alert on debit
+    if direction == "out" and new_balance is not None:
+        from app.services.par_service import ParService
+        par_svc = ParService(db)
+        par = par_svc.get_par_level(active_restaurant_id, item_id)
+        if par and float(new_balance) < float(par.par_qty):
+            gap = float(par.par_qty) - float(new_balance)
+            result_text += f"\n⚠️ Below par (need {gap:g} more {par.unit}). Use /reorder to create a purchase order."
 
     answer_callback_query(callback_id=callback_id, text="", settings=settings)
     if message_id:
@@ -2293,13 +2301,25 @@ def _handle_qadj(
     verb = "+1" if direction == "in" else "−1"
 
     low_stock = new_balance is not None and float(new_balance) <= 0
-    alert_suffix = "  ⚠️ Low stock!" if low_stock else ""
+    below_par = False
+    par_hint = ""
+    if direction == "out" and new_balance is not None and item is not None:
+        from app.services.par_service import ParService
+        par_svc = ParService(db)
+        par = par_svc.get_par_level(active_restaurant_id, item_id)
+        if par and float(new_balance) < float(par.par_qty):
+            below_par = True
+            gap = float(par.par_qty) - float(new_balance)
+            par_hint = f"  ⚠️ Below par (need {gap:g} more {par.unit}). /reorder"
+
+    show_alert = low_stock or below_par
+    alert_suffix = par_hint if below_par else ("  ⚠️ Low stock!" if low_stock else "")
     toast = f"{verb}{unit_str} {item_name}  →  {bal_str}{unit_str}{alert_suffix}"
 
     answer_callback_query(
         callback_id=callback_id,
         text=toast,
-        show_alert=low_stock,
+        show_alert=show_alert,
         settings=settings,
     )
 
