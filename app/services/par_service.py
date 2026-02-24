@@ -57,6 +57,7 @@ class BelowParItem:
     best_price_exp: int | None          # exponent for display
     best_price_currency: str | None
     best_supplier_name: str | None
+    best_supplier_id: uuid.UUID | None  # for reorder keyboard callback
 
 
 class ParService:
@@ -219,13 +220,16 @@ class ParService:
             best_price_currency: str | None = None
             best_supplier_name: str | None = None
 
+            best_supplier_id: uuid.UUID | None = None
+
             price_row = self._find_best_price(restaurant_id, item.name_lower)
             if price_row:
-                sp, sup_name = price_row
+                sp, sup_name, sup_id = price_row
                 best_price_minor = sp.price_minor
                 best_price_exp = sp.price_exp
                 best_price_currency = sp.currency
                 best_supplier_name = sup_name
+                best_supplier_id = sup_id
 
             results.append(
                 BelowParItem(
@@ -238,6 +242,7 @@ class ParService:
                     best_price_exp=best_price_exp,
                     best_price_currency=best_price_currency,
                     best_supplier_name=best_supplier_name,
+                    best_supplier_id=best_supplier_id,
                 )
             )
 
@@ -253,11 +258,11 @@ class ParService:
         self,
         restaurant_id: uuid.UUID,
         item_name_lower: str,
-    ) -> tuple[SupplierPrice, str] | None:
+    ) -> tuple[SupplierPrice, str, uuid.UUID] | None:
         """Find the cheapest unit price for an item from linked suppliers.
 
         Uses fuzzy similarity match on item_name_lower (threshold=0.5).
-        Returns (SupplierPrice, supplier_name) or None if no price data found.
+        Returns (SupplierPrice, supplier_name, supplier_id) or None if no price data found.
         The "cheapest" price is determined by price_minor/10^price_exp.
         Items with no price_minor are ignored.
         """
@@ -265,7 +270,7 @@ class ParService:
         score_expr = func.similarity(SupplierPrice.item_name_lower, item_name_lower)
 
         stmt = (
-            select(SupplierPrice, Supplier.name)
+            select(SupplierPrice, Supplier.name, Supplier.id)
             .join(SupplierPriceList, SupplierPrice.price_list_id == SupplierPriceList.id)
             .join(Supplier, SupplierPrice.supplier_id == Supplier.id)
             .join(RestaurantSupplier, RestaurantSupplier.supplier_id == Supplier.id)
@@ -286,12 +291,12 @@ class ParService:
         # Pick cheapest by normalised unit price
         best = None
         best_normalised: float = float("inf")
-        for sp, sup_name in rows:
+        for sp, sup_name, sup_id in rows:
             if sp.price_minor is None or sp.price_exp is None:
                 continue
             normalised = sp.price_minor / (10 ** sp.price_exp)
             if normalised < best_normalised:
                 best_normalised = normalised
-                best = (sp, sup_name)
+                best = (sp, sup_name, sup_id)
 
         return best

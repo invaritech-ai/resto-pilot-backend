@@ -217,9 +217,10 @@ class TestGetBelowParItems:
         mock_price.price_minor = 1250
         mock_price.price_exp = 2
         mock_price.currency = "SGD"
+        mock_sup_id = uuid.uuid4()
 
         svc = ParService(session)
-        with patch.object(svc, "_find_best_price", return_value=(mock_price, "Cheong Hing")):
+        with patch.object(svc, "_find_best_price", return_value=(mock_price, "Cheong Hing", mock_sup_id)):
             results = svc.get_below_par_items(RESTAURANT_ID)
 
         assert len(results) == 1
@@ -228,6 +229,7 @@ class TestGetBelowParItems:
         assert r.best_price_exp == 2
         assert r.best_price_currency == "SGD"
         assert r.best_supplier_name == "Cheong Hing"
+        assert r.best_supplier_id == mock_sup_id
 
     def test_no_balance_row_treated_as_zero(self):
         session = _make_session()
